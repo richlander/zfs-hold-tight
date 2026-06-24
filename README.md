@@ -122,6 +122,8 @@ See [`zfs-hold-tight.example.json`](zfs-hold-tight.example.json). Top-level keys
 | `guardMaxDailyShrinkPct` | `33` | HOLD if the newest daily references this % less data than the recent baseline (mass-**deletion** guard; `0` disables). |
 | `guardMaxDailyChurnPct` | `50` | HOLD if the newest daily rewrites more than this % of the dataset's data in one day (mass-**rewrite / encryption** guard; `0` disables). |
 | `propertyNamespace` | `zht` | Prefix for the tool's ZFS user-properties + hold tags (`<ns>:keep_until`, `<ns>:tier`, `<ns>:monthly`, `<ns>:adhoc`). |
+| `zfsPath` | auto (`/usr/sbin/zfs`…) | Absolute path to the `zfs` binary. Resolved from standard locations; set explicitly to avoid trusting the (root cron's) `PATH`. |
+| `curlPath` | auto (`/usr/bin/curl`…) | Absolute path to `curl` (healthchecks only). |
 | `retentionPolicies` | — | Named `{dailyKeepDays, weeklyKeepDays, monthlyKeepDays}` profiles. |
 | `datasets` | — | `dataset → policy` map. Datasets must start with `archive/`. |
 
@@ -138,6 +140,12 @@ effectively per-dataset thresholds when you need them.
 > **Note:** the property/hold namespace is set by `propertyNamespace` (default `zht`). The
 > pool prefix (`archive/`) is still a compiled-in constant in `zfs-hold-tight.cs` — edit it
 > to match your pool.
+
+> **Hardening:** the tool runs `zfs` from an absolute path (resolved, or `zfsPath`) rather
+> than the inherited `PATH`, so a writable earlier `PATH` element can't hijack it when run
+> as root. As defense-in-depth, also pin a minimal `PATH` in the cron entry
+> (e.g. `PATH=/usr/sbin:/usr/bin`), and leave `healthchecksUrl` unset on hardened hosts if
+> you don't need pings (avoids invoking `curl` at all).
 
 ## Safety guards
 

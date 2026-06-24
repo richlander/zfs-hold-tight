@@ -23,7 +23,7 @@ ADATE=$(date -u -d "@$ANCHOR" +%Y-%m-%d)
 snapname() { echo "archive/home/rich@autosnap_$1_${TIME}_daily"; }   # $1=YYYY-MM-DD
 
 cat > "$WORK/config.json" <<EOF
-{ "logDir": "$WORK/logs", "guardMaxDeletePerRun": 5, "guardRecentWindowDays": 7,
+{ "logDir": "$WORK/logs", "zfsPath": "$WORK/bin/zfs", "guardMaxDeletePerRun": 5, "guardRecentWindowDays": 7,
   "retentionPolicies": { "baseline": { "dailyKeepDays": 30, "weeklyKeepDays": 1825, "monthlyKeepDays": 1825 } },
   "datasets": { "archive/home/rich": "baseline" } }
 EOF
@@ -174,7 +174,7 @@ run_tool "$WORK/lowchurn" --force
 # ---- T18: per-dataset isolation — a small (100MiB) dataset wiped 80% is flagged on its
 #          own, while a healthy large dataset prunes normally (only the small one HELD) ----
 cat > "$WORK/cfg2.json" <<EOF
-{ "logDir": "$WORK/logs", "retentionPolicies": { "baseline": { "dailyKeepDays": 30, "weeklyKeepDays": 1825, "monthlyKeepDays": 1825 } },
+{ "logDir": "$WORK/logs", "zfsPath": "$WORK/bin/zfs", "retentionPolicies": { "baseline": { "dailyKeepDays": 30, "weeklyKeepDays": 1825, "monthlyKeepDays": 1825 } },
   "datasets": { "archive/home/rich": "baseline", "archive/scratch": "baseline" } }
 EOF
 n2="$(gen_window $((NOW-7200)) | wc -l)"
@@ -224,6 +224,29 @@ OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
        ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --check-holds 2>/dev/null)"; RC=$?
 { [ "$RC" = 1 ] && echo "$OUT" | grep "archive/home/rich:" | grep -qi "exceeds its .*retention"; } \
   && ok "T23 --check-holds flags hold past its policy retention (names dataset)" || bad "T23 (rc=$RC, out: $(echo "$OUT"|tail -1))"
+
+# ---- T24: --doctor returns nonzero when zfs list fails (no false "validated") ----
+rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"; cp "$WORK/healthy" "$WORK/fz/snaps"; : > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
+OUT="$(FAKE_ZFS_DIR="$WORK/fz" FAKE_ZFS_FAIL=list ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
+       ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --doctor 2>/dev/null)"; RC=$?
+[ "$RC" = 1 ] && ok "T24 --doctor nonzero on zfs list failure" || bad "T24 (rc=$RC)"
+
+# ---- T25: --fix returns nonzero when a hold fails (no false "repaired") ----
+rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"; cp "$WORK/healthy" "$WORK/fz/snaps"; : > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
+OUT="$(FAKE_ZFS_DIR="$WORK/fz" FAKE_ZFS_FAIL=hold ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
+       ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --fix 2>/dev/null)"; RC=$?
+[ "$RC" = 1 ] && ok "T25 --fix nonzero on hold failure" || bad "T25 (rc=$RC)"
+
+# ---- T26: on demotion, if metadata cleanup fails the monthly hold is NOT released
+#          (snapshot stays protected) and the dataset HOLDs (finding 3 ordering) ----
+rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"
+recent=$(date -u -d "$ADATE -5 days" +%Y-%m-%d); demoted="$(snapname "$recent")"
+awk -F'\t' -v d="$demoted" 'BEGIN{OFS="\t"} $1==d{$3="monthly"} {print}' "$WORK/healthy" > "$WORK/fz/snaps"
+printf '%s\tzht:monthly\t-\n' "$demoted" > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
+OUT="$(FAKE_ZFS_DIR="$WORK/fz" FAKE_ZFS_FAIL=inherit ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
+       ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --prune --force 2>/dev/null)"
+{ ! grep -qx "release zht:monthly $demoted" "$WORK/fz/ops.log" && echo "$OUT" | grep -qi "HELD"; } \
+  && ok "T26 demotion: inherit-fail keeps the hold + HOLDs dataset" || bad "T26 (out: $(echo "$OUT"|tail -1))"
 
 # ---- T13: demoted monthly keeper -> hold released + tags inherited, not destroyed ----
 rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"

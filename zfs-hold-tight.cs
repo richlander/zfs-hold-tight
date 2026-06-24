@@ -144,6 +144,21 @@ if (!Regex.IsMatch(ns, @"^[A-Za-z0-9_.-]+$"))
 { Console.Error.WriteLine($"FATAL: propertyNamespace '{ns}' must be letters/digits/._- (no colon)"); configDoc?.Dispose(); return 2; }
 string tagMonthly = $"{ns}:monthly", tagAdhoc = $"{ns}:adhoc", propKeep = $"{ns}:keep_until", propTier = $"{ns}:tier";
 
+// Resolve zfs/curl to absolute trusted paths rather than trusting the (root) cron's PATH —
+// a writable earlier PATH element would otherwise be root code execution. Override with
+// zfsPath / curlPath in config for non-standard layouts.
+string ResolveBin(string name, string cfgKey, string[] candidates)
+{
+    var configured = cfg.TryGetProperty(cfgKey, out var be) ? be.GetString() : null;
+    if (!string.IsNullOrEmpty(configured)) return configured;
+    foreach (var c in candidates) if (File.Exists(c)) return c;
+    return name;  // last resort: ambient PATH
+}
+string zfsBin = ResolveBin("zfs", "zfsPath", new[] { "/usr/sbin/zfs", "/sbin/zfs", "/usr/local/sbin/zfs", "/bin/zfs" });
+string curlBin = ResolveBin("curl", "curlPath", new[] { "/usr/bin/curl", "/bin/curl", "/usr/local/bin/curl" });
+if (zfsBin == "zfs")
+    Console.Error.WriteLine("WARNING: zfs not found at a standard absolute path; using PATH. Set \"zfsPath\" in config to harden.");
+
 var snapRe = new Regex(@"@autosnap_(\d{4}-\d{2}-\d{2}_\d{2}:\d{2}:\d{2})_daily$");
 var now = DateTime.UtcNow;
 var lines = new List<string>();
@@ -514,20 +529,21 @@ int Doctor(string? datasetFilter)
     void Log(string m) { Console.WriteLine(m); lines.Add(m); }
     Log($"=== zfs-hold-tight {now:yyyy-MM-dd HH:mm:ss}Z  mode=doctor ===");
 
-    int missing = 0, protected_ = 0, adhoc_ = 0, orphaned = 0;
+    int missing = 0, protected_ = 0, adhoc_ = 0, orphaned = 0, errors = 0;
     foreach (var (ds, _) in retention)
     {
         if (datasetFilter is not null && ds != datasetFilter) continue;
-        var (_, snaps) = ListDailies(ds);
+        var (code, snaps) = ListDailies(ds);
+        if (code != 0) { Log($"{ds}: ERROR - zfs list failed, cannot validate holds"); errors++; continue; }
         if (snaps.Count == 0) { Log($"{ds}: no snapshots"); continue; }
 
         // Find monthlies
         var monthKeeper = snaps.GroupBy(s => (s.Date.Year, s.Date.Month))
                               .Select(g => g.MaxBy(s => s.Date)!.Name).ToHashSet();
 
-        // Check which snapshots have holds (read-only: tolerate a holds-list failure)
+        // Check which snapshots have holds
         var holdMap = LoadHolds(ds);
-        if (holdMap is null) { Log($"{ds}: WARNING - zfs holds failed, hold status unknown"); continue; }
+        if (holdMap is null) { Log($"{ds}: ERROR - zfs holds failed, hold status unknown"); errors++; continue; }
 
         // Report monthly status
         Log($"{ds}: {monthKeeper.Count} monthlies");
@@ -564,14 +580,15 @@ int Doctor(string? datasetFilter)
         }
     }
 
-    Log($"\nSummary: {protected_} monthlies protected, {missing} missing, {adhoc_} adhoc, {orphaned} unexpected");
-    if (missing == 0 && orphaned == 0)
+    Log($"\nSummary: {protected_} monthlies protected, {missing} missing, {adhoc_} adhoc, {orphaned} unexpected"
+        + (errors > 0 ? $", {errors} datasets unverified (zfs errors)" : ""));
+    if (missing == 0 && orphaned == 0 && errors == 0)
         Log("✓ Hold strategy validated");
     else
-        Log($"⚠ Issues: {missing} missing holds, {orphaned} unexpected");
+        Log($"⚠ Issues: {missing} missing holds, {orphaned} unexpected, {errors} unverified");
 
     FlushLog(lines);
-    return missing > 0 ? 1 : 0;
+    return (missing > 0 || errors > 0) ? 1 : 0;
 }
 
 // ---- fix: create missing monthly holds ----
@@ -581,11 +598,12 @@ int Fix(string? datasetFilter)
     void Log(string m) { Console.WriteLine(m); lines.Add(m); }
     Log($"=== zfs-hold-tight {now:yyyy-MM-dd HH:mm:ss}Z  mode=fix ===");
 
-    int fixed_ = 0;
+    int fixed_ = 0, errors = 0;
     foreach (var (ds, _) in retention)
     {
         if (datasetFilter is not null && ds != datasetFilter) continue;
-        var (_, snaps) = ListDailies(ds);
+        var (code, snaps) = ListDailies(ds);
+        if (code != 0) { Log($"  ✗ {ds}: zfs list failed, skipping"); errors++; continue; }
         if (snaps.Count == 0) continue;
 
         // Find monthlies
@@ -600,16 +618,16 @@ int Fix(string? datasetFilter)
                 Log($"  ✓ {ds}/{Short(monthly)}");
                 fixed_++;
             }
-            else if (e.Contains("already"))
+            else if (e.Contains("already") || e.Contains("exists"))
                 Log($"  ✓ {ds}/{Short(monthly)} (already held)");
             else
-                Log($"  ✗ {ds}/{Short(monthly)}: {e.Trim()}");
+            { Log($"  ✗ {ds}/{Short(monthly)}: {e.Trim()}"); errors++; }
         }
     }
 
-    Log($"Fixed {fixed_} holds");
+    Log($"Fixed {fixed_} holds" + (errors > 0 ? $", {errors} errors" : ""));
     FlushLog(lines);
-    return 0;
+    return errors > 0 ? 1 : 0;
 }
 
 // ---- hold latest of tier ----
@@ -619,14 +637,16 @@ int HoldLatestTier(string tier, string? datasetFilter, bool noHc)
     void Log(string m) { Console.WriteLine(m); lines.Add(m); }
     Log($"=== zfs-hold-tight {now:yyyy-MM-dd HH:mm:ss}Z  mode=hold-latest-tier tier={tier} ===");
 
+    int errors = 0;
     foreach (var (ds, _) in retention)
     {
         if (datasetFilter is not null && ds != datasetFilter) continue;
-        var (_, snaps) = ListDailies(ds);
+        var (code, snaps) = ListDailies(ds);
+        if (code != 0) { Log($"  ✗ {ds}: zfs list failed, skipping"); errors++; continue; }
         if (snaps.Count == 0) continue;
 
         // Find latest of requested tier
-        Snap? target = null;
+        Snap target;
         if (tier == "monthly")
             target = snaps.GroupBy(s => (s.Date.Year, s.Date.Month))
                          .Select(g => g.MaxBy(s => s.Date)!)
@@ -638,21 +658,19 @@ int HoldLatestTier(string tier, string? datasetFilter, bool noHc)
         else // daily
             target = snaps.MaxBy(s => s.Date)!;
 
-        if (target is not null)
-        {
-            var (c, _, e) = Exec("zfs", "hold", tagAdhoc, target.Name);
-            if (c == 0)
-                Log($"  ✓ {ds}/{Short(target.Name)} ({tier})");
-            else if (e.Contains("already"))
-                Log($"  ✓ {ds}/{Short(target.Name)} ({tier}) - already held");
-            else
-                Log($"  ✗ {ds}/{Short(target.Name)}: {e.Trim()}");
-        }
+        var (c, _, e) = Exec("zfs", "hold", tagAdhoc, target.Name);
+        if (c == 0)
+            Log($"  ✓ {ds}/{Short(target.Name)} ({tier})");
+        else if (e.Contains("already") || e.Contains("exists"))
+            Log($"  ✓ {ds}/{Short(target.Name)} ({tier}) - already held");
+        else
+        { Log($"  ✗ {ds}/{Short(target.Name)}: {e.Trim()}"); errors++; }
     }
 
     FlushLog(lines);
-    if (!noHc) HcPing(hcUrl + "/hold-latest-" + tier, "ok");
-    return 0;
+    if (!noHc) HcPing(errors > 0 ? hcUrl + "/fail" : hcUrl + "/hold-latest-" + tier,
+                      errors > 0 ? $"hold-latest-{tier}: {errors} errors" : "ok");
+    return errors > 0 ? 1 : 0;
 }
 
 // ---- guards (evaluated independently per dataset; thresholds from that dataset's policy) ----
@@ -740,12 +758,9 @@ bool Promote(Snap s, DateTime keepUntil, string tier)
     bool success = true;
     if (tier == "daily")
     {
-        if (s.Tier == "monthly")   // demoted monthly: drop the protective hold first
-        {
-            var (rc, _, re) = Exec("zfs", "release", tagMonthly, s.Name);
-            if (rc != 0 && !re.Contains("no such hold") && !re.Contains("not found"))
-                Log($"    WARNING: release {tagMonthly} failed {Short(s.Name)}: {re.Trim()}");
-        }
+        // Demotion: clear the audit tags first, and only once that's known-good release the
+        // protective monthly hold. If an inherit fails the snapshot KEEPS its hold (stays
+        // protected) and the run HOLDs the dataset; the cleanup retries next run.
         if (s.Tier != null)
         {
             var (c, _, e) = Exec("zfs", "inherit", propTier, s.Name);
@@ -755,6 +770,12 @@ bool Promote(Snap s, DateTime keepUntil, string tier)
         {
             var (c, _, e) = Exec("zfs", "inherit", propKeep, s.Name);
             if (c != 0) { Log($"    ERROR: inherit keep_until failed {Short(s.Name)}: {e.Trim()}"); success = false; }
+        }
+        if (success && s.Tier == "monthly")   // demoted monthly: drop the now-unneeded hold last
+        {
+            var (rc, _, re) = Exec("zfs", "release", tagMonthly, s.Name);
+            if (rc != 0 && !re.Contains("no such hold") && !re.Contains("not found"))
+            { Log($"    ERROR: release {tagMonthly} failed {Short(s.Name)}: {re.Trim()}"); success = false; }
         }
         return success;
     }
@@ -822,8 +843,10 @@ void FlushLog(List<string>? logLines = null)
     catch { /* best effort - e.g. dry-run as non-root cannot write the root-owned log */ }
 }
 
-static (int code, string outp, string err) Exec(string file, params string[] a)
+(int code, string outp, string err) Exec(string file, params string[] a)
 {
+    if (file == "zfs") file = zfsBin;            // absolute trusted path, not ambient PATH
+    else if (file == "curl") file = curlBin;
     var psi = new ProcessStartInfo(file) { RedirectStandardOutput = true, RedirectStandardError = true };
     foreach (var x in a) psi.ArgumentList.Add(x);
     using var p = Process.Start(psi)!;
