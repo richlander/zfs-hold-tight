@@ -119,12 +119,20 @@ See [`zfs-hold-tight.example.json`](zfs-hold-tight.example.json). Top-level keys
 | `guardMaxDeletePerRun` | `5` | Per-run delete cap (circuit-breaker; `--force` overrides). |
 | `guardRecentWindowDays` | `7` | Require an unbroken daily window this many days back. |
 | `guardMaxDailyAgeHours` | `26` | HOLD if the newest daily is older than this. |
-| `guardMaxDailyShrinkPct` | `33` | HOLD if the newest daily references this % less data than the recent baseline (mass-deletion guard; `0` disables). |
+| `guardMaxDailyShrinkPct` | `33` | HOLD if the newest daily references this % less data than the recent baseline (mass-**deletion** guard; `0` disables). |
+| `guardMaxDailyChurnPct` | `50` | HOLD if the newest daily rewrites more than this % of the dataset's data in one day (mass-**rewrite / encryption** guard; `0` disables). |
 | `retentionPolicies` | — | Named `{dailyKeepDays, weeklyKeepDays, monthlyKeepDays}` profiles. |
 | `datasets` | — | `dataset → policy` map. Datasets must start with `archive/`. |
 
 Environment overrides: `ZFS_HOLD_TIGHT_CONFIG`, `ZFS_HOLD_TIGHT_LOG_DIR`,
 `ZFS_HOLD_TIGHT_HC_URL`.
+
+**Guards are evaluated independently per dataset** — a small dataset is judged on its own
+recent baseline, so an 80% wipe of a 100 MB dataset trips its guard regardless of how much
+other data exists. The `guard*` values above are global **defaults**; any of them may be
+**overridden inside a retention policy** (e.g. tighten the content guards for write-once
+media, or disable churn for a scratch dataset). Per-policy + a one-dataset policy ⇒
+effectively per-dataset thresholds when you need them.
 
 > **Note:** the pool prefix (`archive/`) and the property/hold namespace (`lander:`) are
 > compiled-in defaults. Edit the constants in `zfs-hold-tight.cs` to match your pool.
@@ -137,9 +145,10 @@ HOLDs everything. See [docs/SAFETY.md](docs/SAFETY.md) for the full contract.
 1. **Clock sane** — no snapshot dated in the future.
 2. **Newest daily fresh** — ≤ `guardMaxDailyAgeHours` (26h) old.
 3. **Recent window complete** — no gaps in the last `guardRecentWindowDays` (7) days.
-4. **No sudden data shrinkage** — newest daily references ≥ `guardMaxDailyShrinkPct` (33%) less than the recent baseline ⇒ HOLD (mass-deletion guard).
-5. **Volume circuit-breaker** — never delete more than `guardMaxDeletePerRun` without `--force`.
-6. **Population floor** — fewer dailies than the keep count ⇒ nothing to prune (noted).
+4. **No sudden data shrinkage** — newest daily references ≥ `guardMaxDailyShrinkPct` (33%) less than the recent baseline ⇒ HOLD (mass-**deletion** guard).
+5. **No excessive churn** — newest daily rewrites > `guardMaxDailyChurnPct` (50%) of the dataset in one day ⇒ HOLD (mass-**rewrite / encryption** guard).
+6. **Volume circuit-breaker** — never delete more than `guardMaxDeletePerRun` without `--force`.
+7. **Population floor** — fewer dailies than the keep count ⇒ nothing to prune (noted).
 
 Per-snapshot, it never deletes the replication base (newest daily), a week/month keeper,
 an uncovered daily, or any held snapshot.

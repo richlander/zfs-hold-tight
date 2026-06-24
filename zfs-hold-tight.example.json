@@ -6,11 +6,14 @@
   "_comment_healthchecks": "Optional. A healthchecks.io (or compatible) base ping URL. Leave unset (or pass --no-hc) to disable pings entirely. zfs-hold-tight pings the base URL on a clean prune and <url>/fail with diagnostics on any HOLD or destroy failure.",
   "healthchecksUrl": "https://hc-ping.com/YOUR-UUID-HERE",
 
+  "_comment_guards": "These are the GLOBAL DEFAULTS. Each guard is evaluated INDEPENDENTLY per dataset (a small dataset's deletion/encryption is flagged on its own scale). Any guard key may also be set inside a retention policy to override the default for that group of datasets.",
   "guardMaxDeletePerRun": 5,
   "guardRecentWindowDays": 7,
   "guardMaxDailyAgeHours": 26,
-  "_comment_shrink": "HOLD a dataset (delete nothing) + alert when the newest daily references this many percent less data than the recent baseline median — catches mass deletion on the source. 0 disables.",
+  "_comment_shrink": "HOLD + alert when the newest daily references this many % less data than the recent baseline median — catches mass DELETION. 0 disables.",
   "guardMaxDailyShrinkPct": 33,
+  "_comment_churn": "HOLD + alert when the newest daily rewrites more than this % of the dataset's referenced data — catches mass REWRITE / in-place ENCRYPTION. 0 disables.",
+  "guardMaxDailyChurnPct": 50,
 
   "retentionPolicies": {
     "baseline": {
@@ -20,10 +23,19 @@
       "monthlyKeepDays": 1825
     },
     "low": {
-      "_comment": "bulk/media - keep 7 days of dailies, 5 years of weeklies/monthlies",
+      "_comment": "bulk/media - write-once, so tighten the content guards (any change is suspicious)",
       "dailyKeepDays": 7,
       "weeklyKeepDays": 1825,
-      "monthlyKeepDays": 1825
+      "monthlyKeepDays": 1825,
+      "guardMaxDailyShrinkPct": 15,
+      "guardMaxDailyChurnPct": 10
+    },
+    "volatile": {
+      "_comment": "scratch/churny datasets - data changes a lot by design, so relax/disable churn",
+      "dailyKeepDays": 14,
+      "weeklyKeepDays": 1825,
+      "monthlyKeepDays": 1825,
+      "guardMaxDailyChurnPct": 0
     }
   },
 
@@ -31,6 +43,7 @@
     "archive/home/user1": "baseline",
     "archive/home/user2": "baseline",
     "archive/media/movies": "low",
-    "archive/media/music": "low"
+    "archive/media/music": "low",
+    "archive/scratch": "volatile"
   }
 }

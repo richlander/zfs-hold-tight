@@ -22,7 +22,11 @@ snapshots never conflicts.
 
 ## Run-level guards — any failure ⇒ HOLD that dataset (delete nothing), and alert
 
-Evaluated **per dataset**, anchored on the newest daily, not wall-clock.
+Evaluated **independently per dataset**, anchored on the newest daily, not wall-clock and
+not aggregated across datasets — so an attack confined to one small dataset is judged on
+that dataset's own baseline and flagged on its own. Each threshold below is a global
+default that a retention policy may override (so a write-once media policy can tighten the
+content guards while a churny scratch policy relaxes them).
 
 1. **Recent window complete.** The `guardRecentWindowDays` (default 7) days ending at the
    newest daily must each have a daily snapshot — no gaps. *(Load-bearing guard: the
@@ -34,42 +38,51 @@ Evaluated **per dataset**, anchored on the newest daily, not wall-clock.
    newest snapshot. A wrong clock would make `keep_until` expire everything at once.
 4. **No sudden data shrinkage.** If the newest daily references more than
    `guardMaxDailyShrinkPct` (default 33%) less data than the recent baseline median, HOLD
-   — a likely mass deletion on the source. This guard catches outright **deletion**; it
-   does *not* catch **encryption-in-place**, which preserves `referenced` (size) while
-   scrambling contents. Set to 0 to disable. (Recoverability of both cases still rests on
-   retention: pre-incident keepers survive defender-side for years regardless.)
-5. **Volume circuit-breaker.** A single run may not delete more than
+   — a likely mass deletion on the source. Catches outright **deletion** (`referenced`
+   drops). Set to 0 to disable.
+5. **No excessive churn.** If the newest daily's `written` (bytes changed since the prior
+   snapshot) exceeds `guardMaxDailyChurnPct` (default 50%) of the dataset's `referenced`
+   size, HOLD — a likely mass rewrite / **in-place encryption** (which guard 4 misses,
+   since encryption preserves size while scrambling contents). Heuristic: legitimately
+   churny datasets will trip it, so relax/disable it per policy. Set to 0 to disable.
+6. **Volume circuit-breaker.** A single run may not delete more than
    `guardMaxDeletePerRun` (default 5) snapshots for one dataset without `--force`. Steady
    state deletes 0–1/day; a large number signals an abnormal state or a logic bug.
-6. **Population floor.** If a dataset has fewer dailies than its keep count, nothing is
+7. **Population floor.** If a dataset has fewer dailies than its keep count, nothing is
    beyond the window — skip and note it; a sudden drop is itself suspicious.
 
 A broken source feed shows up as stale/gappy dailies, so guards 1–2 enforce replication
 health by proxy.
 
+> **Detection vs. recovery.** Guards 4–5 are best-effort *early warning* — they alert and
+> stop pruning the granular recent dailies, but a patient low-and-slow attack (a few % a
+> day) evades both. The actual protection for deletion *and* encryption is **retention**:
+> pre-incident keepers survive defender-side for years (independent of the source), so you
+> recover by rolling back to one as long as you notice within the retention window.
+
 ## Per-snapshot protections — never delete a snapshot that is…
 
-7. **The newest daily** — the replication incremental base. Absolute, always.
-8. **Within the daily-keep window** — one of the newest N (N per policy).
-9. **A week keeper** — newest daily in its ISO-week, within weekly retention.
-10. **A month keeper** — newest daily in its month, within monthly retention.
-11. **Not yet covered** — a daily is deleted only once a *surviving* keeper covers both
+8. **The newest daily** — the replication incremental base. Absolute, always.
+9. **Within the daily-keep window** — one of the newest N (N per policy).
+10. **A week keeper** — newest daily in its ISO-week, within weekly retention.
+11. **A month keeper** — newest daily in its month, within monthly retention.
+12. **Not yet covered** — a daily is deleted only once a *surviving* keeper covers both
     its ISO-week and its month. Never open a coverage hole.
-12. **Held** — any `zfs hold` (e.g. a defensive `lander:adhoc`) makes the snapshot
+13. **Held** — any `zfs hold` (e.g. a defensive `lander:adhoc`) makes the snapshot
     off-limits; it is skipped, never forced. The tool's own `lander:monthly` hold is
     released immediately before it destroys an expired monthly keeper.
-13. **Not a recognized `autosnap_<ts>_daily`** — legacy `_weekly`/`_monthly`, manual, and
+14. **Not a recognized `autosnap_<ts>_daily`** — legacy `_weekly`/`_monthly`, manual, and
     unparseable names are out of scope (and an unparseable date skips that one snapshot,
     never aborts the run).
 
 ## Operational guarantees
 
-14. **Dry-run by default.** Deletion happens only with `--prune`.
-15. **Per-dataset isolation.** A guard tripping on one dataset HOLDs only that dataset;
+15. **Dry-run by default.** Deletion happens only with `--prune`.
+16. **Per-dataset isolation.** A guard tripping on one dataset HOLDs only that dataset;
     healthy datasets still prune. A global fault (e.g. a bad clock) HOLDs everything.
-16. **Single run at a time.** A mutating run takes an exclusive lock; a second overlapping
+17. **Single run at a time.** A mutating run takes an exclusive lock; a second overlapping
     run exits without touching anything.
-17. **Always logs; alerts on trouble.** Every run appends a timestamped record to the log
+18. **Always logs; alerts on trouble.** Every run appends a timestamped record to the log
     directory (and stdout). On `--prune` it pings healthchecks.io on a clean run, and
     `<url>/fail` (with diagnostics) whenever any guard HOLDs a dataset or a destroy fails
     — so an unhealthy-but-not-pruning state is **visible, never silent**.

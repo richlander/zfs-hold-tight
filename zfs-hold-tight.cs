@@ -12,10 +12,12 @@
 //
 // SAFETY: it deletes only when the dataset's feed is provably healthy; otherwise it
 // HOLDs (deletes nothing) and alerts. Full contract: docs/SAFETY.md.
-//   Run-level guards (HOLD the dataset on failure): recent 7-day window complete,
-//   newest daily fresh (<=26h, guardMaxDailyAgeHours), clock sane, no sudden data
-//   shrinkage (guardMaxDailyShrinkPct — catches mass deletion), volume
-//   circuit-breaker (<=5/run w/o --force).
+//   Run-level guards, evaluated INDEPENDENTLY PER DATASET (HOLD that dataset on failure):
+//   recent 7-day window complete, newest daily fresh (<=26h, guardMaxDailyAgeHours),
+//   clock sane, no sudden data shrinkage (guardMaxDailyShrinkPct — mass deletion), no
+//   excessive churn (guardMaxDailyChurnPct — mass rewrite/encryption), volume
+//   circuit-breaker (<=5/run w/o --force). Each guard threshold defaults globally but
+//   may be overridden per retention policy.
 //   Per-snapshot: never the newest/base, week/month keepers, uncovered, held, or
 //   non-_daily snapshots.
 //
@@ -74,7 +76,7 @@ if (!cfg.TryGetProperty("datasets", out var datasetsElem) || datasetsElem.ValueK
 }
 
 // Validate and load numeric config with bounds
-int MaxDeletePerRun = 5, RecentWindowDays = 7, MaxDailyAgeHours = 26, MaxDailyShrinkPct = 33;
+int MaxDeletePerRun = 5, RecentWindowDays = 7, MaxDailyAgeHours = 26, MaxDailyShrinkPct = 33, MaxDailyChurnPct = 50;
 try
 {
     if (cfg.TryGetProperty("guardMaxDeletePerRun", out var gdp))
@@ -97,12 +99,27 @@ try
         MaxDailyShrinkPct = gms.GetInt32();   // 0 disables the data-shrinkage guard
         if (MaxDailyShrinkPct < 0 || MaxDailyShrinkPct > 99) throw new ArgumentException("guardMaxDailyShrinkPct must be 0-99 (0 disables)");
     }
+    if (cfg.TryGetProperty("guardMaxDailyChurnPct", out var gmc))
+    {
+        MaxDailyChurnPct = gmc.GetInt32();    // 0 disables the churn (mass-rewrite) guard
+        if (MaxDailyChurnPct < 0 || MaxDailyChurnPct > 100) throw new ArgumentException("guardMaxDailyChurnPct must be 0-100 (0 disables)");
+    }
 }
 catch (Exception ex)
 {
     Console.Error.WriteLine($"FATAL: invalid config values: {ex.Message}");
     configDoc?.Dispose();
     return 2;
+}
+
+// Validate a per-policy guard override (same bounds as the top-level keys); falls back
+// to the global default when the policy omits the key.
+int GuardInt(JsonElement p, string key, int dflt, Func<int, bool> ok, string rule)
+{
+    if (!p.TryGetProperty(key, out var e)) return dflt;
+    int v = e.GetInt32();
+    if (!ok(v)) throw new ArgumentException($"{key} {rule}");
+    return v;
 }
 
 string logDir = Environment.GetEnvironmentVariable("ZFS_HOLD_TIGHT_LOG_DIR")
@@ -124,10 +141,12 @@ void Log(string m) { Console.WriteLine(m); lines.Add(m); }
 
 // Build retention policy from config (needed for all modes)
 var retention = new Dictionary<string, Retention>();
+var guardsByDataset = new Dictionary<string, Guards>();
 var policies = new Dictionary<string, Retention>();
+var policyGuards = new Dictionary<string, Guards>();
 const string DatasetPrefix = "archive/";  // allowlist: only prune archive/* datasets
 
-// Load and validate retention policies
+// Load and validate retention policies + their (optional) per-policy guard overrides.
 try
 {
     foreach (var policy in policiesElem.EnumerateObject())
@@ -141,6 +160,12 @@ try
             throw new ArgumentException($"Policy '{policy.Name}': all retention days must be positive");
 
         policies[policy.Name] = new Retention(daily, weekly, monthly);
+        policyGuards[policy.Name] = new Guards(
+            GuardInt(p, "guardMaxDeletePerRun",   MaxDeletePerRun,   v => v > 0,              "must be > 0"),
+            GuardInt(p, "guardRecentWindowDays",  RecentWindowDays,  v => v > 0 && v <= 365,  "must be 1-365"),
+            GuardInt(p, "guardMaxDailyAgeHours",  MaxDailyAgeHours,  v => v > 0 && v <= 720,  "must be 1-720"),
+            GuardInt(p, "guardMaxDailyShrinkPct", MaxDailyShrinkPct, v => v >= 0 && v <= 99,  "must be 0-99 (0 disables)"),
+            GuardInt(p, "guardMaxDailyChurnPct",  MaxDailyChurnPct,  v => v >= 0 && v <= 100, "must be 0-100 (0 disables)"));
     }
 }
 catch (Exception ex)
@@ -160,7 +185,10 @@ try
 
         string policyName = dataset.Value.GetString() ?? "baseline";
         if (policies.TryGetValue(policyName, out var policy))
+        {
             retention[dataset.Name] = policy;
+            guardsByDataset[dataset.Name] = policyGuards[policyName];
+        }
         else
             throw new ArgumentException($"Dataset '{dataset.Name}' references unknown policy '{policyName}'");
     }
@@ -273,9 +301,10 @@ foreach (var (ds, ret) in retention)
         continue;
     }
     if (snaps.Count == 0) { Log($"{ds}: no daily snapshots, skip"); continue; }
+    var gd = guardsByDataset[ds];   // this dataset's effective guard thresholds
 
     // ---- run-level guards (HOLD on failure) ----
-    string? guard = HealthGuard(snaps, ret);
+    string? guard = HealthGuard(snaps, ret, gd);
     if (guard is not null) { Log($"{ds}: HOLD - {guard} (no deletions)"); held.Add($"{ds}: {guard}"); continue; }
 
     // ---- keepers + desired keep_until ----
@@ -323,10 +352,10 @@ foreach (var (ds, ret) in retention)
         continue;
     }
 
-    // ---- volume circuit-breaker (guard 5) ----
-    if (doomed.Count > MaxDeletePerRun && !force)
+    // ---- volume circuit-breaker ----
+    if (doomed.Count > gd.MaxDeletePerRun && !force)
     {
-        Log($"{ds}: HOLD - would delete {doomed.Count} > cap {MaxDeletePerRun}; rerun with --force if intended");
+        Log($"{ds}: HOLD - would delete {doomed.Count} > cap {gd.MaxDeletePerRun}; rerun with --force if intended");
         held.Add($"{ds}: volume {doomed.Count}>cap"); continue;
     }
 
@@ -592,43 +621,50 @@ int HoldLatestTier(string tier, string? datasetFilter, bool noHc)
     return 0;
 }
 
-// ---- guards ----
-string? HealthGuard(List<Snap> snaps, Retention ret)
+// ---- guards (evaluated independently per dataset; thresholds from that dataset's policy) ----
+string? HealthGuard(List<Snap> snaps, Retention ret, Guards gd)
 {
     var newest = snaps.Max(s => s.Date);
-    if (snaps.Any(s => s.Date > now.AddMinutes(5)))                       // guard 4: clock
+    var newestSnap = snaps.MaxBy(s => s.Date)!;
+    if (snaps.Any(s => s.Date > now.AddMinutes(5)))                       // guard: clock
         return "snapshot dated in the future (clock?)";
-    if (now - newest > TimeSpan.FromHours(MaxDailyAgeHours))             // guard 2: newest daily is fresh
-        return $"newest daily is stale: {newest:yyyy-MM-dd HH:mm}Z is {(now - newest).TotalHours:F0}h old (> {MaxDailyAgeHours}h)";
-    var days = snaps.Select(s => s.Date.Date).ToHashSet();               // guard 1: recent window
+    if (now - newest > TimeSpan.FromHours(gd.MaxDailyAgeHours))           // guard: newest daily is fresh
+        return $"newest daily is stale: {newest:yyyy-MM-dd HH:mm}Z is {(now - newest).TotalHours:F0}h old (> {gd.MaxDailyAgeHours}h)";
+    var days = snaps.Select(s => s.Date.Date).ToHashSet();               // guard: recent window
     var missing = new List<string>();
-    for (int d = 0; d < RecentWindowDays; d++)
+    for (int d = 0; d < gd.RecentWindowDays; d++)
     {
         var day = newest.Date.AddDays(-d);
         if (!days.Contains(day)) missing.Add(day.ToString("MM-dd"));
     }
-    if (missing.Count > 0) return $"gap in last {RecentWindowDays}d: missing {string.Join(",", missing)}";
-    // guard: data shrinkage. The newest daily referencing far less data than the recent
-    // baseline signals mass deletion on the source. Catches deletion, NOT encryption
-    // (which preserves `referenced`). 0 disables.
-    if (MaxDailyShrinkPct > 0)
+    if (missing.Count > 0) return $"gap in last {gd.RecentWindowDays}d: missing {string.Join(",", missing)}";
+
+    // baseline = recent dailies of THIS dataset (so a small dataset is judged on its own scale)
+    var baseline = snaps.Where(s => s.Name != newestSnap.Name && s.Date >= newest.AddDays(-gd.RecentWindowDays))
+                        .ToList();
+
+    // guard: data shrinkage. Newest daily referencing far less than this dataset's recent
+    // baseline ⇒ mass deletion. Catches deletion, NOT encryption (which preserves `referenced`).
+    if (gd.MaxDailyShrinkPct > 0 && newestSnap.Referenced is long nref)
     {
-        var newestSnap = snaps.MaxBy(s => s.Date)!;
-        var baseline = snaps.Where(s => s.Name != newestSnap.Name
-                                     && s.Date >= newest.AddDays(-RecentWindowDays)
-                                     && s.Referenced is long rv && rv > 0)
-                            .Select(s => s.Referenced!.Value).OrderBy(x => x).ToList();
-        if (newestSnap.Referenced is long nref && baseline.Count > 0)
+        var refs = baseline.Where(s => s.Referenced is long rv && rv > 0).Select(s => s.Referenced!.Value).OrderBy(x => x).ToList();
+        if (refs.Count > 0)
         {
-            long median = baseline[baseline.Count / 2];
-            if (nref < median * (100 - MaxDailyShrinkPct) / 100.0)
-            {
-                double dropPct = 100.0 * (1 - (double)nref / median);
-                return $"newest daily shrank {dropPct:F0}% ({nref / 1048576}MiB referenced vs ~{median / 1048576}MiB baseline, > {MaxDailyShrinkPct}% drop) — possible mass deletion on source";
-            }
+            long median = refs[refs.Count / 2];
+            if (nref < median * (100 - gd.MaxDailyShrinkPct) / 100.0)
+                return $"newest daily shrank {100.0 * (1 - (double)nref / median):F0}% ({nref / 1048576}MiB referenced vs ~{median / 1048576}MiB baseline, > {gd.MaxDailyShrinkPct}% drop) — possible mass deletion on source";
         }
     }
-    if (snaps.Count < ret.DailyKeepDays)                                 // guard 6: population (note only)
+
+    // guard: churn. A single daily rewriting most of this dataset ⇒ mass rewrite / in-place
+    // encryption. `written` = bytes changed since the prior snapshot. 0 disables.
+    if (gd.MaxDailyChurnPct > 0 && newestSnap.Written is long nwr && newestSnap.Referenced is long nrf && nrf > 0)
+    {
+        if (nwr > nrf * gd.MaxDailyChurnPct / 100.0)
+            return $"newest daily churned {100.0 * nwr / nrf:F0}% ({nwr / 1048576}MiB written vs {nrf / 1048576}MiB referenced, > {gd.MaxDailyChurnPct}%) — possible mass rewrite/encryption on source";
+    }
+
+    if (snaps.Count < ret.DailyKeepDays)                                 // guard: population (note only)
         Log($"  note: {snaps.Count} dailies < keep {ret.DailyKeepDays}, nothing beyond window");
     return null;
 }
@@ -636,8 +672,8 @@ string? HealthGuard(List<Snap> snaps, Retention ret)
 // ---- helpers ----
 (int, List<Snap>) ListDailies(string ds)
 {
-    // -p: exact bytes for `referenced` (the data-shrinkage guard needs raw numbers).
-    var (code, outp, err) = Exec("zfs", "list", "-Hp", "-t", "snapshot", "-o", "name,lander:keep_until,lander:tier,referenced", "-d", "1", ds);
+    // -p: exact bytes for referenced/written (the shrinkage + churn guards need raw numbers).
+    var (code, outp, err) = Exec("zfs", "list", "-Hp", "-t", "snapshot", "-o", "name,lander:keep_until,lander:tier,referenced,written", "-d", "1", ds);
     var list = new List<Snap>();
     if (code != 0) { Log($"ERROR: zfs list {ds} failed: {err.Trim()}"); return (code, list); }
     foreach (var line in outp.Split('\n', StringSplitOptions.RemoveEmptyEntries))
@@ -653,7 +689,8 @@ string? HealthGuard(List<Snap> snaps, Retention ret)
         long? ku = cols.Length > 1 && long.TryParse(cols[1], out var v) ? v : null;
         string? tier = cols.Length > 2 && cols[2] != "-" ? cols[2] : null;
         long? refb = cols.Length > 3 && long.TryParse(cols[3], out var rb) ? rb : null;
-        list.Add(new Snap(cols[0], date, ku, tier, refb));
+        long? wrb = cols.Length > 4 && long.TryParse(cols[4], out var wb) ? wb : null;
+        list.Add(new Snap(cols[0], date, ku, tier, refb, wrb));
     }
     return (0, list);
 }
@@ -765,4 +802,5 @@ static bool SameIsoWeek(DateTime a, DateTime b) =>
 static string Short(string snap) => snap[(snap.IndexOf('@') + 1)..];
 
 record Retention(int DailyKeepDays, int WeeklyKeepDays, int MonthlyKeepDays);
-record Snap(string Name, DateTime Date, long? KeepUntil, string? Tier, long? Referenced = null);
+record Guards(int MaxDeletePerRun, int RecentWindowDays, int MaxDailyAgeHours, int MaxDailyShrinkPct, int MaxDailyChurnPct);
+record Snap(string Name, DateTime Date, long? KeepUntil, string? Tier, long? Referenced = null, long? Written = null);

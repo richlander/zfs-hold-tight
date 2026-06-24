@@ -157,6 +157,40 @@ gen_window $((NOW-7200)) | awk -F'\t' 'BEGIN{OFS="\t"} {print $1,$2,$3,107374182
 run_tool "$WORK/stable" --force
 { ! echo "$OUT" | grep -qi "shrank\|shrink"; } && ok "T15 stable referenced: no false shrink-HOLD" || bad "T15 false positive (out: $(echo "$OUT"|tail -1))"
 
+# ---- T16: churn spike (newest daily rewrites most of the dataset) -> HOLD ----
+# 5-col fixture (..., referenced, written); referenced stable 1GiB, newest written 900MiB (~88% churn)
+nlines="$(gen_window $((NOW-7200)) | wc -l)"
+gen_window $((NOW-7200)) | awk -F'\t' -v n="$nlines" \
+  'BEGIN{OFS="\t"} {print $1,$2,$3,1073741824,(NR==n?943718400:10485760)}' > "$WORK/churn"
+run_tool "$WORK/churn" --force
+{ echo "$OUT" | grep -qi "churn\|rewrite\|encryption"; } && ok "T16 churn spike -> HOLD" || bad "T16 (out: $(echo "$OUT"|tail -1))"
+
+# ---- T17: normal churn -> churn guard does NOT false-positive ----
+gen_window $((NOW-7200)) | awk -F'\t' 'BEGIN{OFS="\t"} {print $1,$2,$3,1073741824,10485760}' > "$WORK/lowchurn"
+run_tool "$WORK/lowchurn" --force
+{ ! echo "$OUT" | grep -qi "churn"; } && ok "T17 normal churn: no false churn-HOLD" || bad "T17 false positive (out: $(echo "$OUT"|tail -1))"
+
+# ---- T18: per-dataset isolation — a small (100MiB) dataset wiped 80% is flagged on its
+#          own, while a healthy large dataset prunes normally (only the small one HELD) ----
+cat > "$WORK/cfg2.json" <<EOF
+{ "logDir": "$WORK/logs", "retentionPolicies": { "baseline": { "dailyKeepDays": 30, "weeklyKeepDays": 1825, "monthlyKeepDays": 1825 } },
+  "datasets": { "archive/home/rich": "baseline", "archive/scratch": "baseline" } }
+EOF
+n2="$(gen_window $((NOW-7200)) | wc -l)"
+# healthy 1GiB dataset
+gen_window $((NOW-7200)) | awk -F'\t' 'BEGIN{OFS="\t"} {print $1,$2,$3,1073741824,10485760}' > "$WORK/d2"
+# small 100MiB dataset whose newest daily references only 20MiB (80% drop)
+gen_window $((NOW-7200)) | sed 's#archive/home/rich#archive/scratch#' \
+  | awk -F'\t' -v n="$n2" 'BEGIN{OFS="\t"} {print $1,$2,$3,(NR==n?20971520:104857600),5242880}' >> "$WORK/d2"
+rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"; cp "$WORK/d2" "$WORK/fz/snaps"; : > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
+OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/cfg2.json" \
+       ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --force 2>/dev/null)"
+{ echo "$OUT" | grep "archive/scratch:" | grep -qi "shrank\|HOLD" \
+  && ! { echo "$OUT" | grep "archive/home/rich:" | grep -qi "HOLD"; } \
+  && echo "$OUT" | grep -qi "1 HELD"; } \
+  && ok "T18 per-dataset isolation: 100MiB dataset wiped 80% flagged alone" \
+  || bad "T18 (out: $(echo "$OUT" | grep -E 'scratch|home/rich|HELD' | tr '\n' '|'))"
+
 # ---- T13: demoted monthly keeper -> hold released + tags inherited, not destroyed ----
 rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"
 recent=$(date -u -d "$ADATE -5 days" +%Y-%m-%d); demoted="$(snapname "$recent")"
