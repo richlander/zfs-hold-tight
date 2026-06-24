@@ -21,11 +21,12 @@
 // Every run appends to /mnt/archive/tools/zfs-hold-tight.log and (on --prune) pings
 // healthchecks.io: the base URL on a clean run, /fail with diagnostics on trouble.
 //
-// Build (native, glibc-matched to TrueNAS 2.36 - NOT a cross-compile):
-//   docker run --rm -v "$PWD:/src" -w /src debian:12 bash -c '
-//     apt-get update -qq && apt-get install -y -qq curl clang zlib1g-dev ca-certificates libicu72
-//     curl -sSL https://dot.net/v1/dotnet-install.sh | bash -s -- --channel 10.0 --install-dir /usr/share/dotnet
-//     PATH=$PATH:/usr/share/dotnet dotnet publish zfs-hold-tight.cs -r linux-x64 -c Release -o out'
+// Build (native, glibc-matched to the target - NOT a cross-compile). The dotnet AOT SDK
+// image is Debian 12-based (glibc 2.36, matching TrueNAS) with clang+zlib already present:
+//   docker run --rm -v "$PWD:/src" -w /src mcr.microsoft.com/dotnet/sdk:10.0-aot \
+//     dotnet publish zfs-hold-tight.cs -r linux-x64 -c Release -o out
+//   # verify it will run on the target: highest symbol must be <= the target's glibc
+//   objdump -T out/zfs-hold-tight | grep -oE 'GLIBC_[0-9.]+' | sort -V | tail -1
 //
 // Usage: zfs-hold-tight [--prune] [--force] [--dataset archive/<name>] [-v] [--no-hc]
 //        zfs-hold-tight --doctor [--dataset archive/<name>]

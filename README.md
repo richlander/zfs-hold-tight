@@ -69,7 +69,12 @@ Each run, per dataset:
 # 1. Configure
 cp zfs-hold-tight.example.json zfs-hold-tight.json   # then edit datasets + retention
 
-# 2. Build (native-AOT single binary; needs the .NET 10+ SDK + clang)
+# 2. Build a native-AOT single binary (needs the .NET 10+ SDK + clang).
+#    AOT is NOT a cross-compile: build on glibc <= the target's. To deploy to an
+#    older target (e.g. TrueNAS / Debian 12, glibc 2.36), build in the AOT SDK image:
+#      docker run --rm -v "$PWD:/src" -w /src mcr.microsoft.com/dotnet/sdk:10.0-aot \
+#        dotnet publish zfs-hold-tight.cs -r linux-x64 -c Release -o bin/
+#    Otherwise, locally:
 dotnet publish zfs-hold-tight.cs -r linux-x64 -c Release -o bin/
 
 # 3. Dry-run (default: shows what would be pruned, deletes nothing)
