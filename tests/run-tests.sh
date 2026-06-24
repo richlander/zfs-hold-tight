@@ -77,6 +77,9 @@ grep -qx "$(snapname "$ADATE")" "$WORK/destroyed" && bad "T2b newest/base destro
 # tag-only-keepers: plain dailies must NOT be tagged; only ~70 keepers get zht:tier
 sets=$(grep -c 'set zht:tier' "$OPS"); sets=${sets:-0}
 { [ "$sets" -gt 0 ] && [ "$sets" -lt 120 ]; } && ok "T2c tag-only-keepers ($sets tier-sets, not ~388)" || bad "T2c tier-sets=$sets"
+# finding 2: doomed plain dailies (no monthly hold) must NOT each get a redundant release
+rels=$(grep -c '^release' "$OPS"); rels=${rels:-0}
+[ "$rels" = 0 ] && ok "T2d no redundant release before destroying unheld dailies" || bad "T2d $rels redundant releases"
 
 # ---- T3a: newest 30h old (>26h) -> HOLD on freshness ----
 gen_window $((NOW-108000)) > "$WORK/stale"
@@ -247,6 +250,15 @@ OUT="$(FAKE_ZFS_DIR="$WORK/fz" FAKE_ZFS_FAIL=inherit ZFS_HOLD_TIGHT_CONFIG="$WOR
        ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --prune --force 2>/dev/null)"
 { ! grep -qx "release zht:monthly $demoted" "$WORK/fz/ops.log" && echo "$OUT" | grep -qi "HELD"; } \
   && ok "T26 demotion: inherit-fail keeps the hold + HOLDs dataset" || bad "T26 (out: $(echo "$OUT"|tail -1))"
+
+# ---- T27: monthly keepers already held are NOT re-held every prune (finding 3) ----
+rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"; cp "$WORK/healthy" "$WORK/fz/snaps"; : > "$WORK/fz/ops.log"
+: > "$WORK/fz/holds"
+while read -r kd; do printf '%s\tzht:monthly\t-\n' "$(snapname "$kd")" >> "$WORK/fz/holds"; done < "$WORK/mk"
+OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
+       ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --prune --force 2>/dev/null)"
+[ "$(grep -c '^hold zht:monthly' "$WORK/fz/ops.log")" = 0 ] \
+  && ok "T27 already-held monthlies not re-held" || bad "T27 $(grep -c '^hold zht:monthly' "$WORK/fz/ops.log") redundant holds"
 
 # ---- T13: demoted monthly keeper -> hold released + tags inherited, not destroyed ----
 rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"

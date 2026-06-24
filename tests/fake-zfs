@@ -17,7 +17,8 @@ case "$sub" in
     awk -F'\t' -v p="$ds@" 'index($1,p)==1{print}' "$D/snaps" 2>/dev/null
     exit 0 ;;
   holds)
-    printf 'NAME\tTAG\tTIMESTAMP\n'
+    hdr=1; for x in "$@"; do case "$x" in -*H*) hdr=0;; esac; done   # -H suppresses the header
+    [ "$hdr" = 1 ] && printf 'NAME\tTAG\tTIMESTAMP\n'
     [ -f "$D/holds" ] && cat "$D/holds"
     exit 0 ;;
   set)

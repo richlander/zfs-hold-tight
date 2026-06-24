@@ -165,6 +165,13 @@ Per-snapshot, it never deletes the replication base (newest daily), a week/month
 *past* its retention ages out (so your recovery window is bounded by `weeklyKeepDays` /
 `monthlyKeepDays`, not infinite).
 
+> **`--force` removes the per-run delete throttle entirely** — use it deliberately for a
+> reviewed bulk cleanup (e.g. a first run against a large backlog), then return to plain
+> `--prune`. Steady-state runs do ~0–1 deletes and a handful of metadata writes; a first
+> run after introducing the tool (or after a long gap) does more — it tags each keeper and
+> clears tags off any previously-tagged dailies — but still one `zfs list`/`holds` per
+> dataset, not per snapshot.
+
 ## Building
 
 A native-AOT build produces a single self-contained binary with instant startup and no

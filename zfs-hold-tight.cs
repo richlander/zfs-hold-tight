@@ -357,7 +357,7 @@ foreach (var (ds, ret) in retention)
     // Current holds on this dataset — used to (a) honor guard 12 (never delete a held
     // snapshot) and (b) tell our managed <ns>:monthly hold from foreign/defensive ones.
     // A holds-list failure means we can't verify guard 12, so HOLD rather than guess.
-    var holdMap = LoadHolds(ds);
+    var holdMap = LoadHolds(snaps.Select(s => s.Name).ToList());
     if (holdMap is null)
     {
         Log($"{ds}: HOLD - zfs holds failed (cannot verify holds)");
@@ -373,7 +373,8 @@ foreach (var (ds, ret) in retention)
     {
         var keepUntil = Desired(s);
         string tier = monthKeeper.Contains(s.Name) ? "monthly" : weekKeeper.Contains(s.Name) ? "weekly" : "daily";
-        if (prune && !Promote(s, keepUntil, tier)) promoteErrors.Add(Short(s.Name));
+        bool monthlyHeld = holdMap.TryGetValue(s.Name, out var sht) && sht.Contains(tagMonthly);
+        if (prune && !Promote(s, keepUntil, tier, monthlyHeld)) promoteErrors.Add(Short(s.Name));
         if (now <= keepUntil) continue;                     // still retained
         if (s.Name == newest) continue;                     // never the base (guard 7)
         if (IsForeignHeld(s.Name))                          // guard 12: held => never delete, skip cleanly
@@ -419,11 +420,15 @@ foreach (var (ds, ret) in retention)
         if (verbose) Log($"  {verb}: {Short(name)}");
         if (!prune) continue;
 
-        // Release our managed <ns>:monthly hold before destroy (idempotent). Doomed
-        // snapshots carry no foreign hold (guard 12 excluded those above).
-        var (rc, _, re) = Exec("zfs", "release", tagMonthly, name);
-        if (rc != 0 && !re.Contains("no such hold") && !re.Contains("not found"))
-            Log($"    WARNING: release {tagMonthly} failed {Short(name)}: {re.Trim()}");
+        // Release our managed <ns>:monthly hold before destroy, but ONLY for snapshots that
+        // actually have it (an expired monthly keeper, or one held at load time) — not for
+        // the common plain-daily case. (Guard 12 already excluded foreign-held snapshots.)
+        if (monthKeeper.Contains(name) || (holdMap.TryGetValue(name, out var ht) && ht.Contains(tagMonthly)))
+        {
+            var (rc, _, re) = Exec("zfs", "release", tagMonthly, name);
+            if (rc != 0 && !re.Contains("no such hold") && !re.Contains("not found"))
+                Log($"    WARNING: release {tagMonthly} failed {Short(name)}: {re.Trim()}");
+        }
 
         destroyAttempted++;
         var (code, _, err) = Exec("zfs", "destroy", name);
@@ -491,7 +496,9 @@ int CheckHolds(bool noHc)
     bool anyFail = false;
     foreach (var (ds, ret) in retention)
     {
-        var holdMap = LoadHolds(ds);
+        var (code, snaps) = ListDailies(ds);
+        if (code != 0) { Log($"  WARNING: {ds}: zfs list failed"); anyFail = true; continue; }
+        var holdMap = LoadHolds(snaps.Select(s => s.Name).ToList());
         if (holdMap is null) { Log($"  WARNING: {ds}: zfs holds failed"); anyFail = true; continue; }
         int maxDays = Math.Max(ret.WeeklyKeepDays, ret.MonthlyKeepDays);
         var cutoff = now.AddDays(-maxDays);
@@ -542,7 +549,7 @@ int Doctor(string? datasetFilter)
                               .Select(g => g.MaxBy(s => s.Date)!.Name).ToHashSet();
 
         // Check which snapshots have holds
-        var holdMap = LoadHolds(ds);
+        var holdMap = LoadHolds(snaps.Select(s => s.Name).ToList());
         if (holdMap is null) { Log($"{ds}: ERROR - zfs holds failed, hold status unknown"); errors++; continue; }
 
         // Report monthly status
@@ -753,14 +760,15 @@ string? HealthGuard(List<Snap> snaps, Retention ret, Guards gd)
 // writes, not ~280) and is self-correcting: a snapshot that was a keeper last run but
 // is now superseded (demotion) has its tags inherited away and its monthly hold released
 // — without that release a demoted monthly's hold would later block its own destroy.
-bool Promote(Snap s, DateTime keepUntil, string tier)
+bool Promote(Snap s, DateTime keepUntil, string tier, bool monthlyHeld)
 {
     bool success = true;
     if (tier == "daily")
     {
         // Demotion: clear the audit tags first, and only once that's known-good release the
-        // protective monthly hold. If an inherit fails the snapshot KEEPS its hold (stays
-        // protected) and the run HOLDs the dataset; the cleanup retries next run.
+        // protective monthly hold (and only if it's actually present). If an inherit fails
+        // the snapshot KEEPS its hold (stays protected) and the run HOLDs the dataset; the
+        // cleanup retries next run.
         if (s.Tier != null)
         {
             var (c, _, e) = Exec("zfs", "inherit", propTier, s.Name);
@@ -771,7 +779,7 @@ bool Promote(Snap s, DateTime keepUntil, string tier)
             var (c, _, e) = Exec("zfs", "inherit", propKeep, s.Name);
             if (c != 0) { Log($"    ERROR: inherit keep_until failed {Short(s.Name)}: {e.Trim()}"); success = false; }
         }
-        if (success && s.Tier == "monthly")   // demoted monthly: drop the now-unneeded hold last
+        if (success && monthlyHeld)           // demoted monthly: drop the now-unneeded hold last
         {
             var (rc, _, re) = Exec("zfs", "release", tagMonthly, s.Name);
             if (rc != 0 && !re.Contains("no such hold") && !re.Contains("not found"))
@@ -791,36 +799,43 @@ bool Promote(Snap s, DateTime keepUntil, string tier)
         var (c, _, e) = Exec("zfs", "set", $"{propTier}={tier}", s.Name);
         if (c != 0) { Log($"    ERROR: set tier failed {Short(s.Name)}: {e.Trim()}"); success = false; }
     }
-    // Auto-create hold on monthlies for protection
-    if (tier == "monthly")
+    // Auto-create hold on monthlies for protection — only if not already held (avoids ~60
+    // redundant `zfs hold` calls per dataset per prune; we already know the hold state).
+    if (tier == "monthly" && !monthlyHeld)
     {
         var (c, _, e) = Exec("zfs", "hold", tagMonthly, s.Name);
         if (c == 0)
             Log($"    hold: {Short(s.Name)} (monthly keeper protected)");
         else if (e.Contains("already") || e.Contains("exists"))
-            { /* idempotent: hold already present */ }
+            { /* idempotent: hold already present (race) */ }
         else
             { Log($"    ERROR: hold failed {Short(s.Name)}: {e.Trim()}"); success = false; }
     }
     return success;
 }
 
-// Parse `zfs holds -r <ds>` into snapshot -> set of hold tags. Tolerant of tab- or
-// space-aligned output; only the first two columns (NAME, TAG) are needed.
-// Returns null on a `zfs holds` failure (distinct from "no holds") so a destructive caller
-// can refuse to proceed without knowing the hold state.
-Dictionary<string, HashSet<string>>? LoadHolds(string ds)
+// snapshot -> set of hold tags. `zfs holds` takes SNAPSHOT args (not a dataset; `-r` is
+// for descending from a snapshot), so we pass the dataset's snapshot names, batched in
+// chunks to stay under argv limits — one or a few commands per dataset, not one per snap.
+// Returns null on any `zfs holds` failure (distinct from "no holds") so a destructive
+// caller can refuse to proceed without knowing the hold state.
+Dictionary<string, HashSet<string>>? LoadHolds(IReadOnlyList<string> snapNames)
 {
     var map = new Dictionary<string, HashSet<string>>();
-    var (c, outp, _) = Exec("zfs", "holds", "-r", ds);
-    if (c != 0) return null;
-    foreach (var line in outp.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+    const int chunk = 256;
+    for (int i = 0; i < snapNames.Count; i += chunk)
     {
-        if (line.StartsWith("NAME")) continue;
-        var cols = line.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
-        if (cols.Length < 2) continue;
-        if (!map.TryGetValue(cols[0], out var set)) { set = new(); map[cols[0]] = set; }
-        set.Add(cols[1]);
+        var a = new List<string> { "holds", "-H" };
+        for (int j = i; j < Math.Min(i + chunk, snapNames.Count); j++) a.Add(snapNames[j]);
+        var (c, outp, _) = Exec("zfs", a.ToArray());
+        if (c != 0) return null;
+        foreach (var line in outp.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var cols = line.Split('\t', StringSplitOptions.RemoveEmptyEntries);   // -H: NAME\tTAG\tTIMESTAMP
+            if (cols.Length < 2) continue;
+            if (!map.TryGetValue(cols[0], out var set)) { set = new(); map[cols[0]] = set; }
+            set.Add(cols[1]);
+        }
     }
     return map;
 }
@@ -850,7 +865,11 @@ void FlushLog(List<string>? logLines = null)
     var psi = new ProcessStartInfo(file) { RedirectStandardOutput = true, RedirectStandardError = true };
     foreach (var x in a) psi.ArgumentList.Add(x);
     using var p = Process.Start(psi)!;
-    string o = p.StandardOutput.ReadToEnd(), e = p.StandardError.ReadToEnd();
+    // Drain both pipes concurrently — reading one fully before the other can deadlock if the
+    // child fills the unread pipe's buffer.
+    var oT = p.StandardOutput.ReadToEndAsync();
+    var eT = p.StandardError.ReadToEndAsync();
+    string o = oT.GetAwaiter().GetResult(), e = eT.GetAwaiter().GetResult();
     p.WaitForExit();
     return (p.ExitCode, o, e);
 }
