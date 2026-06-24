@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Fake `zfs` for testing zfs-hold-tight without a real pool.
+# Driven by fixture files under $FAKE_ZFS_DIR:
+#   snaps    one per line: name<TAB>keep_until<TAB>tier   (use - for empty)
+#   holds    one per line: name<TAB>tag<TAB>timestamp
+#   ops.log  appended: every mutating op (set/hold/release/destroy/inherit)
+# $FAKE_ZFS_FAIL may name a subcommand to force-fail (e.g. "set").
+set -u
+D="$FAKE_ZFS_DIR"
+sub="${1:-}"; shift || true
+log() { echo "$*" >> "$D/ops.log"; }
+[ "${FAKE_ZFS_FAIL:-}" = "$sub" ] && { echo "fake: forced failure on $sub" >&2; exit 1; }
+case "$sub" in
+  list)
+    [ -n "${FAKE_ZFS_SLEEP:-}" ] && sleep "$FAKE_ZFS_SLEEP"
+    ds="${@: -1}"
+    awk -F'\t' -v p="$ds@" 'index($1,p)==1{print}' "$D/snaps" 2>/dev/null
+    exit 0 ;;
+  holds)
+    printf 'NAME\tTAG\tTIMESTAMP\n'
+    [ -f "$D/holds" ] && cat "$D/holds"
+    exit 0 ;;
+  set)
+    log "set $1 $2"; exit 0 ;;
+  inherit)
+    log "inherit $1 $2"; exit 0 ;;
+  hold)
+    # $1=tag $2=snap ; refuse duplicate like real zfs
+    if [ -f "$D/holds" ] && grep -qP "^$(printf '%s' "$2" | sed 's/[.[\*^$]/\\&/g')\t$(printf '%s' "$1" | sed 's/[.[\*^$]/\\&/g')\t" "$D/holds"; then
+      echo "cannot hold: tag already exists on this dataset" >&2; exit 1
+    fi
+    log "hold $1 $2"; printf '%s\t%s\t-\n' "$2" "$1" >> "$D/holds"; exit 0 ;;
+  release)
+    log "release $1 $2"
+    if [ -f "$D/holds" ]; then
+      grep -vP "^$(printf '%s' "$2" | sed 's/[.[\*^$]/\\&/g')\t$(printf '%s' "$1" | sed 's/[.[\*^$]/\\&/g')\t" "$D/holds" > "$D/holds.tmp" || true
+      mv "$D/holds.tmp" "$D/holds"
+    fi
+    exit 0 ;;
+  destroy)
+    # refuse if held (like real zfs)
+    if [ -f "$D/holds" ] && grep -qP "^$(printf '%s' "$1" | sed 's/[.[\*^$]/\\&/g')\t" "$D/holds"; then
+      echo "cannot destroy '$1': snapshot is busy (held)" >&2; exit 1
+    fi
+    log "destroy $1"
+    grep -vP "^$(printf '%s' "$1" | sed 's/[.[\*^$]/\\&/g')\t" "$D/snaps" > "$D/snaps.tmp" || true
+    mv "$D/snaps.tmp" "$D/snaps"
+    exit 0 ;;
+  *) echo "fake zfs: unknown subcommand '$sub'" >&2; exit 2 ;;
+esac

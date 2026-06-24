@@ -1,0 +1,34 @@
+{
+  "_comment": "Copy to zfs-hold-tight.json (kept next to the binary, or point at it with ZFS_HOLD_TIGHT_CONFIG) and edit for your pool. The real config is git-ignored.",
+
+  "logDir": "/mnt/archive/tools/logs",
+
+  "_comment_healthchecks": "Optional. A healthchecks.io (or compatible) base ping URL. Leave unset (or pass --no-hc) to disable pings entirely. zfs-hold-tight pings the base URL on a clean prune and <url>/fail with diagnostics on any HOLD or destroy failure.",
+  "healthchecksUrl": "https://hc-ping.com/YOUR-UUID-HERE",
+
+  "guardMaxDeletePerRun": 5,
+  "guardRecentWindowDays": 7,
+  "guardMaxDailyAgeHours": 26,
+
+  "retentionPolicies": {
+    "baseline": {
+      "_comment": "general datasets - keep 30 days of dailies, 5 years of weeklies/monthlies",
+      "dailyKeepDays": 30,
+      "weeklyKeepDays": 1825,
+      "monthlyKeepDays": 1825
+    },
+    "low": {
+      "_comment": "bulk/media - keep 7 days of dailies, 5 years of weeklies/monthlies",
+      "dailyKeepDays": 7,
+      "weeklyKeepDays": 1825,
+      "monthlyKeepDays": 1825
+    }
+  },
+
+  "datasets": {
+    "archive/home/user1": "baseline",
+    "archive/home/user2": "baseline",
+    "archive/media/movies": "low",
+    "archive/media/music": "low"
+  }
+}

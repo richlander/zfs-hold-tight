@@ -1,0 +1,8 @@
+# Real config (may contain a healthchecks ping key + private dataset names)
+zfs-hold-tight.json
+
+# Build output
+bin/
+obj/
+out/
+*.binlog

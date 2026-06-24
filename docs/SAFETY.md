@@ -1,0 +1,78 @@
+# zfs-hold-tight Safety Specification
+
+`zfs-hold-tight` is the only component of the backup system that *deletes* snapshots, so
+it is built to one principle:
+
+> **Delete only when the system is provably in a healthy steady state. When anything
+> looks off, keep everything, do nothing, and alert.**
+
+Deleting is irreversible; refusing to delete is always safe. This document is the
+contract the tool implements (`zfs-hold-tight.cs`). Every condition below is a reason
+*not* to delete.
+
+## Context
+
+The intended deployment pulls only `_daily` snapshots from a source via replication.
+`zfs-hold-tight` thins those dailies on the **defender side** into a
+grandfather-father-son keep set — recent dailies + one per ISO-week + one per month —
+tagging each keeper with `lander:keep_until` / `lander:tier` and destroying dailies whose
+keep_until has passed. It never *creates* snapshots: creating one ahead of the
+replication base is what a `zfs receive` pre-retention step would destroy; pruning old
+snapshots never conflicts.
+
+## Run-level guards — any failure ⇒ HOLD that dataset (delete nothing), and alert
+
+Evaluated **per dataset**, anchored on the newest daily, not wall-clock.
+
+1. **Recent window complete.** The `guardRecentWindowDays` (default 7) days ending at the
+   newest daily must each have a daily snapshot — no gaps. *(Load-bearing guard: the
+   canonical trap is stale data plus freshly re-stamped weekly/monthly snapshots fooling
+   a naive "keep newest N" into pruning real coverage.)*
+2. **Newest daily fresh.** The most recent daily must be ≤ `guardMaxDailyAgeHours`
+   (default 26h) old. A stale newest means replication isn't delivering.
+3. **Clock sane.** No snapshot may be dated in the future, and `now` must be after the
+   newest snapshot. A wrong clock would make `keep_until` expire everything at once.
+4. **Volume circuit-breaker.** A single run may not delete more than
+   `guardMaxDeletePerRun` (default 5) snapshots for one dataset without `--force`. Steady
+   state deletes 0–1/day; a large number signals an abnormal state or a logic bug.
+5. **Population floor.** If a dataset has fewer dailies than its keep count, nothing is
+   beyond the window — skip and note it; a sudden drop is itself suspicious.
+
+A broken source feed shows up as stale/gappy dailies, so guards 1–2 enforce replication
+health by proxy.
+
+## Per-snapshot protections — never delete a snapshot that is…
+
+6. **The newest daily** — the replication incremental base. Absolute, always.
+7. **Within the daily-keep window** — one of the newest N (N per policy).
+8. **A week keeper** — newest daily in its ISO-week, within weekly retention.
+9. **A month keeper** — newest daily in its month, within monthly retention.
+10. **Not yet covered** — a daily is deleted only once a *surviving* keeper covers both
+    its ISO-week and its month. Never open a coverage hole.
+11. **Held** — any `zfs hold` (e.g. a defensive `lander:adhoc`) makes the snapshot
+    off-limits; it is skipped, never forced. The tool's own `lander:monthly` hold is
+    released immediately before it destroys an expired monthly keeper.
+12. **Not a recognized `autosnap_<ts>_daily`** — legacy `_weekly`/`_monthly`, manual, and
+    unparseable names are out of scope (and an unparseable date skips that one snapshot,
+    never aborts the run).
+
+## Operational guarantees
+
+13. **Dry-run by default.** Deletion happens only with `--prune`.
+14. **Per-dataset isolation.** A guard tripping on one dataset HOLDs only that dataset;
+    healthy datasets still prune. A global fault (e.g. a bad clock) HOLDs everything.
+15. **Single run at a time.** A mutating run takes an exclusive lock; a second overlapping
+    run exits without touching anything.
+16. **Always logs; alerts on trouble.** Every run appends a timestamped record to the log
+    directory (and stdout). On `--prune` it pings healthchecks.io on a clean run, and
+    `<url>/fail` (with diagnostics) whenever any guard HOLDs a dataset or a destroy fails
+    — so an unhealthy-but-not-pruning state is **visible, never silent**.
+
+## Worked example (the trap guards 1–2 prevent)
+
+The source's daily feed stalls: the newest daily is 6 days old, but a config change just
+re-stamped fresh weekly/monthly snapshots. A naive "keep newest 30 dailies + keepers"
+could begin deleting older dailies — destroying real coverage that nothing is replacing.
+Guard 1 (6-day gap) and guard 2 (stale newest) both fail, so `zfs-hold-tight` deletes
+nothing and pings `/fail`. The operator sees a stalled feed instead of slow, silent data
+loss.
