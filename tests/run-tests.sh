@@ -222,8 +222,8 @@ old6="$(snapname "$(date -u -d "$ADATE -2200 days" +%Y-%m-%d)")"   # ~6y old > 1
 printf '%s\tzht:monthly\t-\n' "$old6" > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
 OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
        ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --check-holds 2>/dev/null)"; RC=$?
-{ [ "$RC" = 1 ] && echo "$OUT" | grep -qi "older than its retention"; } \
-  && ok "T23 --check-holds flags hold past its policy retention" || bad "T23 (rc=$RC, out: $(echo "$OUT"|tail -1))"
+{ [ "$RC" = 1 ] && echo "$OUT" | grep "archive/home/rich:" | grep -qi "exceeds its .*retention"; } \
+  && ok "T23 --check-holds flags hold past its policy retention (names dataset)" || bad "T23 (rc=$RC, out: $(echo "$OUT"|tail -1))"
 
 # ---- T13: demoted monthly keeper -> hold released + tags inherited, not destroyed ----
 rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"

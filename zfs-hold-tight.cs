@@ -488,7 +488,7 @@ int CheckHolds(bool noHc)
                 CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var snapDate))
                 continue;
             if (snapDate < cutoff)
-                stale.Add($"{snap}: held but older than its retention ({maxDays}d)");
+                stale.Add($"{ds}: hold on {Short(snap)} exceeds its {maxDays}d retention");
         }
     }
 
