@@ -60,7 +60,8 @@ run_tool "$WORK/healthy"
 { echo "$OUT" | grep -q "cap" && [ "$(grep -c '^destroy' "$OPS")" = 0 ]; } \
   && ok "T1 healthy dry-run HELD on circuit-breaker, no destroys" || bad "T1 (out: $(echo "$OUT"|tail -1))"
 
-# ---- T2: prune --force -> keeper invariant: no week/month keeper destroyed ----
+# ---- T2: prune --force -> keeper invariant: no in-retention week/month keeper destroyed
+#          (the fixture spans ~1y, all keepers within the 5y window; T19 covers expiry) ----
 run_tool "$WORK/healthy" --prune --force
 grep '^destroy' "$OPS" | awk '{print $2}' | sort > "$WORK/destroyed"
 awk -F'\t' '{print $1}' "$WORK/healthy" | sed -E 's/.*autosnap_([0-9-]+)_.*/\1/' > "$WORK/dates"
@@ -71,7 +72,7 @@ viol=0
 while read -r kd; do grep -qx "$(snapname "$kd")" "$WORK/destroyed" && { echo "    month-keeper destroyed: $kd"; viol=1; }; done < "$WORK/mk"
 while read -r kd; do grep -qx "$(snapname "$kd")" "$WORK/destroyed" && { echo "    week-keeper destroyed: $kd"; viol=1; }; done < "$WORK/wk"
 { [ "$viol" = 0 ] && [ "$(wc -l < "$WORK/destroyed")" -gt 50 ]; } \
-  && ok "T2 prune destroyed $(wc -l < "$WORK/destroyed"|tr -d ' '), no keeper destroyed" || bad "T2 viol=$viol destroyed=$(wc -l<"$WORK/destroyed")"
+  && ok "T2 prune destroyed $(wc -l < "$WORK/destroyed"|tr -d ' '), no in-retention keeper destroyed" || bad "T2 viol=$viol destroyed=$(wc -l<"$WORK/destroyed")"
 grep -qx "$(snapname "$ADATE")" "$WORK/destroyed" && bad "T2b newest/base destroyed!" || ok "T2b newest daily (base) preserved"
 # tag-only-keepers: plain dailies must NOT be tagged; only ~70 keepers get zht:tier
 sets=$(grep -c 'set zht:tier' "$OPS"); sets=${sets:-0}
@@ -214,6 +215,15 @@ OUT="$(FAKE_ZFS_DIR="$WORK/fz" FAKE_ZFS_FAIL=holds ZFS_HOLD_TIGHT_CONFIG="$WORK/
        ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --prune --force 2>/dev/null)"
 { echo "$OUT" | grep -qi "holds" && [ "$(grep -c '^destroy' "$WORK/fz/ops.log")" = 0 ]; } \
   && ok "T22 zfs holds failure -> HOLD, 0 destroys" || bad "T22 (out: $(echo "$OUT"|tail -1))"
+
+# ---- T23: --check-holds flags a hold older than its dataset's retention (per-policy) ----
+rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"; cp "$WORK/healthy" "$WORK/fz/snaps"
+old6="$(snapname "$(date -u -d "$ADATE -2200 days" +%Y-%m-%d)")"   # ~6y old > 1825d retention
+printf '%s\tzht:monthly\t-\n' "$old6" > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
+OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
+       ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --check-holds 2>/dev/null)"; RC=$?
+{ [ "$RC" = 1 ] && echo "$OUT" | grep -qi "older than its retention"; } \
+  && ok "T23 --check-holds flags hold past its policy retention" || bad "T23 (rc=$RC, out: $(echo "$OUT"|tail -1))"
 
 # ---- T13: demoted monthly keeper -> hold released + tags inherited, not destroyed ----
 rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"

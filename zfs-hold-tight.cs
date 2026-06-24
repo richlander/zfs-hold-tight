@@ -18,8 +18,9 @@
 //   excessive churn (guardMaxDailyChurnPct — mass rewrite/encryption), volume
 //   circuit-breaker (<=5/run w/o --force). Each guard threshold defaults globally but
 //   may be overridden per retention policy.
-//   Per-snapshot: never the newest/base, week/month keepers, uncovered, held, or
-//   non-_daily snapshots.
+//   Per-snapshot: never the newest/base, a week/month keeper still WITHIN its retention,
+//   an uncovered daily, a held snapshot, or a non-_daily snapshot. (A keeper past its
+//   retention ages out — see docs/SAFETY.md.)
 //
 // Every run appends to /mnt/archive/tools/zfs-hold-tight.log and (on --prune) pings
 // healthchecks.io: the base URL on a clean run, /fail with diagnostics on trouble.
@@ -467,45 +468,43 @@ int CheckHolds(bool noHc)
     var now = DateTime.UtcNow;
     Log($"=== zfs-hold-tight {now:yyyy-MM-dd HH:mm:ss}Z  mode=check-holds ===");
 
-    const int MaxRetentionDays = 5 * 365;  // 5 years (coarse net: longest policy retention)
-    var maxKeepDate = now.AddDays(-MaxRetentionDays);
-
-    var pool = DatasetPrefix.TrimEnd('/');
-    var (c, out_, err) = Exec("zfs", "holds", "-r", pool);
-    if (c != 0) { Log($"FAIL: {err.Trim()}"); FlushLog(lines); return 1; }
-
+    // A held snapshot is "stale" once it is older than ITS dataset's longest retention
+    // (max of weekly/monthly keep-days) — checked per dataset, since retention varies by
+    // policy. A flat threshold would false-alarm on long policies and miss short ones.
+    var dateRe = new Regex(@"@autosnap_(\d{4}-\d{2}-\d{2})");
     var stale = new List<string>();
-    foreach (var line in out_.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+    bool anyFail = false;
+    foreach (var (ds, ret) in retention)
     {
-        if (line.StartsWith("NAME")) continue;  // skip header
-        var cols = line.Split(new[] { '\t', ' ' }, StringSplitOptions.RemoveEmptyEntries);
-        if (cols.Length < 3) continue;
-        var snap = cols[0];
-
-        // Parse snapshot date from name
-        var m = new Regex(@"@autosnap_(\d{4}-\d{2}-\d{2})").Match(snap);
-        if (!m.Success) continue;
-        if (!DateTime.TryParseExact(m.Groups[1].Value, "yyyy-MM-dd",
-            System.Globalization.CultureInfo.InvariantCulture,
-            System.Globalization.DateTimeStyles.AssumeUniversal, out var snapDate))
-            continue;
-
-        if (snapDate < maxKeepDate)
-            stale.Add($"{snap}: held but older than {MaxRetentionDays}d");
+        var holdMap = LoadHolds(ds);
+        if (holdMap is null) { Log($"  WARNING: {ds}: zfs holds failed"); anyFail = true; continue; }
+        int maxDays = Math.Max(ret.WeeklyKeepDays, ret.MonthlyKeepDays);
+        var cutoff = now.AddDays(-maxDays);
+        foreach (var snap in holdMap.Keys)
+        {
+            var m = dateRe.Match(snap);
+            if (!m.Success) continue;
+            if (!DateTime.TryParseExact(m.Groups[1].Value, "yyyy-MM-dd",
+                CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var snapDate))
+                continue;
+            if (snapDate < cutoff)
+                stale.Add($"{snap}: held but older than its retention ({maxDays}d)");
+        }
     }
 
     if (stale.Count == 0)
-        Log($"OK: no stale holds found");
+        Log(anyFail ? "no stale holds found (some datasets unchecked: zfs holds failed)" : "OK: no stale holds found");
     else
     {
-        Log($"WARNING: {stale.Count} holds exceed {MaxRetentionDays}d retention:");
+        Log($"WARNING: {stale.Count} holds exceed their dataset retention:");
         foreach (var s in stale) Log($"  {s}");
     }
 
+    bool trouble = stale.Count > 0 || anyFail;
     FlushLog(lines);
-    if (!noHc && stale.Count > 0)
-        HcPing(hcUrl + "/fail", $"stale holds:\n" + string.Join("\n", stale));
-    return stale.Count > 0 ? 1 : 0;
+    if (!noHc && trouble)
+        HcPing(hcUrl + "/fail", stale.Count > 0 ? "stale holds:\n" + string.Join("\n", stale) : "check-holds: a zfs holds call failed");
+    return trouble ? 1 : 0;
 }
 
 // ---- doctor: validate hold strategy ----

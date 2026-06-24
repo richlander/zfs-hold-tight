@@ -152,8 +152,10 @@ HOLDs everything. See [docs/SAFETY.md](docs/SAFETY.md) for the full contract.
 6. **Volume circuit-breaker** — never delete more than `guardMaxDeletePerRun` without `--force`.
 7. **Population floor** — fewer dailies than the keep count ⇒ nothing to prune (noted).
 
-Per-snapshot, it never deletes the replication base (newest daily), a week/month keeper,
-an uncovered daily, or any held snapshot.
+Per-snapshot, it never deletes the replication base (newest daily), a week/month keeper
+**while within its retention window**, an uncovered daily, or any held snapshot. A keeper
+*past* its retention ages out (so your recovery window is bounded by `weeklyKeepDays` /
+`monthlyKeepDays`, not infinite).
 
 ## Building
 
@@ -191,7 +193,8 @@ tests/run-tests.sh                       # or: tests/run-tests.sh path/to/zfs-ho
 ```
 
 The suite drives the tool against a fake `zfs` (`tests/fake-zfs`) — no real pool needed —
-and asserts the core invariant (*no week/month keeper is ever destroyed*) plus every
+and asserts the core invariant (*no week/month keeper is destroyed while within retention*)
+plus every
 guard, the hold lifecycle, the run-lock, and input validation. Requires the .NET SDK.
 
 ## License

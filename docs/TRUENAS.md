@@ -4,6 +4,26 @@
 This covers building a compatible binary, putting it somewhere it can actually run, and
 scheduling it.
 
+## 0. Replication settings this assumes — verify these FIRST
+
+`zfs-hold-tight`'s ransomware value rests on one property: **it is the *only* thing that
+deletes snapshots on the backup, and source-side deletions never reach it.** A wrong
+replication setting defeats that before this tool ever runs. On each replication task that
+feeds your `archive/*` datasets, verify:
+
+| Setting | Required value | Why |
+|---|---|---|
+| **Retention policy** | **`Custom`**, lifetime ≥ your longest `*KeepDays` (e.g. 5y) — **never `Same as Source`** | `Same as Source` makes source pruning/`zfs destroy` **propagate** to the backup — the exact attack this design defends against. `Custom` keeps snapshots on the backup's own clock. Set it long enough that the *replication task itself* never deletes inside your retention window — `zfs-hold-tight` owns the thinning. |
+| **Direction** | **Pull** (TrueNAS connects out and runs `zfs send` on the source) | TrueNAS must never accept an inbound `zfs receive`/push. A stolen source credential then can't write to the backup. |
+| **Source replication user** | read-only `zfs send` / `hold` only (`zfs allow`) | Can't be used to delete or write source or destination. |
+| **Periodic Snapshot Tasks on `archive/*`** | **none** | zettarepl's pre-retention receive destroys any destination snapshot newer than the last common one, so locally-created snapshots don't survive — and retention is `zfs-hold-tight`'s job, not theirs. |
+| **`allow_from_scratch`** | **off** | Re-seeds (which discard destination history) must be deliberate, not automatic. |
+| **Snapshot families replicated** | one (the `_daily` family) | Replicating multiple Sanoid families risks same-second name collisions that wedge replication; `zfs-hold-tight` derives weekly/monthly locally from the dailies. |
+
+With those set, the only destination-side deleter is `zfs-hold-tight`, and an attacker who
+compromises the source and runs `zfs destroy -r` cannot remove history already on the
+backup.
+
 ## 1. Build a binary that will run on TrueNAS
 
 Native AOT produces a normal dynamically-linked ELF that links against the **build host's
