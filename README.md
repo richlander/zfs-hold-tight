@@ -69,12 +69,8 @@ Each run, per dataset:
 # 1. Configure
 cp zfs-hold-tight.example.json zfs-hold-tight.json   # then edit datasets + retention
 
-# 2. Build a native-AOT single binary (needs the .NET 10+ SDK + clang).
-#    AOT is NOT a cross-compile: build on glibc <= the target's. To deploy to an
-#    older target (e.g. TrueNAS / Debian 12, glibc 2.36), build in the AOT SDK image:
-#      docker run --rm -v "$PWD:/src" -w /src mcr.microsoft.com/dotnet/sdk:10.0-aot \
-#        dotnet publish zfs-hold-tight.cs -r linux-x64 -c Release -o bin/
-#    Otherwise, locally:
+# 2. Build a native-AOT single binary (see "Building" — deploying to TrueNAS needs a
+#    glibc-matched container build)
 dotnet publish zfs-hold-tight.cs -r linux-x64 -c Release -o bin/
 
 # 3. Dry-run (default: shows what would be pruned, deletes nothing)
@@ -145,6 +141,35 @@ HOLDs everything. See [docs/SAFETY.md](docs/SAFETY.md) for the full contract.
 
 Per-snapshot, it never deletes the replication base (newest daily), a week/month keeper,
 an uncovered daily, or any held snapshot.
+
+## Building
+
+A native-AOT build produces a single self-contained binary with instant startup and no
+runtime dependency. It needs the **.NET 10+ SDK** plus **clang** and zlib headers.
+
+```bash
+dotnet publish zfs-hold-tight.cs -r linux-x64 -c Release -o bin/    # -> bin/zfs-hold-tight
+```
+
+**Deploying to an older target (e.g. TrueNAS): build in a glibc-matched container.** AOT
+emits a normal dynamically-linked binary that links the *build host's* glibc, and glibc
+is forward- but not backward-compatible — a binary built on glibc 2.39 won't start on an
+older system. Build inside Microsoft's AOT SDK image (Debian 12-based, glibc 2.36, with
+clang preinstalled) so the result runs on any glibc ≥ 2.36:
+
+```bash
+docker run --rm -v "$PWD:/src" -w /src mcr.microsoft.com/dotnet/sdk:10.0-aot \
+  dotnet publish zfs-hold-tight.cs -r linux-x64 -c Release -o out
+objdump -T out/zfs-hold-tight | grep -oE 'GLIBC_[0-9.]+' | sort -V | tail -1   # must be ≤ target glibc
+```
+
+## Running on TrueNAS
+
+TrueNAS SCALE is the primary target. The OS is a read-only appliance image, so the binary
+must run from a **pool dataset with `exec=on`**, not the OS — and is deployed by hand
+(pull-only threat model). Build compatibility is **TrueNAS SCALE 23.10 "Cobia" and later**
+(Debian 12 / glibc 2.36). Full guide — dataset setup, staged first run, cron in the wake
+window: **[docs/TRUENAS.md](docs/TRUENAS.md)**.
 
 ## Testing
 
