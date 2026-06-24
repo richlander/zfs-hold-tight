@@ -85,8 +85,9 @@ dotnet publish zfs-hold-tight.cs -r linux-x64 -c Release -o bin/
 ```
 
 The binary looks for `zfs-hold-tight.json` next to itself (override with
-`ZFS_HOLD_TIGHT_CONFIG`). It runs `zfs` from `PATH` and must run as a user able to
-`zfs destroy`/`hold` the target datasets (usually root).
+`ZFS_HOLD_TIGHT_CONFIG`). It runs `zfs` from a resolved **absolute path** (`zfsPath` or a
+standard location — see [Hardening](#configuration)), not the inherited `PATH`, and must
+run as a user able to `zfs destroy`/`hold` the target datasets (usually root).
 
 ## Commands
 
@@ -97,7 +98,7 @@ The binary looks for `zfs-hold-tight.json` next to itself (override with
 | `--prune --force` | Bypass the per-run delete cap (for a reviewed bulk cleanup). |
 | `-v`, `--verbose` | Log each snapshot decision. |
 | `--doctor` | Report hold status: monthlies protected ✓ / missing ✗ / unexpected. |
-| `--check-holds` | Flag holds on snapshots older than the longest retention. |
+| `--check-holds` | Flag holds on snapshots older than their dataset's own retention. |
 | `--fix` | Create any missing `<ns>:monthly` holds on monthly keepers. |
 | `--hold-adhoc <snap>` | Defensive manual `<ns>:adhoc` hold on one snapshot. |
 | `--hold-latest-tier <daily\|weekly\|monthly>` | Hold the newest snapshot of a tier. |

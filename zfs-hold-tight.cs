@@ -634,9 +634,16 @@ int Fix(string? datasetFilter)
         {
             var chunk = toHold.GetRange(i, Math.Min(256, toHold.Count - i));
             var a = new List<string> { "hold", tagMonthly }; a.AddRange(chunk);
-            var (c, _, e) = Exec("zfs", a.ToArray());
-            if (c == 0) { foreach (var m in chunk) { Log($"  ✓ {ds}/{Short(m)}"); fixed_++; } }
-            else { foreach (var m in chunk) Log($"  ✗ {ds}/{Short(m)}: {e.Trim()}"); errors++; }
+            var (c, _, _) = Exec("zfs", a.ToArray());
+            if (c == 0) { foreach (var m in chunk) { Log($"  ✓ {ds}/{Short(m)}"); fixed_++; } continue; }
+            // Chunk failed — retry one-by-one so the report names the actual bad snapshot(s)
+            // (the fast batched path stays the common case).
+            foreach (var m in chunk)
+            {
+                var (cc, _, ee) = Exec("zfs", "hold", tagMonthly, m);
+                if (cc == 0 || ee.Contains("already") || ee.Contains("exists")) { Log($"  ✓ {ds}/{Short(m)}"); fixed_++; }
+                else { Log($"  ✗ {ds}/{Short(m)}: {ee.Trim()}"); errors++; }
+            }
         }
     }
 
