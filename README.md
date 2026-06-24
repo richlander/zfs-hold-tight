@@ -57,9 +57,9 @@ Each run, per dataset:
 2. Run the [health guards](#safety-guards). If any fails, **HOLD** the dataset (no
    deletions) and alert.
 3. Identify keepers: newest-per-ISO-week (weekly) and newest-per-month (monthly).
-4. Tag keepers with `lander:tier` + `lander:keep_until`; `zfs hold lander:monthly` the
-   monthlies. Plain dailies stay untagged (implicitly daily). Superseded keepers are
-   demoted: tags inherited away, stale monthly hold released.
+4. Tag keepers with `<ns>:tier` + `<ns>:keep_until`; `zfs hold <ns>:monthly` the monthlies
+   (`<ns>` = `propertyNamespace`, default `zht`). Plain dailies stay untagged (implicitly
+   daily). Superseded keepers are demoted: tags inherited away, stale monthly hold released.
 5. Destroy dailies past expiry that are fully covered by a surviving keeper — never the
    replication base, a keeper, or a held snapshot.
 
@@ -98,8 +98,8 @@ The binary looks for `zfs-hold-tight.json` next to itself (override with
 | `-v`, `--verbose` | Log each snapshot decision. |
 | `--doctor` | Report hold status: monthlies protected ✓ / missing ✗ / unexpected. |
 | `--check-holds` | Flag holds on snapshots older than the longest retention. |
-| `--fix` | Create any missing `lander:monthly` holds on monthly keepers. |
-| `--hold-adhoc <snap>` | Defensive manual `lander:adhoc` hold on one snapshot. |
+| `--fix` | Create any missing `<ns>:monthly` holds on monthly keepers. |
+| `--hold-adhoc <snap>` | Defensive manual `<ns>:adhoc` hold on one snapshot. |
 | `--hold-latest-tier <daily\|weekly\|monthly>` | Hold the newest snapshot of a tier. |
 | `--hold-latest` | Shorthand for `--hold-latest-tier daily`. |
 | `--dataset <name>` | Limit `--doctor`/`--fix`/`--prune` to one dataset. |
@@ -121,6 +121,7 @@ See [`zfs-hold-tight.example.json`](zfs-hold-tight.example.json). Top-level keys
 | `guardMaxDailyAgeHours` | `26` | HOLD if the newest daily is older than this. |
 | `guardMaxDailyShrinkPct` | `33` | HOLD if the newest daily references this % less data than the recent baseline (mass-**deletion** guard; `0` disables). |
 | `guardMaxDailyChurnPct` | `50` | HOLD if the newest daily rewrites more than this % of the dataset's data in one day (mass-**rewrite / encryption** guard; `0` disables). |
+| `propertyNamespace` | `zht` | Prefix for the tool's ZFS user-properties + hold tags (`<ns>:keep_until`, `<ns>:tier`, `<ns>:monthly`, `<ns>:adhoc`). |
 | `retentionPolicies` | — | Named `{dailyKeepDays, weeklyKeepDays, monthlyKeepDays}` profiles. |
 | `datasets` | — | `dataset → policy` map. Datasets must start with `archive/`. |
 
@@ -134,8 +135,9 @@ other data exists. The `guard*` values above are global **defaults**; any of the
 media, or disable churn for a scratch dataset). Per-policy + a one-dataset policy ⇒
 effectively per-dataset thresholds when you need them.
 
-> **Note:** the pool prefix (`archive/`) and the property/hold namespace (`lander:`) are
-> compiled-in defaults. Edit the constants in `zfs-hold-tight.cs` to match your pool.
+> **Note:** the property/hold namespace is set by `propertyNamespace` (default `zht`). The
+> pool prefix (`archive/`) is still a compiled-in constant in `zfs-hold-tight.cs` — edit it
+> to match your pool.
 
 ## Safety guards
 

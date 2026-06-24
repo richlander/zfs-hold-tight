@@ -15,7 +15,8 @@ contract the tool implements (`zfs-hold-tight.cs`). Every condition below is a r
 The intended deployment pulls only `_daily` snapshots from a source via replication.
 `zfs-hold-tight` thins those dailies on the **defender side** into a
 grandfather-father-son keep set — recent dailies + one per ISO-week + one per month —
-tagging each keeper with `lander:keep_until` / `lander:tier` and destroying dailies whose
+tagging each keeper with `<ns>:keep_until` / `<ns>:tier` (`<ns>` = `propertyNamespace`,
+default `zht`) and destroying dailies whose
 keep_until has passed. It never *creates* snapshots: creating one ahead of the
 replication base is what a `zfs receive` pre-retention step would destroy; pruning old
 snapshots never conflicts.
@@ -68,9 +69,10 @@ health by proxy.
 11. **A month keeper** — newest daily in its month, within monthly retention.
 12. **Not yet covered** — a daily is deleted only once a *surviving* keeper covers both
     its ISO-week and its month. Never open a coverage hole.
-13. **Held** — any `zfs hold` (e.g. a defensive `lander:adhoc`) makes the snapshot
-    off-limits; it is skipped, never forced. The tool's own `lander:monthly` hold is
-    released immediately before it destroys an expired monthly keeper.
+13. **Held** — any `zfs hold` (e.g. a defensive `<ns>:adhoc`) makes the snapshot
+    off-limits; it is skipped, never forced. The tool's own `<ns>:monthly` hold is
+    released immediately before it destroys an expired monthly keeper. (And if `zfs holds`
+    itself fails, the dataset is HELD rather than pruned while blind to holds.)
 14. **Not a recognized `autosnap_<ts>_daily`** — legacy `_weekly`/`_monthly`, manual, and
     unparseable names are out of scope (and an unparseable date skips that one snapshot,
     never aborts the run).

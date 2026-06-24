@@ -3,6 +3,9 @@
 
   "logDir": "/mnt/archive/tools/logs",
 
+  "_comment_namespace": "Prefix for this tool's ZFS user-properties and hold tags (<ns>:keep_until, <ns>:tier, <ns>:monthly, <ns>:adhoc). Defaults to 'zht'. If migrating from a build that used another prefix, set it to the old value to keep managing existing holds.",
+  "propertyNamespace": "zht",
+
   "_comment_healthchecks": "Optional. A healthchecks.io (or compatible) base ping URL. Leave unset (or pass --no-hc) to disable pings entirely. zfs-hold-tight pings the base URL on a clean prune and <url>/fail with diagnostics on any HOLD or destroy failure.",
   "healthchecksUrl": "https://hc-ping.com/YOUR-UUID-HERE",
 

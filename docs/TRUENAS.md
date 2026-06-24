@@ -91,7 +91,13 @@ run is visible rather than silent.
 
 ## Migrating from an older build / a differently-named binary
 
-`zfs-hold-tight` only recomputes keepers from snapshot dates; its `lander:*` tags are
-audit annotations. To swap a binary in place, drop in the new one and update the cron
-command to point at it. Existing `lander:monthly` holds remain valid; run `--doctor` to
-confirm and `--fix` to backfill any missing ones.
+`zfs-hold-tight` only recomputes keepers from snapshot dates; its `<ns>:*` tags
+(`<ns>` = `propertyNamespace`) are audit annotations. To swap a binary in place, drop in
+the new one and update the cron command to point at it. Existing `<ns>:monthly` holds
+remain valid; run `--doctor` to confirm and `--fix` to backfill any missing ones.
+
+If you are migrating from a build that used a different namespace, set
+`propertyNamespace` in the config to the **old** value so the tool keeps managing the
+holds/properties it already created — otherwise those old-namespace holds are treated as
+foreign (left in place, their snapshots never pruned) and the tool starts a fresh set
+under the new namespace.

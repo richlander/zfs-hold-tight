@@ -73,8 +73,8 @@ while read -r kd; do grep -qx "$(snapname "$kd")" "$WORK/destroyed" && { echo " 
 { [ "$viol" = 0 ] && [ "$(wc -l < "$WORK/destroyed")" -gt 50 ]; } \
   && ok "T2 prune destroyed $(wc -l < "$WORK/destroyed"|tr -d ' '), no keeper destroyed" || bad "T2 viol=$viol destroyed=$(wc -l<"$WORK/destroyed")"
 grep -qx "$(snapname "$ADATE")" "$WORK/destroyed" && bad "T2b newest/base destroyed!" || ok "T2b newest daily (base) preserved"
-# tag-only-keepers: plain dailies must NOT be tagged; only ~70 keepers get lander:tier
-sets=$(grep -c 'set lander:tier' "$OPS"); sets=${sets:-0}
+# tag-only-keepers: plain dailies must NOT be tagged; only ~70 keepers get zht:tier
+sets=$(grep -c 'set zht:tier' "$OPS"); sets=${sets:-0}
 { [ "$sets" -gt 0 ] && [ "$sets" -lt 120 ]; } && ok "T2c tag-only-keepers ($sets tier-sets, not ~388)" || bad "T2c tier-sets=$sets"
 
 # ---- T3a: newest 30h old (>26h) -> HOLD on freshness ----
@@ -124,7 +124,7 @@ run_tool "$WORK/healthy" --check-holds
 # ---- T10: adhoc-held expired snapshot skipped, not destroy-failed (guard 12) ----
 rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"; cp "$WORK/healthy" "$WORK/fz/snaps"
 held="$(snapname 2025-06-15)"                      # old, not a keeper, expired
-printf '%s\tlander:adhoc\t-\n' "$held" > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
+printf '%s\tzht:adhoc\t-\n' "$held" > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
 OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
        ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --prune --force 2>/dev/null)"
 { ! grep -qx "destroy $held" "$WORK/fz/ops.log"; } \
@@ -218,13 +218,13 @@ OUT="$(FAKE_ZFS_DIR="$WORK/fz" FAKE_ZFS_FAIL=holds ZFS_HOLD_TIGHT_CONFIG="$WORK/
 # ---- T13: demoted monthly keeper -> hold released + tags inherited, not destroyed ----
 rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"
 recent=$(date -u -d "$ADATE -5 days" +%Y-%m-%d); demoted="$(snapname "$recent")"
-# stamp it as a stale monthly (col3=monthly) with a lander:monthly hold, though it is NOT the month keeper
+# stamp it as a stale monthly (col3=monthly) with a zht:monthly hold, though it is NOT the month keeper
 awk -F'\t' -v d="$demoted" 'BEGIN{OFS="\t"} $1==d{$3="monthly"} {print}' "$WORK/healthy" > "$WORK/fz/snaps"
-printf '%s\tlander:monthly\t-\n' "$demoted" > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
+printf '%s\tzht:monthly\t-\n' "$demoted" > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
 OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
        ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --prune --force 2>/dev/null)"
-{ grep -qx "release lander:monthly $demoted" "$WORK/fz/ops.log" \
-  && grep -qx "inherit lander:tier $demoted" "$WORK/fz/ops.log" \
+{ grep -qx "release zht:monthly $demoted" "$WORK/fz/ops.log" \
+  && grep -qx "inherit zht:tier $demoted" "$WORK/fz/ops.log" \
   && ! grep -qx "destroy $demoted" "$WORK/fz/ops.log"; } \
   && ok "T13 demoted monthly: hold released + tags inherited, kept" \
   || bad "T13 (ops: $(grep "$demoted" "$WORK/fz/ops.log" | tr '\n' ';'))"

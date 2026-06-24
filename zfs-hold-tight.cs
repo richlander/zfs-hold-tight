@@ -7,7 +7,7 @@
 // Replication pulls ONLY daily snapshots from merritt (Approach 4 in
 // zfs/backup-history.md). This tool thins those dailies into a tiered retention (daily/weekly/monthly)
 // keep set - newest N dailies + newest-per-week + newest-per-month - tagging each with
-// lander:keep_until (and lander:tier = daily|weekly|monthly, for audit) and destroying
+// <ns>:keep_until (and <ns>:tier = daily|weekly|monthly, for audit; <ns> = propertyNamespace) and destroying
 // dailies past expiry. It never creates snapshots.
 //
 // SAFETY: it deletes only when the dataset's feed is provably healthy; otherwise it
@@ -134,6 +134,15 @@ if (string.IsNullOrEmpty(hcUrl) && cfg.TryGetProperty("healthchecksUrl", out var
 // Healthchecks is optional: with no URL configured (and no env override), skip pings
 // entirely rather than baking in a site URL. Set healthchecksUrl in config to enable.
 bool noHc = args.Contains("--no-hc") || string.IsNullOrEmpty(hcUrl);
+
+// Namespace for this tool's ZFS user-properties and hold tags (<ns>:keep_until,
+// <ns>:tier, <ns>:monthly, <ns>:adhoc). Configurable so the source carries no site
+// identity; defaults to "zht".
+string ns = (cfg.TryGetProperty("propertyNamespace", out var pnEl) ? pnEl.GetString() : null) ?? "zht";
+if (!Regex.IsMatch(ns, @"^[A-Za-z0-9_.-]+$"))
+{ Console.Error.WriteLine($"FATAL: propertyNamespace '{ns}' must be letters/digits/._- (no colon)"); configDoc?.Dispose(); return 2; }
+string tagMonthly = $"{ns}:monthly", tagAdhoc = $"{ns}:adhoc", propKeep = $"{ns}:keep_until", propTier = $"{ns}:tier";
+
 var snapRe = new Regex(@"@autosnap_(\d{4}-\d{2}-\d{2}_\d{2}:\d{2}:\d{2})_daily$");
 var now = DateTime.UtcNow;
 var lines = new List<string>();
@@ -330,7 +339,7 @@ foreach (var (ds, ret) in retention)
     }
 
     // Current holds on this dataset — used to (a) honor guard 12 (never delete a held
-    // snapshot) and (b) tell our managed lander:monthly hold from foreign/defensive ones.
+    // snapshot) and (b) tell our managed <ns>:monthly hold from foreign/defensive ones.
     // A holds-list failure means we can't verify guard 12, so HOLD rather than guess.
     var holdMap = LoadHolds(ds);
     if (holdMap is null)
@@ -340,7 +349,7 @@ foreach (var (ds, ret) in retention)
         continue;
     }
     bool IsForeignHeld(string name) =>
-        holdMap.TryGetValue(name, out var tags) && tags.Any(t => t != "lander:monthly");
+        holdMap.TryGetValue(name, out var tags) && tags.Any(t => t != tagMonthly);
 
     var doomed = new List<string>();
     var promoteErrors = new List<string>();  // snapshots whose metadata/hold write failed
@@ -394,11 +403,11 @@ foreach (var (ds, ret) in retention)
         if (verbose) Log($"  {verb}: {Short(name)}");
         if (!prune) continue;
 
-        // Release our managed lander:monthly hold before destroy (idempotent). Doomed
+        // Release our managed <ns>:monthly hold before destroy (idempotent). Doomed
         // snapshots carry no foreign hold (guard 12 excluded those above).
-        var (rc, _, re) = Exec("zfs", "release", "lander:monthly", name);
+        var (rc, _, re) = Exec("zfs", "release", tagMonthly, name);
         if (rc != 0 && !re.Contains("no such hold") && !re.Contains("not found"))
-            Log($"    WARNING: release lander:monthly failed {Short(name)}: {re.Trim()}");
+            Log($"    WARNING: release {tagMonthly} failed {Short(name)}: {re.Trim()}");
 
         destroyAttempted++;
         var (code, _, err) = Exec("zfs", "destroy", name);
@@ -433,13 +442,13 @@ int HoldAdhoc(string snap, bool noHc)
     if (!snap.StartsWith(DatasetPrefix) || !snap.Contains('@'))
     { Log($"FAIL: snapshot '{snap}' must be under '{DatasetPrefix}' and name a snapshot (contain '@')"); FlushLog(lines); return 2; }
 
-    var (c, _, e) = Exec("zfs", "hold", "lander:adhoc", snap);
+    var (c, _, e) = Exec("zfs", "hold", tagAdhoc, snap);
     if (c != 0) { Log($"FAIL: {e.Trim()}"); FlushLog(lines); return 1; }
-    Log($"OK: held {snap} with tag lander:adhoc");
+    Log($"OK: held {snap} with tag {tagAdhoc}");
 
     // Verify hold was created
     var (vc, vo, _) = Exec("zfs", "holds", snap);
-    if (vc == 0 && vo.Contains("lander:adhoc"))
+    if (vc == 0 && vo.Contains(tagAdhoc))
         Log($"Verified: hold is active");
     else
         Log($"WARNING: hold may not be active (verification inconclusive)");
@@ -525,9 +534,9 @@ int Doctor(string? datasetFilter)
         Log($"{ds}: {monthKeeper.Count} monthlies");
         foreach (var monthly in monthKeeper.OrderByDescending(s => s))
         {
-            if (holdMap.TryGetValue(monthly, out var tags) && tags.Contains("lander:monthly"))
+            if (holdMap.TryGetValue(monthly, out var tags) && tags.Contains(tagMonthly))
             {
-                Log($"  ✓ {Short(monthly)} (lander:monthly)");
+                Log($"  ✓ {Short(monthly)} ({tagMonthly})");
                 protected_++;
             }
             else
@@ -542,14 +551,14 @@ int Doctor(string? datasetFilter)
         {
             if (!monthKeeper.Contains(snap) && snap.Contains("_daily"))
             {
-                if (tags.Contains("lander:adhoc"))
+                if (tags.Contains(tagAdhoc))
                 {
-                    Log($"  ℹ {Short(snap)} (lander:adhoc - defensive)");
+                    Log($"  ℹ {Short(snap)} ({tagAdhoc} - defensive)");
                     adhoc_++;
                 }
-                else if (!tags.Any(t => t.StartsWith("lander:")))
+                else if (!tags.Any(t => t.StartsWith($"{ns}:")))
                 {
-                    Log($"  ? {Short(snap)} has non-lander holds: {string.Join(",", tags)}");
+                    Log($"  ? {Short(snap)} has foreign holds: {string.Join(",", tags)}");
                     orphaned++;
                 }
             }
@@ -586,7 +595,7 @@ int Fix(string? datasetFilter)
 
         foreach (var monthly in monthKeeper)
         {
-            var (c, _, e) = Exec("zfs", "hold", "lander:monthly", monthly);
+            var (c, _, e) = Exec("zfs", "hold", tagMonthly, monthly);
             if (c == 0)
             {
                 Log($"  ✓ {ds}/{Short(monthly)}");
@@ -632,7 +641,7 @@ int HoldLatestTier(string tier, string? datasetFilter, bool noHc)
 
         if (target is not null)
         {
-            var (c, _, e) = Exec("zfs", "hold", "lander:adhoc", target.Name);
+            var (c, _, e) = Exec("zfs", "hold", tagAdhoc, target.Name);
             if (c == 0)
                 Log($"  ✓ {ds}/{Short(target.Name)} ({tier})");
             else if (e.Contains("already"))
@@ -699,7 +708,7 @@ string? HealthGuard(List<Snap> snaps, Retention ret, Guards gd)
 (int, List<Snap>) ListDailies(string ds)
 {
     // -p: exact bytes for referenced/written (the shrinkage + churn guards need raw numbers).
-    var (code, outp, err) = Exec("zfs", "list", "-Hp", "-t", "snapshot", "-o", "name,lander:keep_until,lander:tier,referenced,written", "-d", "1", ds);
+    var (code, outp, err) = Exec("zfs", "list", "-Hp", "-t", "snapshot", "-o", $"name,{propKeep},{propTier},referenced,written", "-d", "1", ds);
     var list = new List<Snap>();
     if (code != 0) { Log($"ERROR: zfs list {ds} failed: {err.Trim()}"); return (code, list); }
     foreach (var line in outp.Split('\n', StringSplitOptions.RemoveEmptyEntries))
@@ -722,7 +731,7 @@ string? HealthGuard(List<Snap> snaps, Retention ret, Guards gd)
 }
 
 // Annotate one snapshot for its current tier. Returns false if any write failed.
-// Only keepers (weekly/monthly) carry lander:tier + lander:keep_until tags; a plain
+// Only keepers (weekly/monthly) carry <ns>:tier + <ns>:keep_until tags; a plain
 // daily is implicitly daily and stays untagged. This keeps the first run cheap (~24
 // writes, not ~280) and is self-correcting: a snapshot that was a keeper last run but
 // is now superseded (demotion) has its tags inherited away and its monthly hold released
@@ -734,18 +743,18 @@ bool Promote(Snap s, DateTime keepUntil, string tier)
     {
         if (s.Tier == "monthly")   // demoted monthly: drop the protective hold first
         {
-            var (rc, _, re) = Exec("zfs", "release", "lander:monthly", s.Name);
+            var (rc, _, re) = Exec("zfs", "release", tagMonthly, s.Name);
             if (rc != 0 && !re.Contains("no such hold") && !re.Contains("not found"))
-                Log($"    WARNING: release lander:monthly failed {Short(s.Name)}: {re.Trim()}");
+                Log($"    WARNING: release {tagMonthly} failed {Short(s.Name)}: {re.Trim()}");
         }
         if (s.Tier != null)
         {
-            var (c, _, e) = Exec("zfs", "inherit", "lander:tier", s.Name);
+            var (c, _, e) = Exec("zfs", "inherit", propTier, s.Name);
             if (c != 0) { Log($"    ERROR: inherit tier failed {Short(s.Name)}: {e.Trim()}"); success = false; }
         }
         if (s.KeepUntil != null)
         {
-            var (c, _, e) = Exec("zfs", "inherit", "lander:keep_until", s.Name);
+            var (c, _, e) = Exec("zfs", "inherit", propKeep, s.Name);
             if (c != 0) { Log($"    ERROR: inherit keep_until failed {Short(s.Name)}: {e.Trim()}"); success = false; }
         }
         return success;
@@ -754,18 +763,18 @@ bool Promote(Snap s, DateTime keepUntil, string tier)
     long want = ((DateTimeOffset)keepUntil).ToUnixTimeSeconds();
     if (s.KeepUntil != want)
     {
-        var (c, _, e) = Exec("zfs", "set", $"lander:keep_until={want}", s.Name);
+        var (c, _, e) = Exec("zfs", "set", $"{propKeep}={want}", s.Name);
         if (c != 0) { Log($"    ERROR: set keep_until failed {Short(s.Name)}: {e.Trim()}"); success = false; }
     }
     if (s.Tier != tier)   // weekly|monthly — highest tier the snapshot qualifies for
     {
-        var (c, _, e) = Exec("zfs", "set", $"lander:tier={tier}", s.Name);
+        var (c, _, e) = Exec("zfs", "set", $"{propTier}={tier}", s.Name);
         if (c != 0) { Log($"    ERROR: set tier failed {Short(s.Name)}: {e.Trim()}"); success = false; }
     }
     // Auto-create hold on monthlies for protection
     if (tier == "monthly")
     {
-        var (c, _, e) = Exec("zfs", "hold", "lander:monthly", s.Name);
+        var (c, _, e) = Exec("zfs", "hold", tagMonthly, s.Name);
         if (c == 0)
             Log($"    hold: {Short(s.Name)} (monthly keeper protected)");
         else if (e.Contains("already") || e.Contains("exists"))
