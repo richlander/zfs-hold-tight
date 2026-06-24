@@ -74,8 +74,8 @@ while read -r kd; do grep -qx "$(snapname "$kd")" "$WORK/destroyed" && { echo " 
 { [ "$viol" = 0 ] && [ "$(wc -l < "$WORK/destroyed")" -gt 50 ]; } \
   && ok "T2 prune destroyed $(wc -l < "$WORK/destroyed"|tr -d ' '), no in-retention keeper destroyed" || bad "T2 viol=$viol destroyed=$(wc -l<"$WORK/destroyed")"
 grep -qx "$(snapname "$ADATE")" "$WORK/destroyed" && bad "T2b newest/base destroyed!" || ok "T2b newest daily (base) preserved"
-# tag-only-keepers: plain dailies must NOT be tagged; only ~70 keepers get zht:tier
-sets=$(grep -c 'set zht:tier' "$OPS"); sets=${sets:-0}
+# tag-only-keepers: plain dailies must NOT be tagged; only ~70 keepers get a zht:tier= set
+sets=$(grep -c 'zht:tier=' "$OPS"); sets=${sets:-0}
 { [ "$sets" -gt 0 ] && [ "$sets" -lt 120 ]; } && ok "T2c tag-only-keepers ($sets tier-sets, not ~388)" || bad "T2c tier-sets=$sets"
 # finding 2: doomed plain dailies (no monthly hold) must NOT each get a redundant release
 rels=$(grep -c '^release' "$OPS"); rels=${rels:-0}
@@ -250,6 +250,14 @@ OUT="$(FAKE_ZFS_DIR="$WORK/fz" FAKE_ZFS_FAIL=inherit ZFS_HOLD_TIGHT_CONFIG="$WOR
        ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --prune --force 2>/dev/null)"
 { ! grep -qx "release zht:monthly $demoted" "$WORK/fz/ops.log" && echo "$OUT" | grep -qi "HELD"; } \
   && ok "T26 demotion: inherit-fail keeps the hold + HOLDs dataset" || bad "T26 (out: $(echo "$OUT"|tail -1))"
+
+# ---- T28: a capped --prune (no --force) HOLDs without mutating anything first (finding 1) ----
+rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"; cp "$WORK/healthy" "$WORK/fz/snaps"; : > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
+OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
+       ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --prune 2>/dev/null)"
+muts=$(grep -cE '^(set|hold|inherit|release|destroy)' "$WORK/fz/ops.log"); muts=${muts:-0}
+{ echo "$OUT" | grep -qi "cap" && [ "$muts" = 0 ]; } \
+  && ok "T28 capped --prune HOLDs with zero metadata writes" || bad "T28 muts=$muts (out: $(echo "$OUT"|tail -1))"
 
 # ---- T27: monthly keepers already held are NOT re-held every prune (finding 3) ----
 rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"; cp "$WORK/healthy" "$WORK/fz/snaps"; : > "$WORK/fz/ops.log"

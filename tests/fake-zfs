@@ -22,15 +22,14 @@ case "$sub" in
     [ -f "$D/holds" ] && cat "$D/holds"
     exit 0 ;;
   set)
-    log "set $1 $2"; exit 0 ;;
+    log "set $*"; exit 0 ;;          # `set <prop=val>... <snap>` — may carry multiple props
   inherit)
     log "inherit $1 $2"; exit 0 ;;
   hold)
-    # $1=tag $2=snap ; refuse duplicate like real zfs
-    if [ -f "$D/holds" ] && grep -qP "^$(printf '%s' "$2" | sed 's/[.[\*^$]/\\&/g')\t$(printf '%s' "$1" | sed 's/[.[\*^$]/\\&/g')\t" "$D/holds"; then
-      echo "cannot hold: tag already exists on this dataset" >&2; exit 1
-    fi
-    log "hold $1 $2"; printf '%s\t%s\t-\n' "$2" "$1" >> "$D/holds"; exit 0 ;;
+    # `hold <tag> <snap>...` — may carry multiple snapshots
+    tag="$1"; shift
+    for s in "$@"; do log "hold $tag $s"; printf '%s\t%s\t-\n' "$s" "$tag" >> "$D/holds"; done
+    exit 0 ;;
   release)
     log "release $1 $2"
     if [ -f "$D/holds" ]; then

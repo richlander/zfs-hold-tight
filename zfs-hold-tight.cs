@@ -367,15 +367,11 @@ foreach (var (ds, ret) in retention)
     bool IsForeignHeld(string name) =>
         holdMap.TryGetValue(name, out var tags) && tags.Any(t => t != tagMonthly);
 
+    // ---- PLAN (read-only): compute the doomed set; mutate nothing yet ----
     var doomed = new List<string>();
-    var promoteErrors = new List<string>();  // snapshots whose metadata/hold write failed
     foreach (var s in snaps.OrderBy(s => s.Date))
     {
-        var keepUntil = Desired(s);
-        string tier = monthKeeper.Contains(s.Name) ? "monthly" : weekKeeper.Contains(s.Name) ? "weekly" : "daily";
-        bool monthlyHeld = holdMap.TryGetValue(s.Name, out var sht) && sht.Contains(tagMonthly);
-        if (prune && !Promote(s, keepUntil, tier, monthlyHeld)) promoteErrors.Add(Short(s.Name));
-        if (now <= keepUntil) continue;                     // still retained
+        if (now <= Desired(s)) continue;                    // still retained
         if (s.Name == newest) continue;                     // never the base (guard 7)
         if (IsForeignHeld(s.Name))                          // guard 12: held => never delete, skip cleanly
         { if (verbose) Log($"  {ds}: skip {Short(s.Name)} - held ({string.Join(",", holdMap[s.Name])})"); continue; }
@@ -394,20 +390,32 @@ foreach (var (ds, ret) in retention)
         doomed.Add(s.Name);
     }
 
-    // Metadata/hold write failures HOLD the dataset (delete nothing) and alert.
-    if (promoteErrors.Count > 0)
-    {
-        Log($"{ds}: HOLD - metadata/hold errors detected (no deletions)");
-        held.Add($"{ds}: metadata/hold failures");
-        metadataErrors.AddRange(promoteErrors.Select(n => $"  {ds}@{n}"));
-        continue;
-    }
-
-    // ---- volume circuit-breaker ----
+    // ---- volume circuit-breaker — BEFORE any mutation, so a capped dataset HOLDs cleanly
+    //      without first issuing a burst of set/hold/inherit writes ----
     if (doomed.Count > gd.MaxDeletePerRun && !force)
     {
         Log($"{ds}: HOLD - would delete {doomed.Count} > cap {gd.MaxDeletePerRun}; rerun with --force if intended");
         held.Add($"{ds}: volume {doomed.Count}>cap"); continue;
+    }
+
+    // ---- tag keepers / clean up demotions (prune only, now that the run will proceed) ----
+    if (prune)
+    {
+        var promoteErrors = new List<string>();  // snapshots whose metadata/hold write failed
+        foreach (var s in snaps.OrderBy(s => s.Date))
+        {
+            string tier = monthKeeper.Contains(s.Name) ? "monthly" : weekKeeper.Contains(s.Name) ? "weekly" : "daily";
+            bool monthlyHeld = holdMap.TryGetValue(s.Name, out var sht) && sht.Contains(tagMonthly);
+            if (!Promote(s, Desired(s), tier, monthlyHeld)) promoteErrors.Add(Short(s.Name));
+        }
+        // Metadata/hold write failures HOLD the dataset (delete nothing) and alert.
+        if (promoteErrors.Count > 0)
+        {
+            Log($"{ds}: HOLD - metadata/hold errors detected (no deletions)");
+            held.Add($"{ds}: metadata/hold failures");
+            metadataErrors.AddRange(promoteErrors.Select(n => $"  {ds}@{n}"));
+            continue;
+        }
     }
 
     int kept = snaps.Count - doomed.Count;
@@ -613,22 +621,22 @@ int Fix(string? datasetFilter)
         if (code != 0) { Log($"  ✗ {ds}: zfs list failed, skipping"); errors++; continue; }
         if (snaps.Count == 0) continue;
 
-        // Find monthlies
+        // Find monthlies, load current holds once, and hold only the ones still MISSING
+        // (batched — `zfs hold <tag> <snap>...` takes multiple snapshots).
         var monthKeeper = snaps.GroupBy(s => (s.Date.Year, s.Date.Month))
                               .Select(g => g.MaxBy(s => s.Date)!.Name).ToHashSet();
+        var holdMap = LoadHolds(snaps.Select(s => s.Name).ToList());
+        if (holdMap is null) { Log($"  ✗ {ds}: zfs holds failed, skipping"); errors++; continue; }
 
-        foreach (var monthly in monthKeeper)
+        var toHold = monthKeeper.Where(m => !(holdMap.TryGetValue(m, out var t) && t.Contains(tagMonthly))).ToList();
+        foreach (var m in monthKeeper.Except(toHold)) Log($"  ✓ {ds}/{Short(m)} (already held)");
+        for (int i = 0; i < toHold.Count; i += 256)
         {
-            var (c, _, e) = Exec("zfs", "hold", tagMonthly, monthly);
-            if (c == 0)
-            {
-                Log($"  ✓ {ds}/{Short(monthly)}");
-                fixed_++;
-            }
-            else if (e.Contains("already") || e.Contains("exists"))
-                Log($"  ✓ {ds}/{Short(monthly)} (already held)");
-            else
-            { Log($"  ✗ {ds}/{Short(monthly)}: {e.Trim()}"); errors++; }
+            var chunk = toHold.GetRange(i, Math.Min(256, toHold.Count - i));
+            var a = new List<string> { "hold", tagMonthly }; a.AddRange(chunk);
+            var (c, _, e) = Exec("zfs", a.ToArray());
+            if (c == 0) { foreach (var m in chunk) { Log($"  ✓ {ds}/{Short(m)}"); fixed_++; } }
+            else { foreach (var m in chunk) Log($"  ✗ {ds}/{Short(m)}: {e.Trim()}"); errors++; }
         }
     }
 
@@ -788,16 +796,16 @@ bool Promote(Snap s, DateTime keepUntil, string tier, bool monthlyHeld)
         return success;
     }
 
+    // Set keep_until and/or tier in a single `zfs set` (it accepts multiple prop=value args).
     long want = ((DateTimeOffset)keepUntil).ToUnixTimeSeconds();
-    if (s.KeepUntil != want)
+    var props = new List<string>();
+    if (s.KeepUntil != want) props.Add($"{propKeep}={want}");
+    if (s.Tier != tier)      props.Add($"{propTier}={tier}");   // weekly|monthly — highest qualifying tier
+    if (props.Count > 0)
     {
-        var (c, _, e) = Exec("zfs", "set", $"{propKeep}={want}", s.Name);
-        if (c != 0) { Log($"    ERROR: set keep_until failed {Short(s.Name)}: {e.Trim()}"); success = false; }
-    }
-    if (s.Tier != tier)   // weekly|monthly — highest tier the snapshot qualifies for
-    {
-        var (c, _, e) = Exec("zfs", "set", $"{propTier}={tier}", s.Name);
-        if (c != 0) { Log($"    ERROR: set tier failed {Short(s.Name)}: {e.Trim()}"); success = false; }
+        var setArgs = new List<string> { "set" }; setArgs.AddRange(props); setArgs.Add(s.Name);
+        var (c, _, e) = Exec("zfs", setArgs.ToArray());
+        if (c != 0) { Log($"    ERROR: set {string.Join(",", props)} failed {Short(s.Name)}: {e.Trim()}"); success = false; }
     }
     // Auto-create hold on monthlies for protection — only if not already held (avoids ~60
     // redundant `zfs hold` calls per dataset per prune; we already know the hold state).
