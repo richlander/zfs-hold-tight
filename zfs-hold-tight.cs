@@ -201,9 +201,19 @@ catch (Exception ex)
 }
 
 // Parse --dataset if present
+// --dataset must name a configured dataset. Validate here, BEFORE any command dispatches,
+// so a missing value can never silently widen a destructive run to all datasets and an
+// unknown value can never look like a successful no-op (--doctor/--fix/--hold-*).
 string? datasetFilter = null;
-for (int i = 0; i < args.Length - 1; i++)
-    if (args[i] == "--dataset") datasetFilter = args[i + 1];
+int dsIdx = Array.IndexOf(args, "--dataset");
+if (dsIdx >= 0)
+{
+    if (dsIdx + 1 >= args.Length || args[dsIdx + 1].StartsWith("--"))
+    { Console.Error.WriteLine("--dataset requires a dataset name"); configDoc?.Dispose(); return 2; }
+    datasetFilter = args[dsIdx + 1];
+    if (!retention.ContainsKey(datasetFilter))
+    { Console.Error.WriteLine($"unknown dataset '{datasetFilter}'"); configDoc?.Dispose(); return 2; }
+}
 
 // Run-lock: serialize any run that mutates ZFS state (prune/fix/hold-*), so two
 // overlapping cron invocations can't double-process. Read-only modes skip the lock.
@@ -280,8 +290,7 @@ if (args.Contains("--hold-latest"))
 bool prune = args.Contains("--prune");
 bool force = args.Contains("--force");
 bool verbose = args.Contains("-v") || args.Contains("--verbose");
-string? only = datasetFilter;
-if (only is not null && !retention.ContainsKey(only)) { Console.Error.WriteLine($"unknown dataset '{only}'"); return 2; }
+string? only = datasetFilter;   // already validated against config above
 
 Log($"=== zfs-hold-tight {now:yyyy-MM-dd HH:mm:ss}Z  mode={(prune ? "PRUNE" : "dry-run")}{(force ? " --force" : "")} ===");
 if (prune && !noHc) HcPing(hcUrl + "/start", null);
@@ -322,7 +331,14 @@ foreach (var (ds, ret) in retention)
 
     // Current holds on this dataset — used to (a) honor guard 12 (never delete a held
     // snapshot) and (b) tell our managed lander:monthly hold from foreign/defensive ones.
+    // A holds-list failure means we can't verify guard 12, so HOLD rather than guess.
     var holdMap = LoadHolds(ds);
+    if (holdMap is null)
+    {
+        Log($"{ds}: HOLD - zfs holds failed (cannot verify holds)");
+        held.Add($"{ds}: zfs holds error");
+        continue;
+    }
     bool IsForeignHeld(string name) =>
         holdMap.TryGetValue(name, out var tags) && tags.Any(t => t != "lander:monthly");
 
@@ -337,9 +353,18 @@ foreach (var (ds, ret) in retention)
         if (s.Name == newest) continue;                     // never the base (guard 7)
         if (IsForeignHeld(s.Name))                          // guard 12: held => never delete, skip cleanly
         { if (verbose) Log($"  {ds}: skip {Short(s.Name)} - held ({string.Join(",", holdMap[s.Name])})"); continue; }
-        bool weekCov  = snaps.Any(o => o.Name != s.Name && SameIsoWeek(o.Date, s.Date) && Desired(o) > now);
-        bool monthCov = snaps.Any(o => o.Name != s.Name && o.Date.Year == s.Date.Year && o.Date.Month == s.Date.Month && Desired(o) > now);
-        if (!(weekCov && monthCov)) { Log($"  {ds}: skip {Short(s.Name)} - not yet covered by a keeper"); continue; }
+        // A non-keeper daily is deleted only once a *surviving* keeper covers its week and
+        // month (never open a coverage hole early). A week/month keeper that is itself past
+        // retention is its period's last survivor — nothing remains to cover, so it must
+        // age out rather than live forever (it being the newest in its week/month means the
+        // coverage test can never find a replacement).
+        bool isKeeper = weekKeeper.Contains(s.Name) || monthKeeper.Contains(s.Name);
+        if (!isKeeper)
+        {
+            bool weekCov  = snaps.Any(o => o.Name != s.Name && SameIsoWeek(o.Date, s.Date) && Desired(o) > now);
+            bool monthCov = snaps.Any(o => o.Name != s.Name && o.Date.Year == s.Date.Year && o.Date.Month == s.Date.Month && Desired(o) > now);
+            if (!(weekCov && monthCov)) { Log($"  {ds}: skip {Short(s.Name)} - not yet covered by a keeper"); continue; }
+        }
         doomed.Add(s.Name);
     }
 
@@ -492,8 +517,9 @@ int Doctor(string? datasetFilter)
         var monthKeeper = snaps.GroupBy(s => (s.Date.Year, s.Date.Month))
                               .Select(g => g.MaxBy(s => s.Date)!.Name).ToHashSet();
 
-        // Check which snapshots have holds
+        // Check which snapshots have holds (read-only: tolerate a holds-list failure)
         var holdMap = LoadHolds(ds);
+        if (holdMap is null) { Log($"{ds}: WARNING - zfs holds failed, hold status unknown"); continue; }
 
         // Report monthly status
         Log($"{ds}: {monthKeeper.Count} monthlies");
@@ -752,11 +778,13 @@ bool Promote(Snap s, DateTime keepUntil, string tier)
 
 // Parse `zfs holds -r <ds>` into snapshot -> set of hold tags. Tolerant of tab- or
 // space-aligned output; only the first two columns (NAME, TAG) are needed.
-Dictionary<string, HashSet<string>> LoadHolds(string ds)
+// Returns null on a `zfs holds` failure (distinct from "no holds") so a destructive caller
+// can refuse to proceed without knowing the hold state.
+Dictionary<string, HashSet<string>>? LoadHolds(string ds)
 {
     var map = new Dictionary<string, HashSet<string>>();
     var (c, outp, _) = Exec("zfs", "holds", "-r", ds);
-    if (c != 0) return map;
+    if (c != 0) return null;
     foreach (var line in outp.Split('\n', StringSplitOptions.RemoveEmptyEntries))
     {
         if (line.StartsWith("NAME")) continue;

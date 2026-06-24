@@ -191,6 +191,30 @@ OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/cfg2.json" \
   && ok "T18 per-dataset isolation: 100MiB dataset wiped 80% flagged alone" \
   || bad "T18 (out: $(echo "$OUT" | grep -E 'scratch|home/rich|HELD' | tr '\n' '|'))"
 
+# ---- T19: an expired week/month keeper (past retention) ages out, not kept forever ----
+old=$(date -u -d "$ADATE -2200 days" +%Y-%m-%d); oldsnap="$(snapname "$old")"   # ~6y old, sole rep of its week+month
+{ gen_window $((NOW-7200)); printf '%s\t-\t-\n' "$oldsnap"; } > "$WORK/expired"
+rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"; cp "$WORK/expired" "$WORK/fz/snaps"; : > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
+OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
+       ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --prune --force 2>/dev/null)"
+{ grep -qx "destroy $oldsnap" "$WORK/fz/ops.log"; } \
+  && ok "T19 expired keeper aged out (pruned, not immortal)" || bad "T19 expired keeper not pruned"
+
+# ---- T20: --dataset with no value is a hard error (never silently all-datasets) ----
+run_tool "$WORK/healthy" --prune --dataset
+[ "$RC" = 2 ] && ok "T20 --dataset without value rejected (rc=2)" || bad "T20 (rc=$RC)"
+
+# ---- T21: unknown --dataset rejected (not a silent no-op for --doctor/--fix/--hold-*) ----
+run_tool "$WORK/healthy" --doctor --dataset archive/does-not-exist
+[ "$RC" = 2 ] && ok "T21 unknown --dataset rejected in --doctor (rc=2)" || bad "T21 (rc=$RC)"
+
+# ---- T22: `zfs holds` failure HOLDs the dataset (can't verify guard 12), 0 destroys ----
+rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"; cp "$WORK/healthy" "$WORK/fz/snaps"; : > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
+OUT="$(FAKE_ZFS_DIR="$WORK/fz" FAKE_ZFS_FAIL=holds ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
+       ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --prune --force 2>/dev/null)"
+{ echo "$OUT" | grep -qi "holds" && [ "$(grep -c '^destroy' "$WORK/fz/ops.log")" = 0 ]; } \
+  && ok "T22 zfs holds failure -> HOLD, 0 destroys" || bad "T22 (out: $(echo "$OUT"|tail -1))"
+
 # ---- T13: demoted monthly keeper -> hold released + tags inherited, not destroyed ----
 rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"
 recent=$(date -u -d "$ADATE -5 days" +%Y-%m-%d); demoted="$(snapname "$recent")"
