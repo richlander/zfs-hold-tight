@@ -9,6 +9,8 @@
   "guardMaxDeletePerRun": 5,
   "guardRecentWindowDays": 7,
   "guardMaxDailyAgeHours": 26,
+  "_comment_shrink": "HOLD a dataset (delete nothing) + alert when the newest daily references this many percent less data than the recent baseline median — catches mass deletion on the source. 0 disables.",
+  "guardMaxDailyShrinkPct": 33,
 
   "retentionPolicies": {
     "baseline": {

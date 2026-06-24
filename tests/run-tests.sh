@@ -144,6 +144,19 @@ FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" ZFS_HOLD_TIGHT
 wait $P1
 [ "$RC2" = 3 ] && ok "T12 second concurrent prune blocked by run-lock (rc=3)" || bad "T12 (rc2=$RC2)"
 
+# ---- T14: sudden data shrinkage (newest daily references far less) -> HOLD ----
+# 4-col fixture (name, keep_until, tier, referenced[bytes]); baseline 1GiB, newest 100MiB (~90% drop)
+nlines="$(gen_window $((NOW-7200)) | wc -l)"
+gen_window $((NOW-7200)) | awk -F'\t' -v n="$nlines" \
+  'BEGIN{OFS="\t"} {print $1,$2,$3,(NR==n?104857600:1073741824)}' > "$WORK/shrink"
+run_tool "$WORK/shrink" --force
+{ echo "$OUT" | grep -qi "shrank\|shrink\|deletion"; } && ok "T14 data shrinkage -> HOLD" || bad "T14 (out: $(echo "$OUT"|tail -1))"
+
+# ---- T15: stable referenced (no shrink) -> shrink guard does NOT false-positive ----
+gen_window $((NOW-7200)) | awk -F'\t' 'BEGIN{OFS="\t"} {print $1,$2,$3,1073741824}' > "$WORK/stable"
+run_tool "$WORK/stable" --force
+{ ! echo "$OUT" | grep -qi "shrank\|shrink"; } && ok "T15 stable referenced: no false shrink-HOLD" || bad "T15 false positive (out: $(echo "$OUT"|tail -1))"
+
 # ---- T13: demoted monthly keeper -> hold released + tags inherited, not destroyed ----
 rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"
 recent=$(date -u -d "$ADATE -5 days" +%Y-%m-%d); demoted="$(snapname "$recent")"

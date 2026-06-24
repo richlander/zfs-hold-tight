@@ -11,9 +11,10 @@
 // dailies past expiry. It never creates snapshots.
 //
 // SAFETY: it deletes only when the dataset's feed is provably healthy; otherwise it
-// HOLDs (deletes nothing) and alerts. Full contract: truenas/gfs-prune-safety.md.
+// HOLDs (deletes nothing) and alerts. Full contract: docs/SAFETY.md.
 //   Run-level guards (HOLD the dataset on failure): recent 7-day window complete,
-//   newest daily fresh (<=26h, guardMaxDailyAgeHours), clock sane, volume
+//   newest daily fresh (<=26h, guardMaxDailyAgeHours), clock sane, no sudden data
+//   shrinkage (guardMaxDailyShrinkPct — catches mass deletion), volume
 //   circuit-breaker (<=5/run w/o --force).
 //   Per-snapshot: never the newest/base, week/month keepers, uncovered, held, or
 //   non-_daily snapshots.
@@ -73,7 +74,7 @@ if (!cfg.TryGetProperty("datasets", out var datasetsElem) || datasetsElem.ValueK
 }
 
 // Validate and load numeric config with bounds
-int MaxDeletePerRun = 5, RecentWindowDays = 7, MaxDailyAgeHours = 26;
+int MaxDeletePerRun = 5, RecentWindowDays = 7, MaxDailyAgeHours = 26, MaxDailyShrinkPct = 33;
 try
 {
     if (cfg.TryGetProperty("guardMaxDeletePerRun", out var gdp))
@@ -90,6 +91,11 @@ try
     {
         MaxDailyAgeHours = gma.GetInt32();
         if (MaxDailyAgeHours <= 0 || MaxDailyAgeHours > 720) throw new ArgumentException("guardMaxDailyAgeHours must be 1-720");
+    }
+    if (cfg.TryGetProperty("guardMaxDailyShrinkPct", out var gms))
+    {
+        MaxDailyShrinkPct = gms.GetInt32();   // 0 disables the data-shrinkage guard
+        if (MaxDailyShrinkPct < 0 || MaxDailyShrinkPct > 99) throw new ArgumentException("guardMaxDailyShrinkPct must be 0-99 (0 disables)");
     }
 }
 catch (Exception ex)
@@ -602,6 +608,26 @@ string? HealthGuard(List<Snap> snaps, Retention ret)
         if (!days.Contains(day)) missing.Add(day.ToString("MM-dd"));
     }
     if (missing.Count > 0) return $"gap in last {RecentWindowDays}d: missing {string.Join(",", missing)}";
+    // guard: data shrinkage. The newest daily referencing far less data than the recent
+    // baseline signals mass deletion on the source. Catches deletion, NOT encryption
+    // (which preserves `referenced`). 0 disables.
+    if (MaxDailyShrinkPct > 0)
+    {
+        var newestSnap = snaps.MaxBy(s => s.Date)!;
+        var baseline = snaps.Where(s => s.Name != newestSnap.Name
+                                     && s.Date >= newest.AddDays(-RecentWindowDays)
+                                     && s.Referenced is long rv && rv > 0)
+                            .Select(s => s.Referenced!.Value).OrderBy(x => x).ToList();
+        if (newestSnap.Referenced is long nref && baseline.Count > 0)
+        {
+            long median = baseline[baseline.Count / 2];
+            if (nref < median * (100 - MaxDailyShrinkPct) / 100.0)
+            {
+                double dropPct = 100.0 * (1 - (double)nref / median);
+                return $"newest daily shrank {dropPct:F0}% ({nref / 1048576}MiB referenced vs ~{median / 1048576}MiB baseline, > {MaxDailyShrinkPct}% drop) — possible mass deletion on source";
+            }
+        }
+    }
     if (snaps.Count < ret.DailyKeepDays)                                 // guard 6: population (note only)
         Log($"  note: {snaps.Count} dailies < keep {ret.DailyKeepDays}, nothing beyond window");
     return null;
@@ -610,7 +636,8 @@ string? HealthGuard(List<Snap> snaps, Retention ret)
 // ---- helpers ----
 (int, List<Snap>) ListDailies(string ds)
 {
-    var (code, outp, err) = Exec("zfs", "list", "-H", "-t", "snapshot", "-o", "name,lander:keep_until,lander:tier", "-d", "1", ds);
+    // -p: exact bytes for `referenced` (the data-shrinkage guard needs raw numbers).
+    var (code, outp, err) = Exec("zfs", "list", "-Hp", "-t", "snapshot", "-o", "name,lander:keep_until,lander:tier,referenced", "-d", "1", ds);
     var list = new List<Snap>();
     if (code != 0) { Log($"ERROR: zfs list {ds} failed: {err.Trim()}"); return (code, list); }
     foreach (var line in outp.Split('\n', StringSplitOptions.RemoveEmptyEntries))
@@ -625,7 +652,8 @@ string? HealthGuard(List<Snap> snaps, Retention ret)
         { Log($"  WARNING: unparseable snapshot date, skipping: {cols[0]}"); continue; }
         long? ku = cols.Length > 1 && long.TryParse(cols[1], out var v) ? v : null;
         string? tier = cols.Length > 2 && cols[2] != "-" ? cols[2] : null;
-        list.Add(new Snap(cols[0], date, ku, tier));
+        long? refb = cols.Length > 3 && long.TryParse(cols[3], out var rb) ? rb : null;
+        list.Add(new Snap(cols[0], date, ku, tier, refb));
     }
     return (0, list);
 }
@@ -737,4 +765,4 @@ static bool SameIsoWeek(DateTime a, DateTime b) =>
 static string Short(string snap) => snap[(snap.IndexOf('@') + 1)..];
 
 record Retention(int DailyKeepDays, int WeeklyKeepDays, int MonthlyKeepDays);
-record Snap(string Name, DateTime Date, long? KeepUntil, string? Tier);
+record Snap(string Name, DateTime Date, long? KeepUntil, string? Tier, long? Referenced = null);

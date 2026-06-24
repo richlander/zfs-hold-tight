@@ -32,10 +32,16 @@ Evaluated **per dataset**, anchored on the newest daily, not wall-clock.
    (default 26h) old. A stale newest means replication isn't delivering.
 3. **Clock sane.** No snapshot may be dated in the future, and `now` must be after the
    newest snapshot. A wrong clock would make `keep_until` expire everything at once.
-4. **Volume circuit-breaker.** A single run may not delete more than
+4. **No sudden data shrinkage.** If the newest daily references more than
+   `guardMaxDailyShrinkPct` (default 33%) less data than the recent baseline median, HOLD
+   — a likely mass deletion on the source. This guard catches outright **deletion**; it
+   does *not* catch **encryption-in-place**, which preserves `referenced` (size) while
+   scrambling contents. Set to 0 to disable. (Recoverability of both cases still rests on
+   retention: pre-incident keepers survive defender-side for years regardless.)
+5. **Volume circuit-breaker.** A single run may not delete more than
    `guardMaxDeletePerRun` (default 5) snapshots for one dataset without `--force`. Steady
    state deletes 0–1/day; a large number signals an abnormal state or a logic bug.
-5. **Population floor.** If a dataset has fewer dailies than its keep count, nothing is
+6. **Population floor.** If a dataset has fewer dailies than its keep count, nothing is
    beyond the window — skip and note it; a sudden drop is itself suspicious.
 
 A broken source feed shows up as stale/gappy dailies, so guards 1–2 enforce replication
@@ -43,27 +49,27 @@ health by proxy.
 
 ## Per-snapshot protections — never delete a snapshot that is…
 
-6. **The newest daily** — the replication incremental base. Absolute, always.
-7. **Within the daily-keep window** — one of the newest N (N per policy).
-8. **A week keeper** — newest daily in its ISO-week, within weekly retention.
-9. **A month keeper** — newest daily in its month, within monthly retention.
-10. **Not yet covered** — a daily is deleted only once a *surviving* keeper covers both
+7. **The newest daily** — the replication incremental base. Absolute, always.
+8. **Within the daily-keep window** — one of the newest N (N per policy).
+9. **A week keeper** — newest daily in its ISO-week, within weekly retention.
+10. **A month keeper** — newest daily in its month, within monthly retention.
+11. **Not yet covered** — a daily is deleted only once a *surviving* keeper covers both
     its ISO-week and its month. Never open a coverage hole.
-11. **Held** — any `zfs hold` (e.g. a defensive `lander:adhoc`) makes the snapshot
+12. **Held** — any `zfs hold` (e.g. a defensive `lander:adhoc`) makes the snapshot
     off-limits; it is skipped, never forced. The tool's own `lander:monthly` hold is
     released immediately before it destroys an expired monthly keeper.
-12. **Not a recognized `autosnap_<ts>_daily`** — legacy `_weekly`/`_monthly`, manual, and
+13. **Not a recognized `autosnap_<ts>_daily`** — legacy `_weekly`/`_monthly`, manual, and
     unparseable names are out of scope (and an unparseable date skips that one snapshot,
     never aborts the run).
 
 ## Operational guarantees
 
-13. **Dry-run by default.** Deletion happens only with `--prune`.
-14. **Per-dataset isolation.** A guard tripping on one dataset HOLDs only that dataset;
+14. **Dry-run by default.** Deletion happens only with `--prune`.
+15. **Per-dataset isolation.** A guard tripping on one dataset HOLDs only that dataset;
     healthy datasets still prune. A global fault (e.g. a bad clock) HOLDs everything.
-15. **Single run at a time.** A mutating run takes an exclusive lock; a second overlapping
+16. **Single run at a time.** A mutating run takes an exclusive lock; a second overlapping
     run exits without touching anything.
-16. **Always logs; alerts on trouble.** Every run appends a timestamped record to the log
+17. **Always logs; alerts on trouble.** Every run appends a timestamped record to the log
     directory (and stdout). On `--prune` it pings healthchecks.io on a clean run, and
     `<url>/fail` (with diagnostics) whenever any guard HOLDs a dataset or a destroy fails
     — so an unhealthy-but-not-pruning state is **visible, never silent**.

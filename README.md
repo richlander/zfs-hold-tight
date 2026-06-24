@@ -119,6 +119,7 @@ See [`zfs-hold-tight.example.json`](zfs-hold-tight.example.json). Top-level keys
 | `guardMaxDeletePerRun` | `5` | Per-run delete cap (circuit-breaker; `--force` overrides). |
 | `guardRecentWindowDays` | `7` | Require an unbroken daily window this many days back. |
 | `guardMaxDailyAgeHours` | `26` | HOLD if the newest daily is older than this. |
+| `guardMaxDailyShrinkPct` | `33` | HOLD if the newest daily references this % less data than the recent baseline (mass-deletion guard; `0` disables). |
 | `retentionPolicies` | — | Named `{dailyKeepDays, weeklyKeepDays, monthlyKeepDays}` profiles. |
 | `datasets` | — | `dataset → policy` map. Datasets must start with `archive/`. |
 
@@ -136,8 +137,9 @@ HOLDs everything. See [docs/SAFETY.md](docs/SAFETY.md) for the full contract.
 1. **Clock sane** — no snapshot dated in the future.
 2. **Newest daily fresh** — ≤ `guardMaxDailyAgeHours` (26h) old.
 3. **Recent window complete** — no gaps in the last `guardRecentWindowDays` (7) days.
-4. **Volume circuit-breaker** — never delete more than `guardMaxDeletePerRun` without `--force`.
-5. **Population floor** — fewer dailies than the keep count ⇒ nothing to prune (noted).
+4. **No sudden data shrinkage** — newest daily references ≥ `guardMaxDailyShrinkPct` (33%) less than the recent baseline ⇒ HOLD (mass-deletion guard).
+5. **Volume circuit-breaker** — never delete more than `guardMaxDeletePerRun` without `--force`.
+6. **Population floor** — fewer dailies than the keep count ⇒ nothing to prune (noted).
 
 Per-snapshot, it never deletes the replication base (newest daily), a week/month keeper,
 an uncovered daily, or any held snapshot.
