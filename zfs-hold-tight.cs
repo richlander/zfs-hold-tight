@@ -137,8 +137,8 @@ if (string.IsNullOrEmpty(hcUrl) && cfg.TryGetProperty("healthchecksUrl", out var
 bool noHc = args.Contains("--no-hc") || string.IsNullOrEmpty(hcUrl);
 
 // Namespace for this tool's ZFS user-properties and hold tags (<ns>:keep_until,
-// <ns>:tier, <ns>:monthly, <ns>:adhoc). Configurable so the source carries no site
-// identity; defaults to "zht".
+// <ns>:tier, <ns>:monthly, <ns>:adhoc, <ns>:worry). Configurable so the source carries
+// no site identity; defaults to "zht".
 string ns = (cfg.TryGetProperty("propertyNamespace", out var pnEl) ? pnEl.GetString() : null) ?? "zht";
 if (!Regex.IsMatch(ns, @"^[A-Za-z0-9_.-]+$"))
 { Console.Error.WriteLine($"FATAL: propertyNamespace '{ns}' must be letters/digits/._- (no colon)"); configDoc?.Dispose(); return 2; }
@@ -337,10 +337,6 @@ foreach (var (ds, ret) in retention)
     if (snaps.Count == 0) { Log($"{ds}: no daily snapshots, skip"); continue; }
     var gd = guardsByDataset[ds];   // this dataset's effective guard thresholds
 
-    // ---- run-level guards (HOLD on failure) ----
-    string? guard = HealthGuard(snaps, ret, gd);
-    if (guard is not null) { Log($"{ds}: HOLD - {guard} (no deletions)"); held.Add($"{ds}: {guard}"); continue; }
-
     // ---- keepers + desired keep_until ----
     var weekKeeper  = snaps.GroupBy(s => (ISOWeek.GetYear(s.Date), ISOWeek.GetWeekOfYear(s.Date)))
                            .Select(g => g.MaxBy(s => s.Date)!.Name).ToHashSet();
@@ -366,6 +362,31 @@ foreach (var (ds, ret) in retention)
     }
     bool IsForeignHeld(string name) =>
         holdMap.TryGetValue(name, out var tags) && tags.Any(t => t != tagMonthly);
+
+    // ---- run-level guards. On a worry, protection only ever INCREASES: still hold the
+    //      monthly keepers (even the suspect newest — a false positive costs nothing, and
+    //      we don't want to skip the hold and lose the chance later) and record a worry
+    //      breadcrumb on the tip — but never release a hold or delete anything. ----
+    string? guard = HealthGuard(snaps, ret, gd);
+    if (guard is not null)
+    {
+        if (prune)
+        {
+            foreach (var mk in monthKeeper)
+                if (!(holdMap.TryGetValue(mk, out var mt) && mt.Contains(tagMonthly)))
+                {
+                    var (hc, _, he) = Exec("zfs", "hold", tagMonthly, mk);
+                    if (hc == 0) Log($"    hold: {Short(mk)} (protected during worry)");
+                    else if (!(he.Contains("already") || he.Contains("exists")))
+                        Log($"    WARNING: worry-hold failed {Short(mk)}: {he.Trim()}");
+                }
+            var (wc, _, we) = Exec("zfs", "set", $"{ns}:worry={now:yyyy-MM-dd} {guard}", newest);
+            if (wc != 0) Log($"    WARNING: set {ns}:worry failed: {we.Trim()}");
+        }
+        Log($"{ds}: HOLD - {guard} (no deletions; keepers protected)");
+        held.Add($"{ds}: {guard}");
+        continue;
+    }
 
     // ---- PLAN (read-only): compute the doomed set; mutate nothing yet ----
     var doomed = new List<string>();
@@ -422,7 +443,12 @@ foreach (var (ds, ret) in retention)
     totalKeep += kept; totalDoom += doomed.Count;
     string verb = prune ? "destroy" : "would destroy";
     string rng = doomed.Count > 0 ? $" [{Short(doomed[0])} .. {Short(doomed[^1])}]" : "";
-    Log($"{ds}: {snaps.Count} dailies -> keep {kept} (d{ret.DailyKeepDays}/w{ret.WeeklyKeepDays / 7}/m{ret.MonthlyKeepDays / 30}), {verb} {doomed.Count}{rng}");
+    // keeper tag breakdown (monthly takes precedence over weekly) and the next date a
+    // snapshot in this dataset is expected to age out and be pruned.
+    int mCount = monthKeeper.Count, wCount = weekKeeper.Count(w => !monthKeeper.Contains(w));
+    var futureExpiry = snaps.Where(s => s.Name != newest).Select(s => Desired(s)).Where(d => d > now).ToList();
+    string nextPrune = futureExpiry.Count > 0 ? futureExpiry.Min().ToString("yyyy-MM-dd") : "—";
+    Log($"{ds}: {snaps.Count} dailies -> keep {kept} ({mCount}m/{wCount}w, d{ret.DailyKeepDays}/w{ret.WeeklyKeepDays / 7}/m{ret.MonthlyKeepDays / 30}), {verb} {doomed.Count}{rng}; next prune {nextPrune}");
     foreach (var name in doomed)
     {
         if (verbose) Log($"  {verb}: {Short(name)}");
@@ -788,6 +814,7 @@ bool Promote(Snap s, DateTime keepUntil, string tier, bool monthlyHeld)
         {
             var (c, _, e) = Exec("zfs", "inherit", propTier, s.Name);
             if (c != 0) { Log($"    ERROR: inherit tier failed {Short(s.Name)}: {e.Trim()}"); success = false; }
+            else if (verbose) Log($"    inherit {Short(s.Name)}: cleared {propTier},{propKeep} (demoted to daily)");
         }
         if (s.KeepUntil != null)
         {
@@ -799,6 +826,7 @@ bool Promote(Snap s, DateTime keepUntil, string tier, bool monthlyHeld)
             var (rc, _, re) = Exec("zfs", "release", tagMonthly, s.Name);
             if (rc != 0 && !re.Contains("no such hold") && !re.Contains("not found"))
             { Log($"    ERROR: release {tagMonthly} failed {Short(s.Name)}: {re.Trim()}"); success = false; }
+            else Log($"    release: {Short(s.Name)} (demoted to daily, no longer held)");
         }
         return success;
     }
@@ -813,18 +841,31 @@ bool Promote(Snap s, DateTime keepUntil, string tier, bool monthlyHeld)
         var setArgs = new List<string> { "set" }; setArgs.AddRange(props); setArgs.Add(s.Name);
         var (c, _, e) = Exec("zfs", setArgs.ToArray());
         if (c != 0) { Log($"    ERROR: set {string.Join(",", props)} failed {Short(s.Name)}: {e.Trim()}"); success = false; }
+        else if (verbose) Log($"    set {Short(s.Name)} ({tier}): {string.Join(" ", props)}");
     }
-    // Auto-create hold on monthlies for protection — only if not already held (avoids ~60
-    // redundant `zfs hold` calls per dataset per prune; we already know the hold state).
-    if (tier == "monthly" && !monthlyHeld)
+    // Hold invariant: held ⇔ tier is monthly. Create the hold on a monthly keeper that lacks
+    // it; drop it from a weekly keeper that still carries one (a former month-newest now
+    // superseded — without this, every Sunday would accumulate a stray monthly hold).
+    if (tier == "monthly")
     {
-        var (c, _, e) = Exec("zfs", "hold", tagMonthly, s.Name);
-        if (c == 0)
-            Log($"    hold: {Short(s.Name)} (monthly keeper protected)");
-        else if (e.Contains("already") || e.Contains("exists"))
-            { /* idempotent: hold already present (race) */ }
+        if (!monthlyHeld)
+        {
+            var (c, _, e) = Exec("zfs", "hold", tagMonthly, s.Name);
+            if (c == 0)
+                Log($"    hold: {Short(s.Name)} (monthly keeper, prune ~{keepUntil:yyyy-MM-dd})");
+            else if (e.Contains("already") || e.Contains("exists"))
+                { /* idempotent: hold already present (race) */ }
+            else
+                { Log($"    ERROR: hold failed {Short(s.Name)}: {e.Trim()}"); success = false; }
+        }
+    }
+    else if (monthlyHeld)   // weekly keeper still holding a monthly tag → drop it
+    {
+        var (rc, _, re) = Exec("zfs", "release", tagMonthly, s.Name);
+        if (rc != 0 && !re.Contains("no such hold") && !re.Contains("not found"))
+            { Log($"    ERROR: release {tagMonthly} failed {Short(s.Name)}: {re.Trim()}"); success = false; }
         else
-            { Log($"    ERROR: hold failed {Short(s.Name)}: {e.Trim()}"); success = false; }
+            Log($"    release: {Short(s.Name)} (monthly→weekly, no longer held)");
     }
     return success;
 }

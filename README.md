@@ -122,7 +122,7 @@ See [`zfs-hold-tight.example.json`](zfs-hold-tight.example.json). Top-level keys
 | `guardMaxDailyAgeHours` | `26` | HOLD if the newest daily is older than this. |
 | `guardMaxDailyShrinkPct` | `33` | HOLD if the newest daily references this % less data than the recent baseline (mass-**deletion** guard; `0` disables). |
 | `guardMaxDailyChurnPct` | `50` | HOLD if the newest daily rewrites more than this % of the dataset's data in one day (mass-**rewrite / encryption** guard; `0` disables). |
-| `propertyNamespace` | `zht` | Prefix for the tool's ZFS user-properties + hold tags (`<ns>:keep_until`, `<ns>:tier`, `<ns>:monthly`, `<ns>:adhoc`). |
+| `propertyNamespace` | `zht` | Prefix for the tool's ZFS user-properties + hold tags (`<ns>:keep_until`, `<ns>:tier`, `<ns>:monthly`, `<ns>:adhoc`, `<ns>:worry`). |
 | `zfsPath` | auto (`/usr/sbin/zfs`…) | Absolute path to the `zfs` binary. Resolved from standard locations; set explicitly to avoid trusting the (root cron's) `PATH`. |
 | `curlPath` | auto (`/usr/bin/curl`…) | Absolute path to `curl` (healthchecks only). |
 | `retentionPolicies` | — | Named `{dailyKeepDays, weeklyKeepDays, monthlyKeepDays}` profiles. |
@@ -165,6 +165,12 @@ Per-snapshot, it never deletes the replication base (newest daily), a week/month
 **while within its retention window**, an uncovered daily, or any held snapshot. A keeper
 *past* its retention ages out (so your recovery window is bounded by `weeklyKeepDays` /
 `monthlyKeepDays`, not infinite).
+
+> **On a worry, protection only ever increases.** When a guard HOLDs a dataset, the tool
+> still proactively `zfs hold`s the monthly keepers (*including* the suspect newest — a
+> false alarm costs nothing, but skipping the hold could lose the chance to protect it)
+> and records a `<ns>:worry=<date> <reason>` breadcrumb on the tip. It never releases a
+> hold or deletes anything on a worried run.
 
 > **`--force` removes the per-run delete throttle entirely** — use it deliberately for a
 > reviewed bulk cleanup (e.g. a first run against a large backlog), then return to plain

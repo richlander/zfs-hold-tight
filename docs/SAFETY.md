@@ -55,6 +55,13 @@ content guards while a churny scratch policy relaxes them).
 A broken source feed shows up as stale/gappy dailies, so guards 1–2 enforce replication
 health by proxy.
 
+**HOLD is not passive — protection only ever increases on a worry.** When any guard above
+HOLDs a dataset, the tool still proactively `zfs hold`s its monthly keepers (including the
+suspect newest, since a false alarm costs nothing but skipping the hold could lose the
+chance to protect it) and writes a `<ns>:worry=<date> <reason>` breadcrumb on the tip. It
+**never releases a hold or deletes anything** on a worried run — a release/delete only ever
+happens on a fully-healthy, under-cap run.
+
 > **Detection vs. recovery.** Guards 4–5 are best-effort *early warning* — they alert and
 > stop pruning the granular recent dailies, but a patient low-and-slow attack (a few % a
 > day) evades both. The actual protection for deletion *and* encryption is **retention**:

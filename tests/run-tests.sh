@@ -268,6 +268,34 @@ OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
 [ "$(grep -c '^hold zht:monthly' "$WORK/fz/ops.log")" = 0 ] \
   && ok "T27 already-held monthlies not re-held" || bad "T27 $(grep -c '^hold zht:monthly' "$WORK/fz/ops.log") redundant holds"
 
+# ---- T29: protect-on-worry — a guard worry (shrink) still HOLDs + 0 destroys, but
+#          proactively holds the monthly keeper (the suspect) and tags the worry ----
+nlines="$(gen_window $((NOW-7200)) | wc -l)"
+gen_window $((NOW-7200)) | awk -F'\t' -v n="$nlines" \
+  'BEGIN{OFS="\t"} {print $1,$2,$3,(NR==n?104857600:1073741824)}' > "$WORK/worry"
+rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"; cp "$WORK/worry" "$WORK/fz/snaps"; : > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
+OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
+       ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --prune --force 2>/dev/null)"
+{ echo "$OUT" | grep -qi "HELD" && [ "$(grep -c '^destroy' "$WORK/fz/ops.log")" = 0 ] \
+  && grep -q '^hold zht:monthly' "$WORK/fz/ops.log" && grep -q '^set zht:worry' "$WORK/fz/ops.log"; } \
+  && ok "T29 protect-on-worry: HOLD + 0 destroys, but holds keeper + tags worry" \
+  || bad "T29 (ops: $(grep -cE '^(hold|set zht:worry|destroy)' "$WORK/fz/ops.log") matches)"
+
+# ---- T30: a weekly keeper that still carries a monthly hold gets it released (vestigial fix) ----
+rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"; cp "$WORK/healthy" "$WORK/fz/snaps"
+wkonly="$(snapname 2026-06-21)"   # Sunday (W25 keeper) but NOT June's newest -> weekly, not monthly
+printf '%s\tzht:monthly\t-\n' "$wkonly" > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
+OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
+       ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --prune --force 2>/dev/null)"
+{ grep -qx "release zht:monthly $wkonly" "$WORK/fz/ops.log" && ! grep -qx "destroy $wkonly" "$WORK/fz/ops.log"; } \
+  && ok "T30 weekly keeper's stray monthly hold released (held ⇔ monthly)" \
+  || bad "T30 (ops: $(grep "$wkonly" "$WORK/fz/ops.log" | tr '\n' ';'))"
+
+# ---- T31: per-dataset line carries the next expected prune date ----
+run_tool "$WORK/healthy" --prune --force
+echo "$OUT" | grep -qE 'next prune [0-9]{4}-[0-9]{2}-[0-9]{2}' \
+  && ok "T31 summary line shows next prune date" || bad "T31 (out: $(echo "$OUT"|grep next || echo none))"
+
 # ---- T13: demoted monthly keeper -> hold released + tags inherited, not destroyed ----
 rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"
 recent=$(date -u -d "$ADATE -5 days" +%Y-%m-%d); demoted="$(snapname "$recent")"
