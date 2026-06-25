@@ -180,6 +180,25 @@ Per-snapshot, it never deletes the replication base (newest daily), a week/month
 > clears tags off any previously-tagged dailies — but still one `zfs list`/`holds` per
 > dataset, not per snapshot.
 
+## Reading the logs
+
+Every run appends to `${logDir}/zfs-hold-tight-YYYY-MM-DD.log` (and stdout), with a header
+that records the exact build: `=== zfs-hold-tight 1.0.0+<sha> <ts>Z  mode=PRUNE ===`. Each
+action is a **distinct, greppable token** (the snapshot's full name follows it):
+
+| token | meaning | grep |
+|---|---|---|
+| `HOLD` | a `zfs hold` was placed (monthly keeper protected) | `grep -w HOLD` |
+| `RELEASE` | a hold was released (unhold) | `grep RELEASE` |
+| `DESTROY` | a snapshot was **pruned** (irreversible) | `grep DESTROY` |
+| `META` | a `<ns>:tier` / `<ns>:keep_until` / `<ns>:worry` property was set or cleared | `grep META` |
+| `WORRY` | a guard tripped (stale/gap/clock/shrink/churn) — dataset held, keepers protected, nothing deleted | `grep WORRY` |
+| `HELD` | a dataset frozen for an operational reason (delete-cap hit, `zfs` error) | `grep HELD` |
+
+So "did anything get deleted this week?" → `grep DESTROY logs/*.log`; "any suspicion?" →
+`grep WORRY logs/*.log`; "which build ran?" → `grep '^===' logs/*.log`. (`HOLD` is a
+substring of nothing here, but use `grep -w HOLD` to be safe vs. the lowercase prose.)
+
 ## Building
 
 A native-AOT build produces a single self-contained binary with instant startup and no

@@ -276,9 +276,9 @@ gen_window $((NOW-7200)) | awk -F'\t' -v n="$nlines" \
 rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"; cp "$WORK/worry" "$WORK/fz/snaps"; : > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
 OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
        ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --prune --force 2>/dev/null)"
-{ echo "$OUT" | grep -qi "HELD" && [ "$(grep -c '^destroy' "$WORK/fz/ops.log")" = 0 ] \
+{ echo "$OUT" | grep -q 'WORRY' && [ "$(grep -c '^destroy' "$WORK/fz/ops.log")" = 0 ] \
   && grep -q '^hold zht:monthly' "$WORK/fz/ops.log" && grep -q '^set zht:worry' "$WORK/fz/ops.log"; } \
-  && ok "T29 protect-on-worry: HOLD + 0 destroys, but holds keeper + tags worry" \
+  && ok "T29 protect-on-worry: WORRY + 0 destroys, but holds keeper + tags worry" \
   || bad "T29 (ops: $(grep -cE '^(hold|set zht:worry|destroy)' "$WORK/fz/ops.log") matches)"
 
 # ---- T30: a weekly keeper that still carries a monthly hold gets it released (vestigial fix) ----
@@ -287,7 +287,8 @@ wkonly="$(snapname 2026-06-21)"   # Sunday (W25 keeper) but NOT June's newest ->
 printf '%s\tzht:monthly\t-\n' "$wkonly" > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
 OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
        ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --prune --force 2>/dev/null)"
-{ grep -qx "release zht:monthly $wkonly" "$WORK/fz/ops.log" && ! grep -qx "destroy $wkonly" "$WORK/fz/ops.log"; } \
+{ grep -qx "release zht:monthly $wkonly" "$WORK/fz/ops.log" && ! grep -qx "destroy $wkonly" "$WORK/fz/ops.log" \
+  && echo "$OUT" | grep -q "^  RELEASE $wkonly"; } \
   && ok "T30 weekly keeper's stray monthly hold released (held ⇔ monthly)" \
   || bad "T30 (ops: $(grep "$wkonly" "$WORK/fz/ops.log" | tr '\n' ';'))"
 
@@ -300,6 +301,12 @@ echo "$OUT" | grep -qE 'next prune [0-9]{4}-[0-9]{2}-[0-9]{2}' \
 run_tool "$WORK/healthy" --version
 { [ "$RC" = 0 ] && echo "$OUT" | grep -qiE 'zfs-hold-tight [0-9]+\.'; } \
   && ok "T32 --version prints version, exit 0" || bad "T32 (rc=$RC, out: $OUT)"
+
+# ---- T33: log carries distinct, greppable signal tokens ----
+run_tool "$WORK/healthy" --prune --force
+H=$(echo "$OUT" | grep -c '^  HOLD '); M=$(echo "$OUT" | grep -c '^  META '); D=$(echo "$OUT" | grep -c '^  DESTROY ')
+{ [ "$H" -gt 0 ] && [ "$M" -gt 0 ] && [ "$D" -gt 0 ]; } \
+  && ok "T33 distinct log tokens HOLD/META/DESTROY ($H/$M/$D)" || bad "T33 H=$H M=$M D=$D"
 
 # ---- T13: demoted monthly keeper -> hold released + tags inherited, not destroyed ----
 rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"
