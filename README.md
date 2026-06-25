@@ -189,6 +189,10 @@ runtime dependency. It needs the **.NET 10+ SDK** plus **clang** and zlib header
 dotnet publish zfs-hold-tight.cs -r linux-x64 -c Release -o bin/    # -> bin/zfs-hold-tight
 ```
 
+`--version` reports `1.0.0+<git-sha>` — the SDK reads the committed `HEAD` from `.git`
+and embeds it (no extra flags). **Commit before building** a binary you intend to deploy,
+or the embedded SHA points at the parent commit, not the code you built.
+
 **Deploying to an older target (e.g. TrueNAS): build in a glibc-matched container.** AOT
 emits a normal dynamically-linked binary that links the *build host's* glibc, and glibc
 is forward- but not backward-compatible — a binary built on glibc 2.39 won't start on an

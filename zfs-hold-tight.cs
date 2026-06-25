@@ -1,6 +1,7 @@
 #:property PublishAot=true
 #:property InvariantGlobalization=true
 #:property StripSymbols=true
+#:property Version=1.0.0
 
 // zfs-hold-tight - defender-side GFS retention for TrueNAS archive/* datasets.
 //
@@ -45,10 +46,13 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using System.Reflection;
 
-// Tool version — stamped into every run's header line so logs record which build ran.
-// Bump on each notable change.
-const string Version = "1.0.0";
+// Tool version: the base Version (#:property) plus the git short SHA the SDK appends to
+// InformationalVersion when built with -p:SourceRevisionId=<sha> (see the build recipe).
+// Stamped into every run header so the logs record exactly which build ran. (Pattern
+// borrowed from the dotnet-inspect peer repo — works under NativeAOT.)
+string Version = GetVersion();
 if (args.Contains("--version")) { Console.WriteLine($"zfs-hold-tight {Version}"); return 0; }
 
 // Load config from JSON
@@ -940,6 +944,17 @@ static DateTime Later(DateTime a, DateTime b) => a > b ? a : b;
 static bool SameIsoWeek(DateTime a, DateTime b) =>
     ISOWeek.GetYear(a) == ISOWeek.GetYear(b) && ISOWeek.GetWeekOfYear(a) == ISOWeek.GetWeekOfYear(b);
 static string Short(string snap) => snap[(snap.IndexOf('@') + 1)..];
+
+// InformationalVersion is "<Version>+<full-sha>" when built with -p:SourceRevisionId;
+// shorten the SHA to 7 chars (e.g. "1.0.0+ee4f11a"). Falls back to the assembly version.
+static string GetVersion()
+{
+    var asm = typeof(Snap).Assembly;
+    var info = asm.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
+    if (string.IsNullOrEmpty(info)) return asm.GetName().Version?.ToString() ?? "0.0.0";
+    int plus = info.IndexOf('+');
+    return (plus > 0 && info.Length > plus + 8) ? info[..(plus + 8)] : info;
+}
 
 record Retention(int DailyKeepDays, int WeeklyKeepDays, int MonthlyKeepDays);
 record Guards(int MaxDeletePerRun, int RecentWindowDays, int MaxDailyAgeHours, int MaxDailyShrinkPct, int MaxDailyChurnPct);
