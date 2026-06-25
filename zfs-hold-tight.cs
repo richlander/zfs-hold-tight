@@ -39,11 +39,17 @@
 //        zfs-hold-tight --hold-adhoc <snapshot> [--no-hc]
 //        zfs-hold-tight --hold-latest-tier <tier> [--dataset archive/<name>] [--no-hc]
 //        zfs-hold-tight --hold-latest [--dataset archive/<name>] [--no-hc]
+//        zfs-hold-tight --version
 
 using System.Diagnostics;
 using System.Globalization;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+
+// Tool version — stamped into every run's header line so logs record which build ran.
+// Bump on each notable change.
+const string Version = "1.0.0";
+if (args.Contains("--version")) { Console.WriteLine($"zfs-hold-tight {Version}"); return 0; }
 
 // Load config from JSON
 string configPath = Environment.GetEnvironmentVariable("ZFS_HOLD_TIGHT_CONFIG")
@@ -317,7 +323,7 @@ bool force = args.Contains("--force");
 bool verbose = args.Contains("-v") || args.Contains("--verbose");
 string? only = datasetFilter;   // already validated against config above
 
-Log($"=== zfs-hold-tight {now:yyyy-MM-dd HH:mm:ss}Z  mode={(prune ? "PRUNE" : "dry-run")}{(force ? " --force" : "")} ===");
+Log($"=== zfs-hold-tight {Version} {now:yyyy-MM-dd HH:mm:ss}Z  mode={(prune ? "PRUNE" : "dry-run")}{(force ? " --force" : "")} ===");
 if (prune && !noHc) HcPing(hcUrl + "/start", null);
 
 int totalKeep = 0, totalDoom = 0, destroyAttempted = 0, destroySucceeded = 0, destroyFails = 0;
@@ -492,7 +498,7 @@ int HoldAdhoc(string snap, bool noHc)
     var lines = new List<string>();
     void Log(string m) { Console.WriteLine(m); lines.Add(m); }
     var now = DateTime.UtcNow;
-    Log($"=== zfs-hold-tight {now:yyyy-MM-dd HH:mm:ss}Z  mode=hold-adhoc ===");
+    Log($"=== zfs-hold-tight {Version} {now:yyyy-MM-dd HH:mm:ss}Z  mode=hold-adhoc ===");
 
     if (!snap.StartsWith(DatasetPrefix) || !snap.Contains('@'))
     { Log($"FAIL: snapshot '{snap}' must be under '{DatasetPrefix}' and name a snapshot (contain '@')"); FlushLog(lines); return 2; }
@@ -520,7 +526,7 @@ int CheckHolds(bool noHc)
     var lines = new List<string>();
     void Log(string m) { Console.WriteLine(m); lines.Add(m); }
     var now = DateTime.UtcNow;
-    Log($"=== zfs-hold-tight {now:yyyy-MM-dd HH:mm:ss}Z  mode=check-holds ===");
+    Log($"=== zfs-hold-tight {Version} {now:yyyy-MM-dd HH:mm:ss}Z  mode=check-holds ===");
 
     // A held snapshot is "stale" once it is older than ITS dataset's longest retention
     // (max of weekly/monthly keep-days) — checked per dataset, since retention varies by
@@ -568,7 +574,7 @@ int Doctor(string? datasetFilter)
 {
     var lines = new List<string>();
     void Log(string m) { Console.WriteLine(m); lines.Add(m); }
-    Log($"=== zfs-hold-tight {now:yyyy-MM-dd HH:mm:ss}Z  mode=doctor ===");
+    Log($"=== zfs-hold-tight {Version} {now:yyyy-MM-dd HH:mm:ss}Z  mode=doctor ===");
 
     int missing = 0, protected_ = 0, adhoc_ = 0, orphaned = 0, errors = 0;
     foreach (var (ds, _) in retention)
@@ -637,7 +643,7 @@ int Fix(string? datasetFilter)
 {
     var lines = new List<string>();
     void Log(string m) { Console.WriteLine(m); lines.Add(m); }
-    Log($"=== zfs-hold-tight {now:yyyy-MM-dd HH:mm:ss}Z  mode=fix ===");
+    Log($"=== zfs-hold-tight {Version} {now:yyyy-MM-dd HH:mm:ss}Z  mode=fix ===");
 
     int fixed_ = 0, errors = 0;
     foreach (var (ds, _) in retention)
@@ -683,7 +689,7 @@ int HoldLatestTier(string tier, string? datasetFilter, bool noHc)
 {
     var lines = new List<string>();
     void Log(string m) { Console.WriteLine(m); lines.Add(m); }
-    Log($"=== zfs-hold-tight {now:yyyy-MM-dd HH:mm:ss}Z  mode=hold-latest-tier tier={tier} ===");
+    Log($"=== zfs-hold-tight {Version} {now:yyyy-MM-dd HH:mm:ss}Z  mode=hold-latest-tier tier={tier} ===");
 
     int errors = 0;
     foreach (var (ds, _) in retention)

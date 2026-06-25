@@ -296,6 +296,11 @@ run_tool "$WORK/healthy" --prune --force
 echo "$OUT" | grep -qE 'next prune [0-9]{4}-[0-9]{2}-[0-9]{2}' \
   && ok "T31 summary line shows next prune date" || bad "T31 (out: $(echo "$OUT"|grep next || echo none))"
 
+# ---- T32: --version prints a version and exits 0 (works without config) ----
+run_tool "$WORK/healthy" --version
+{ [ "$RC" = 0 ] && echo "$OUT" | grep -qiE 'zfs-hold-tight [0-9]+\.'; } \
+  && ok "T32 --version prints version, exit 0" || bad "T32 (rc=$RC, out: $OUT)"
+
 # ---- T13: demoted monthly keeper -> hold released + tags inherited, not destroyed ----
 rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"
 recent=$(date -u -d "$ADATE -5 days" +%Y-%m-%d); demoted="$(snapname "$recent")"

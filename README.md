@@ -105,6 +105,7 @@ run as a user able to `zfs destroy`/`hold` the target datasets (usually root).
 | `--hold-latest` | Shorthand for `--hold-latest-tier daily`. |
 | `--dataset <name>` | Limit `--doctor`/`--fix`/`--prune` to one dataset. |
 | `--no-hc` | Skip healthchecks pings for this run. |
+| `--version` | Print the tool version and exit. |
 
 Exit codes: `0` ok · `1` trouble (a dataset HELD or a destroy failed) · `2` bad
 config/arguments · `3` another run holds the lock.
