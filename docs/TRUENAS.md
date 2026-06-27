@@ -90,7 +90,7 @@ cd /mnt/archive/tools
 ```
 
 On the **first** real prune the backlog of old dailies will exceed `guardMaxDeletePerRun`
-(default 5) and the tool will HOLD with `would delete N > cap` — that is the
+(default 5) and the tool will `WORRY` + `SKIP` with `would delete N > cap` — that is the
 circuit-breaker, not an error. Review the dry-run output, then do the one-time backlog
 cleanup with `--prune --force`. After that, steady state is 0–1 deletions/day and `--prune`
 alone is enough.
@@ -106,7 +106,7 @@ Add a cron job (UI: **System Settings → Advanced → Cron Jobs**), command run
 Schedule it *after* the day's snapshots have replicated. If the backup machine is only
 powered on for a wake window (e.g. 04:45–07:00 local), the cron must fire inside that
 window. With `healthchecksUrl` set, the tool pings healthchecks.io on success and
-`/fail` (with diagnostics) on any HOLD or destroy failure, so a stalled feed or a missed
+`/fail` (with diagnostics) on any `SKIP` or destroy failure, so a stalled feed or a missed
 run is visible rather than silent.
 
 ## Migrating from an older build / a differently-named binary

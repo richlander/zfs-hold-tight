@@ -21,7 +21,7 @@ keep_until has passed. It never *creates* snapshots: creating one ahead of the
 replication base is what a `zfs receive` pre-retention step would destroy; pruning old
 snapshots never conflicts.
 
-## Run-level guards — any failure ⇒ HOLD that dataset (delete nothing), and alert
+## Run-level guards — any guard ⇒ `WORRY` + `SKIP` that dataset (delete nothing), and alert
 
 Evaluated **independently per dataset**, anchored on the newest daily, not wall-clock and
 not aggregated across datasets — so an attack confined to one small dataset is judged on
@@ -55,8 +55,8 @@ content guards while a churny scratch policy relaxes them).
 A broken source feed shows up as stale/gappy dailies, so guards 1–2 enforce replication
 health by proxy.
 
-**HOLD is not passive — protection only ever increases on a worry.** When any guard above
-HOLDs a dataset, the tool still proactively `zfs hold`s its monthly keepers (including the
+**A `SKIP` is not passive — protection only ever increases on a worry.** When any guard above
+withholds (`SKIP`s) a dataset, the tool still proactively `zfs hold`s its monthly keepers (including the
 suspect newest, since a false alarm costs nothing but skipping the hold could lose the
 chance to protect it) and writes a `<ns>:worry=<date> <reason>` breadcrumb on the tip. It
 **never releases a hold or deletes anything** on a worried run — a release/delete only ever
@@ -79,7 +79,7 @@ happens on a fully-healthy, under-cap run.
 13. **Held** — any `zfs hold` (e.g. a defensive `<ns>:adhoc`) makes the snapshot
     off-limits; it is skipped, never forced. The tool's own `<ns>:monthly` hold is
     released immediately before it destroys an expired monthly keeper. (And if `zfs holds`
-    itself fails, the dataset is HELD rather than pruned while blind to holds.)
+    itself fails, the dataset is `SKIP`ped (`ERROR`) rather than pruned while blind to holds.)
 14. **Not a recognized `autosnap_<ts>_daily`** — legacy `_weekly`/`_monthly`, manual, and
     unparseable names are out of scope (and an unparseable date skips that one snapshot,
     never aborts the run).

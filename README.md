@@ -107,7 +107,7 @@ run as a user able to `zfs destroy`/`hold` the target datasets (usually root).
 | `--no-hc` | Skip healthchecks pings for this run. |
 | `--version` | Print the tool version and exit. |
 
-Exit codes: `0` ok · `1` trouble (a dataset HELD or a destroy failed) · `2` bad
+Exit codes: `0` ok · `1` trouble (a dataset `SKIP`ped or a destroy failed) · `2` bad
 config/arguments · `3` another run holds the lock.
 
 ## Configuration
@@ -120,9 +120,9 @@ See [`zfs-hold-tight.example.json`](zfs-hold-tight.example.json). Top-level keys
 | `healthchecksUrl` | *(unset → pings disabled)* | healthchecks.io base ping URL. |
 | `guardMaxDeletePerRun` | `5` | Per-run delete cap (circuit-breaker; `--force` overrides). |
 | `guardRecentWindowDays` | `7` | Require an unbroken daily window this many days back. |
-| `guardMaxDailyAgeHours` | `26` | HOLD if the newest daily is older than this. |
-| `guardMaxDailyShrinkPct` | `33` | HOLD if the newest daily references this % less data than the recent baseline (mass-**deletion** guard; `0` disables). |
-| `guardMaxDailyChurnPct` | `50` | HOLD if the newest daily rewrites more than this % of the dataset's data in one day (mass-**rewrite / encryption** guard; `0` disables). |
+| `guardMaxDailyAgeHours` | `26` | `WORRY`+skip if the newest daily is older than this. |
+| `guardMaxDailyShrinkPct` | `33` | `WORRY`+skip if the newest daily references this % less data than the recent baseline (mass-**deletion** guard; `0` disables). |
+| `guardMaxDailyChurnPct` | `50` | `WORRY`+skip if the newest daily rewrites more than this % of the dataset's data in one day (mass-**rewrite / encryption** guard; `0` disables). |
 | `propertyNamespace` | `zht` | Prefix for the tool's ZFS user-properties + hold tags (`<ns>:keep_until`, `<ns>:tier`, `<ns>:monthly`, `<ns>:adhoc`, `<ns>:worry`). |
 | `zfsPath` | auto (`/usr/sbin/zfs`…) | Absolute path to the `zfs` binary. Resolved from standard locations; set explicitly to avoid trusting the (root cron's) `PATH`. |
 | `curlPath` | auto (`/usr/bin/curl`…) | Absolute path to `curl` (healthchecks only). |
@@ -186,18 +186,35 @@ Every run appends to `${logDir}/zfs-hold-tight-YYYY-MM-DD.log` (and stdout), wit
 that records the exact build: `=== zfs-hold-tight 1.0.0+<sha> <ts>Z  mode=PRUNE ===`. Each
 action is a **distinct, greppable token** (the snapshot's full name follows it):
 
+Tokens follow a `RESOURCE:ACTION` grammar so each line names what changed and how. The
+snapshot's full name follows the token.
+
+**Mutation tokens** — routine, countable, the steady-state bookkeeping:
+
 | token | meaning | grep |
 |---|---|---|
-| `HOLD` | a `zfs hold` was placed (monthly keeper protected) | `grep -w HOLD` |
-| `RELEASE` | a hold was released (unhold) | `grep RELEASE` |
-| `DESTROY` | a snapshot was **pruned** (irreversible) | `grep DESTROY` |
-| `META` | a `<ns>:tier` / `<ns>:keep_until` / `<ns>:worry` property was set or cleared | `grep META` |
-| `WORRY` | a guard tripped (stale/gap/clock/shrink/churn) — dataset held, keepers protected, nothing deleted | `grep WORRY` |
-| `HELD` | a dataset frozen for an operational reason (delete-cap hit, `zfs` error) | `grep HELD` |
+| `HOLD:ADD` | a `zfs hold` was placed (monthly keeper protected) | `grep HOLD:ADD` |
+| `HOLD:REMOVE` | a hold was released (demotion / weekly-downgrade / before destroy) | `grep HOLD:REMOVE` |
+| `META:ADD` | tier/keep_until tags written on a newly-tagged keeper | `grep META:ADD` |
+| `META:UPDATE` | an existing keeper's tag changed (e.g. weekly→monthly promotion) | `grep META:UPDATE` |
+| `META:REMOVE` | tags inherited away on demotion | `grep META:REMOVE` |
+| `SNAP:DESTROY` | a snapshot was **pruned** (irreversible) | `grep SNAP:DESTROY` |
 
-So "did anything get deleted this week?" → `grep DESTROY logs/*.log`; "any suspicion?" →
-`grep WORRY logs/*.log`; "which build ran?" → `grep '^===' logs/*.log`. (`HOLD` is a
-substring of nothing here, but use `grep -w HOLD` to be safe vs. the lowercase prose.)
+**Exception tokens** — bare, single-word; a dataset `SKIP` verdict is always preceded by its
+reason (`WORRY` or `ERROR`), and a failed individual op carries a `FAILED` suffix:
+
+| token | meaning | grep |
+|---|---|---|
+| `WORRY` | a guard tripped (stale/gap/clock/shrink/churn/over-cap) — keepers protected, nothing deleted | `grep WORRY` |
+| `ERROR` | a `zfs` verification call (list/holds) failed — cannot proceed safely | `grep ERROR` |
+| `FAILED` | an individual op (hold/set/inherit/destroy) returned nonzero | `grep FAILED` |
+| `SKIP` | the dataset was withheld this run (verdict; see the `WORRY`/`ERROR` above it) | `grep SKIP` |
+
+So "did anything get deleted this week?" → `grep SNAP:DESTROY logs/*.log`; "did anything go
+wrong?" → `grep -E 'WORRY|ERROR|FAILED|SKIP' logs/*.log` (**empty = all clear**); "which build
+ran?" → `grep '^===' logs/*.log`. Invariants worth knowing: `HOLD:ADD == META:ADD/UPDATE` on
+monthlies, `HOLD:REMOVE == META:REMOVE` on demotions, and `SNAP:DESTROY` count matches the
+`PRUNED: kept N, destroyed X/Y` summary.
 
 ## Building
 

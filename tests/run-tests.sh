@@ -58,7 +58,7 @@ gen_feed 2025-06-01 > "$WORK/healthy"
 # ---- T1: healthy feed, dry-run, big backlog -> circuit-breaker HOLD, 0 destroys ----
 run_tool "$WORK/healthy"
 { echo "$OUT" | grep -q "cap" && [ "$(grep -c '^destroy' "$OPS")" = 0 ]; } \
-  && ok "T1 healthy dry-run HELD on circuit-breaker, no destroys" || bad "T1 (out: $(echo "$OUT"|tail -1))"
+  && ok "T1 healthy dry-run SKIP on circuit-breaker, no destroys" || bad "T1 (out: $(echo "$OUT"|tail -1))"
 
 # ---- T2: prune --force -> keeper invariant: no in-retention week/month keeper destroyed
 #          (the fixture spans ~1y, all keepers within the 5y window; T19 covers expiry) ----
@@ -84,24 +84,24 @@ rels=$(grep -c '^release' "$OPS"); rels=${rels:-0}
 # ---- T3a: newest 30h old (>26h) -> HOLD on freshness ----
 gen_window $((NOW-108000)) > "$WORK/stale"
 run_tool "$WORK/stale" --force
-{ echo "$OUT" | grep -qi "stale"; } && ok "T3a stale newest (30h) -> HOLD" || bad "T3a (out: $(echo "$OUT"|tail -1))"
+{ echo "$OUT" | grep -qi "stale"; } && ok "T3a stale newest (30h) -> WORRY+SKIP" || bad "T3a (out: $(echo "$OUT"|tail -1))"
 
 # ---- T3b: newest 10h old (<26h), complete window -> NOT held for freshness ----
 gen_window $((NOW-36000)) > "$WORK/fresh"
 run_tool "$WORK/fresh" --force
-{ ! echo "$OUT" | grep -qi "HELD"; } && ok "T3b fresh newest (10h) proceeds, no HOLD" || bad "T3b held a fresh feed (out: $(echo "$OUT"|tail -1))"
+{ ! echo "$OUT" | grep -qi "SKIP"; } && ok "T3b fresh newest (10h) proceeds, no SKIP" || bad "T3b held a fresh feed (out: $(echo "$OUT"|tail -1))"
 
 # ---- T4: gap in last 7d -> HOLD ----
 gap=$(date -u -d "$ADATE -3 days" +%Y-%m-%d)
 grep -v "$gap" "$WORK/healthy" > "$WORK/gap"
 run_tool "$WORK/gap" --force
-{ echo "$OUT" | grep -qi "gap"; } && ok "T4 gap in window -> HOLD" || bad "T4 (out: $(echo "$OUT"|tail -1))"
+{ echo "$OUT" | grep -qi "gap"; } && ok "T4 gap in window -> WORRY+SKIP" || bad "T4 (out: $(echo "$OUT"|tail -1))"
 
 # ---- T5: future-dated snapshot -> HOLD ----
 cp "$WORK/healthy" "$WORK/future"
 printf '%s\t-\t-\n' "$(snapname "$(date -u -d "$ADATE +2 days" +%Y-%m-%d)")" >> "$WORK/future"
 run_tool "$WORK/future" --force
-{ echo "$OUT" | grep -qi "future"; } && ok "T5 future clock -> HOLD" || bad "T5 (out: $(echo "$OUT"|tail -1))"
+{ echo "$OUT" | grep -qi "future"; } && ok "T5 future clock -> WORRY+SKIP" || bad "T5 (out: $(echo "$OUT"|tail -1))"
 
 # ---- T6: malformed date must NOT crash (no SIGABRT=134) ----
 cp "$WORK/healthy" "$WORK/bad"
@@ -113,8 +113,8 @@ run_tool "$WORK/bad" --force
 rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"; cp "$WORK/healthy" "$WORK/fz/snaps"; : > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
 OUT="$(FAKE_ZFS_DIR="$WORK/fz" FAKE_ZFS_FAIL=set ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
        ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --prune --force 2>/dev/null)"
-{ echo "$OUT" | grep -qi "HELD" && [ "$(grep -c '^destroy' "$WORK/fz/ops.log")" = 0 ]; } \
-  && ok "T7 metadata failure -> HOLD, 0 destroys" || bad "T7 (out: $(echo "$OUT"|tail -1))"
+{ echo "$OUT" | grep -qi "SKIP" && [ "$(grep -c '^destroy' "$WORK/fz/ops.log")" = 0 ]; } \
+  && ok "T7 metadata failure -> SKIP, 0 destroys" || bad "T7 (out: $(echo "$OUT"|tail -1))"
 
 # ---- T8: invalid tier rejected ----
 run_tool "$WORK/healthy" --hold-latest-tier garbage
@@ -154,12 +154,12 @@ nlines="$(gen_window $((NOW-7200)) | wc -l)"
 gen_window $((NOW-7200)) | awk -F'\t' -v n="$nlines" \
   'BEGIN{OFS="\t"} {print $1,$2,$3,(NR==n?104857600:1073741824)}' > "$WORK/shrink"
 run_tool "$WORK/shrink" --force
-{ echo "$OUT" | grep -qi "shrank\|shrink\|deletion"; } && ok "T14 data shrinkage -> HOLD" || bad "T14 (out: $(echo "$OUT"|tail -1))"
+{ echo "$OUT" | grep -qi "shrank\|shrink\|deletion"; } && ok "T14 data shrinkage -> WORRY+SKIP" || bad "T14 (out: $(echo "$OUT"|tail -1))"
 
 # ---- T15: stable referenced (no shrink) -> shrink guard does NOT false-positive ----
 gen_window $((NOW-7200)) | awk -F'\t' 'BEGIN{OFS="\t"} {print $1,$2,$3,1073741824}' > "$WORK/stable"
 run_tool "$WORK/stable" --force
-{ ! echo "$OUT" | grep -qi "shrank\|shrink"; } && ok "T15 stable referenced: no false shrink-HOLD" || bad "T15 false positive (out: $(echo "$OUT"|tail -1))"
+{ ! echo "$OUT" | grep -qi "shrank\|shrink"; } && ok "T15 stable referenced: no false shrink-SKIP" || bad "T15 false positive (out: $(echo "$OUT"|tail -1))"
 
 # ---- T16: churn spike (newest daily rewrites most of the dataset) -> HOLD ----
 # 5-col fixture (..., referenced, written); referenced stable 1GiB, newest written 900MiB (~88% churn)
@@ -167,15 +167,15 @@ nlines="$(gen_window $((NOW-7200)) | wc -l)"
 gen_window $((NOW-7200)) | awk -F'\t' -v n="$nlines" \
   'BEGIN{OFS="\t"} {print $1,$2,$3,1073741824,(NR==n?943718400:10485760)}' > "$WORK/churn"
 run_tool "$WORK/churn" --force
-{ echo "$OUT" | grep -qi "churn\|rewrite\|encryption"; } && ok "T16 churn spike -> HOLD" || bad "T16 (out: $(echo "$OUT"|tail -1))"
+{ echo "$OUT" | grep -qi "churn\|rewrite\|encryption"; } && ok "T16 churn spike -> WORRY+SKIP" || bad "T16 (out: $(echo "$OUT"|tail -1))"
 
 # ---- T17: normal churn -> churn guard does NOT false-positive ----
 gen_window $((NOW-7200)) | awk -F'\t' 'BEGIN{OFS="\t"} {print $1,$2,$3,1073741824,10485760}' > "$WORK/lowchurn"
 run_tool "$WORK/lowchurn" --force
-{ ! echo "$OUT" | grep -qi "churn"; } && ok "T17 normal churn: no false churn-HOLD" || bad "T17 false positive (out: $(echo "$OUT"|tail -1))"
+{ ! echo "$OUT" | grep -qi "churn"; } && ok "T17 normal churn: no false churn-SKIP" || bad "T17 false positive (out: $(echo "$OUT"|tail -1))"
 
 # ---- T18: per-dataset isolation — a small (100MiB) dataset wiped 80% is flagged on its
-#          own, while a healthy large dataset prunes normally (only the small one HELD) ----
+#          own, while a healthy large dataset prunes normally (only the small one SKIPped) ----
 cat > "$WORK/cfg2.json" <<EOF
 { "logDir": "$WORK/logs", "zfsPath": "$WORK/bin/zfs", "retentionPolicies": { "baseline": { "dailyKeepDays": 30, "weeklyKeepDays": 1825, "monthlyKeepDays": 1825 } },
   "datasets": { "archive/home/rich": "baseline", "archive/scratch": "baseline" } }
@@ -189,11 +189,11 @@ gen_window $((NOW-7200)) | sed 's#archive/home/rich#archive/scratch#' \
 rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"; cp "$WORK/d2" "$WORK/fz/snaps"; : > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
 OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/cfg2.json" \
        ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --force 2>/dev/null)"
-{ echo "$OUT" | grep "archive/scratch:" | grep -qi "shrank\|HOLD" \
-  && ! { echo "$OUT" | grep "archive/home/rich:" | grep -qi "HOLD"; } \
-  && echo "$OUT" | grep -qi "1 HELD"; } \
+{ echo "$OUT" | grep "archive/scratch:" | grep -qi "shrank\|SKIP" \
+  && ! { echo "$OUT" | grep "archive/home/rich:" | grep -qi "SKIP"; } \
+  && echo "$OUT" | grep -qi "1 SKIPPED"; } \
   && ok "T18 per-dataset isolation: 100MiB dataset wiped 80% flagged alone" \
-  || bad "T18 (out: $(echo "$OUT" | grep -E 'scratch|home/rich|HELD' | tr '\n' '|'))"
+  || bad "T18 (out: $(echo "$OUT" | grep -E 'scratch|home/rich|SKIP' | tr '\n' '|'))"
 
 # ---- T19: an expired week/month keeper (past retention) ages out, not kept forever ----
 old=$(date -u -d "$ADATE -2200 days" +%Y-%m-%d); oldsnap="$(snapname "$old")"   # ~6y old, sole rep of its week+month
@@ -212,12 +212,12 @@ run_tool "$WORK/healthy" --prune --dataset
 run_tool "$WORK/healthy" --doctor --dataset archive/does-not-exist
 [ "$RC" = 2 ] && ok "T21 unknown --dataset rejected in --doctor (rc=2)" || bad "T21 (rc=$RC)"
 
-# ---- T22: `zfs holds` failure HOLDs the dataset (can't verify guard 12), 0 destroys ----
+# ---- T22: `zfs holds` failure SKIPs the dataset (can't verify guard 12), 0 destroys ----
 rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"; cp "$WORK/healthy" "$WORK/fz/snaps"; : > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
 OUT="$(FAKE_ZFS_DIR="$WORK/fz" FAKE_ZFS_FAIL=holds ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
        ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --prune --force 2>/dev/null)"
 { echo "$OUT" | grep -qi "holds" && [ "$(grep -c '^destroy' "$WORK/fz/ops.log")" = 0 ]; } \
-  && ok "T22 zfs holds failure -> HOLD, 0 destroys" || bad "T22 (out: $(echo "$OUT"|tail -1))"
+  && ok "T22 zfs holds failure -> SKIP, 0 destroys" || bad "T22 (out: $(echo "$OUT"|tail -1))"
 
 # ---- T23: --check-holds flags a hold older than its dataset's retention (per-policy) ----
 rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"; cp "$WORK/healthy" "$WORK/fz/snaps"
@@ -248,8 +248,8 @@ awk -F'\t' -v d="$demoted" 'BEGIN{OFS="\t"} $1==d{$3="monthly"} {print}' "$WORK/
 printf '%s\tzht:monthly\t-\n' "$demoted" > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
 OUT="$(FAKE_ZFS_DIR="$WORK/fz" FAKE_ZFS_FAIL=inherit ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
        ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --prune --force 2>/dev/null)"
-{ ! grep -qx "release zht:monthly $demoted" "$WORK/fz/ops.log" && echo "$OUT" | grep -qi "HELD"; } \
-  && ok "T26 demotion: inherit-fail keeps the hold + HOLDs dataset" || bad "T26 (out: $(echo "$OUT"|tail -1))"
+{ ! grep -qx "release zht:monthly $demoted" "$WORK/fz/ops.log" && echo "$OUT" | grep -qi "SKIP"; } \
+  && ok "T26 demotion: inherit-fail keeps the hold + SKIPs dataset" || bad "T26 (out: $(echo "$OUT"|tail -1))"
 
 # ---- T28: a capped --prune (no --force) HOLDs without mutating anything first (finding 1) ----
 rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"; cp "$WORK/healthy" "$WORK/fz/snaps"; : > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
@@ -257,7 +257,7 @@ OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
        ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --prune 2>/dev/null)"
 muts=$(grep -cE '^(set|hold|inherit|release|destroy)' "$WORK/fz/ops.log"); muts=${muts:-0}
 { echo "$OUT" | grep -qi "cap" && [ "$muts" = 0 ]; } \
-  && ok "T28 capped --prune HOLDs with zero metadata writes" || bad "T28 muts=$muts (out: $(echo "$OUT"|tail -1))"
+  && ok "T28 capped --prune SKIPs with zero metadata writes" || bad "T28 muts=$muts (out: $(echo "$OUT"|tail -1))"
 
 # ---- T27: monthly keepers already held are NOT re-held every prune (finding 3) ----
 rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"; cp "$WORK/healthy" "$WORK/fz/snaps"; : > "$WORK/fz/ops.log"
@@ -288,7 +288,7 @@ printf '%s\tzht:monthly\t-\n' "$wkonly" > "$WORK/fz/holds"; : > "$WORK/fz/ops.lo
 OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
        ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --prune --force 2>/dev/null)"
 { grep -qx "release zht:monthly $wkonly" "$WORK/fz/ops.log" && ! grep -qx "destroy $wkonly" "$WORK/fz/ops.log" \
-  && echo "$OUT" | grep -q "^  RELEASE $wkonly"; } \
+  && echo "$OUT" | grep -q "^  HOLD:REMOVE $wkonly"; } \
   && ok "T30 weekly keeper's stray monthly hold released (held ⇔ monthly)" \
   || bad "T30 (ops: $(grep "$wkonly" "$WORK/fz/ops.log" | tr '\n' ';'))"
 
@@ -304,9 +304,9 @@ run_tool "$WORK/healthy" --version
 
 # ---- T33: log carries distinct, greppable signal tokens ----
 run_tool "$WORK/healthy" --prune --force
-H=$(echo "$OUT" | grep -c '^  HOLD '); M=$(echo "$OUT" | grep -c '^  META '); D=$(echo "$OUT" | grep -c '^  DESTROY ')
+H=$(echo "$OUT" | grep -c '^  HOLD:ADD '); M=$(echo "$OUT" | grep -cE '^  META:(ADD|UPDATE|REMOVE) '); D=$(echo "$OUT" | grep -c '^  SNAP:DESTROY ')
 { [ "$H" -gt 0 ] && [ "$M" -gt 0 ] && [ "$D" -gt 0 ]; } \
-  && ok "T33 distinct log tokens HOLD/META/DESTROY ($H/$M/$D)" || bad "T33 H=$H M=$M D=$D"
+  && ok "T33 distinct log tokens HOLD:ADD/META:*/SNAP:DESTROY ($H/$M/$D)" || bad "T33 H=$H M=$M D=$D"
 
 # ---- T13: demoted monthly keeper -> hold released + tags inherited, not destroyed ----
 rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"

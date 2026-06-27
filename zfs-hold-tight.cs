@@ -13,7 +13,7 @@
 //
 // SAFETY: it deletes only when the dataset's feed is provably healthy; otherwise it
 // HOLDs (deletes nothing) and alerts. Full contract: docs/SAFETY.md.
-//   Run-level guards, evaluated INDEPENDENTLY PER DATASET (HOLD that dataset on failure):
+//   Run-level guards, evaluated INDEPENDENTLY PER DATASET (SKIP that dataset on failure):
 //   recent 7-day window complete, newest daily fresh (<=26h, guardMaxDailyAgeHours),
 //   clock sane, no sudden data shrinkage (guardMaxDailyShrinkPct — mass deletion), no
 //   excessive churn (guardMaxDailyChurnPct — mass rewrite/encryption), volume
@@ -340,7 +340,8 @@ foreach (var (ds, ret) in retention)
     var (listCode, snaps) = ListDailies(ds);
     if (listCode != 0)
     {
-        Log($"{ds}: HELD - zfs list failed (cannot verify feed health)");
+        // ListDailies already logged the ERROR detail; emit the dataset verdict.
+        Log($"{ds}: SKIP - zfs list failed (cannot verify feed health)");
         held.Add($"{ds}: zfs list error");
         continue;
     }
@@ -362,11 +363,12 @@ foreach (var (ds, ret) in retention)
 
     // Current holds on this dataset — used to (a) honor guard 12 (never delete a held
     // snapshot) and (b) tell our managed <ns>:monthly hold from foreign/defensive ones.
-    // A holds-list failure means we can't verify guard 12, so HOLD rather than guess.
+    // A holds-list failure means we can't verify guard 12, so SKIP rather than guess.
     var holdMap = LoadHolds(snaps.Select(s => s.Name).ToList());
     if (holdMap is null)
     {
-        Log($"{ds}: HELD - zfs holds failed (cannot verify holds)");
+        Log($"{ds}: ERROR - zfs holds failed (cannot verify holds)");
+        Log($"{ds}: SKIP - cannot verify holds (no deletions)");
         held.Add($"{ds}: zfs holds error");
         continue;
     }
@@ -380,21 +382,22 @@ foreach (var (ds, ret) in retention)
     string? guard = HealthGuard(snaps, ret, gd);
     if (guard is not null)
     {
-        Log($"{ds}: WORRY - {guard} (held; no deletions; keepers protected)");
+        Log($"{ds}: WORRY - {guard}");
         if (prune)
         {
             foreach (var mk in monthKeeper)
                 if (!(holdMap.TryGetValue(mk, out var mt) && mt.Contains(tagMonthly)))
                 {
                     var (hc, _, he) = Exec("zfs", "hold", tagMonthly, mk);
-                    if (hc == 0) Log($"  HOLD {mk} (protected during worry)");
+                    if (hc == 0) Log($"  HOLD:ADD {mk} (protected during worry)");
                     else if (!(he.Contains("already") || he.Contains("exists")))
-                        Log($"    WARNING: worry-hold failed {Short(mk)}: {he.Trim()}");
+                        Log($"    HOLD:ADD {Short(mk)} FAILED: {he.Trim()}");
                 }
             var (wc, _, we) = Exec("zfs", "set", $"{ns}:worry={now:yyyy-MM-dd} {guard}", newest);
-            if (wc == 0) Log($"  META {newest} {ns}:worry={now:yyyy-MM-dd} {guard}");
-            else Log($"    WARNING: set {ns}:worry failed: {we.Trim()}");
+            if (wc == 0) Log($"  META:ADD {newest} {ns}:worry={now:yyyy-MM-dd} {guard}");
+            else Log($"    META:ADD {Short(newest)} FAILED: {we.Trim()}");
         }
+        Log($"{ds}: SKIP - guard tripped (keepers protected, no deletions)");
         held.Add($"{ds}: {guard}");
         continue;
     }
@@ -422,11 +425,12 @@ foreach (var (ds, ret) in retention)
         doomed.Add(s.Name);
     }
 
-    // ---- volume circuit-breaker — BEFORE any mutation, so a capped dataset HOLDs cleanly
+    // ---- volume circuit-breaker — BEFORE any mutation, so a capped dataset SKIPs cleanly
     //      without first issuing a burst of set/hold/inherit writes ----
     if (doomed.Count > gd.MaxDeletePerRun && !force)
     {
-        Log($"{ds}: HELD - would delete {doomed.Count} > cap {gd.MaxDeletePerRun}; rerun with --force if intended");
+        Log($"{ds}: WORRY - would delete {doomed.Count} > cap {gd.MaxDeletePerRun} (rerun with --force if intended)");
+        Log($"{ds}: SKIP - volume circuit-breaker (no deletions)");
         held.Add($"{ds}: volume {doomed.Count}>cap"); continue;
     }
 
@@ -440,10 +444,11 @@ foreach (var (ds, ret) in retention)
             bool monthlyHeld = holdMap.TryGetValue(s.Name, out var sht) && sht.Contains(tagMonthly);
             if (!Promote(s, Desired(s), tier, monthlyHeld)) promoteErrors.Add(Short(s.Name));
         }
-        // Metadata/hold write failures HOLD the dataset (delete nothing) and alert.
+        // Metadata/hold write failures SKIP the dataset (delete nothing) and alert.
         if (promoteErrors.Count > 0)
         {
-            Log($"{ds}: HELD - metadata/hold errors detected (no deletions)");
+            // The per-op `… FAILED` lines above are the reason; emit the verdict.
+            Log($"{ds}: SKIP - metadata/hold write failed (no deletions)");
             held.Add($"{ds}: metadata/hold failures");
             metadataErrors.AddRange(promoteErrors.Select(n => $"  {ds}@{n}"));
             continue;
@@ -471,20 +476,20 @@ foreach (var (ds, ret) in retention)
         {
             var (rc, _, re) = Exec("zfs", "release", tagMonthly, name);
             if (rc != 0 && !re.Contains("no such hold") && !re.Contains("not found"))
-                Log($"    WARNING: release {tagMonthly} failed {Short(name)}: {re.Trim()}");
-            else Log($"  RELEASE {name} (expired keeper, before destroy)");
+                Log($"    HOLD:REMOVE {Short(name)} FAILED: {re.Trim()}");
+            else Log($"  HOLD:REMOVE {name} (expired keeper, before destroy)");
         }
 
         destroyAttempted++;
         var (code, _, err) = Exec("zfs", "destroy", name);
-        if (code != 0) { destroyFails++; Log($"  DESTROY-FAIL {name}: {err.Trim()}"); }
-        else { destroySucceeded++; Log($"  DESTROY {name}"); }
+        if (code != 0) { destroyFails++; Log($"    SNAP:DESTROY {Short(name)} FAILED: {err.Trim()}"); }
+        else { destroySucceeded++; Log($"  SNAP:DESTROY {name}"); }
     }
 }
 
 bool trouble = held.Count > 0 || metadataErrors.Count > 0 || (prune && destroyFails > 0);
 Log($"\n{(prune ? "PRUNED" : "DRY RUN")}: kept {totalKeep}, {(prune ? $"destroyed {destroySucceeded}/{destroyAttempted}" : $"would destroy {totalDoom}")}"
-    + (held.Count > 0 ? $", {held.Count} HELD" : "")
+    + (held.Count > 0 ? $", {held.Count} SKIPPED" : "")
     + (metadataErrors.Count > 0 ? $", {metadataErrors.Count} metadata errors" : "")
     + (prune && destroyFails > 0 ? $", {destroyFails} destroy-failures" : ""));
 if (metadataErrors.Count > 0) Log("Metadata errors:\n" + string.Join("\n", metadataErrors));
@@ -510,7 +515,7 @@ int HoldAdhoc(string snap, bool noHc)
 
     var (c, _, e) = Exec("zfs", "hold", tagAdhoc, snap);
     if (c != 0) { Log($"FAIL: {e.Trim()}"); FlushLog(lines); return 1; }
-    Log($"  HOLD {snap} ({tagAdhoc}, adhoc)");
+    Log($"  HOLD:ADD {snap} ({tagAdhoc}, adhoc)");
 
     // Verify hold was created
     var (vc, vo, _) = Exec("zfs", "holds", snap);
@@ -672,13 +677,13 @@ int Fix(string? datasetFilter)
             var chunk = toHold.GetRange(i, Math.Min(256, toHold.Count - i));
             var a = new List<string> { "hold", tagMonthly }; a.AddRange(chunk);
             var (c, _, _) = Exec("zfs", a.ToArray());
-            if (c == 0) { foreach (var m in chunk) { Log($"  HOLD {m} (fix)"); fixed_++; } continue; }
+            if (c == 0) { foreach (var m in chunk) { Log($"  HOLD:ADD {m} (fix)"); fixed_++; } continue; }
             // Chunk failed — retry one-by-one so the report names the actual bad snapshot(s)
             // (the fast batched path stays the common case).
             foreach (var m in chunk)
             {
                 var (cc, _, ee) = Exec("zfs", "hold", tagMonthly, m);
-                if (cc == 0 || ee.Contains("already") || ee.Contains("exists")) { Log($"  HOLD {m} (fix)"); fixed_++; }
+                if (cc == 0 || ee.Contains("already") || ee.Contains("exists")) { Log($"  HOLD:ADD {m} (fix)"); fixed_++; }
                 else { Log($"  ✗ {ds}/{Short(m)}: {ee.Trim()}"); errors++; }
             }
         }
@@ -719,7 +724,7 @@ int HoldLatestTier(string tier, string? datasetFilter, bool noHc)
 
         var (c, _, e) = Exec("zfs", "hold", tagAdhoc, target.Name);
         if (c == 0)
-            Log($"  HOLD {target.Name} (adhoc, {tier})");
+            Log($"  HOLD:ADD {target.Name} (adhoc, {tier})");
         else if (e.Contains("already") || e.Contains("exists"))
             Log($"  ✓ {ds}/{Short(target.Name)} ({tier}) - already held");
         else
@@ -819,25 +824,25 @@ bool Promote(Snap s, DateTime keepUntil, string tier, bool monthlyHeld)
     {
         // Demotion: clear the audit tags first, and only once that's known-good release the
         // protective monthly hold (and only if it's actually present). If an inherit fails
-        // the snapshot KEEPS its hold (stays protected) and the run HOLDs the dataset; the
+        // the snapshot KEEPS its hold (stays protected) and the run SKIPs the dataset; the
         // cleanup retries next run.
         if (s.Tier != null)
         {
             var (c, _, e) = Exec("zfs", "inherit", propTier, s.Name);
-            if (c != 0) { Log($"    ERROR: inherit tier failed {Short(s.Name)}: {e.Trim()}"); success = false; }
-            else Log($"  META {s.Name} cleared (demoted to daily)");
+            if (c != 0) { Log($"    META:REMOVE {Short(s.Name)} FAILED: {e.Trim()}"); success = false; }
+            else Log($"  META:REMOVE {s.Name} (demoted to daily)");
         }
         if (s.KeepUntil != null)
         {
             var (c, _, e) = Exec("zfs", "inherit", propKeep, s.Name);
-            if (c != 0) { Log($"    ERROR: inherit keep_until failed {Short(s.Name)}: {e.Trim()}"); success = false; }
+            if (c != 0) { Log($"    META:REMOVE {Short(s.Name)} keep_until FAILED: {e.Trim()}"); success = false; }
         }
         if (success && monthlyHeld)           // demoted monthly: drop the now-unneeded hold last
         {
             var (rc, _, re) = Exec("zfs", "release", tagMonthly, s.Name);
             if (rc != 0 && !re.Contains("no such hold") && !re.Contains("not found"))
-            { Log($"    ERROR: release {tagMonthly} failed {Short(s.Name)}: {re.Trim()}"); success = false; }
-            else Log($"  RELEASE {s.Name} (demoted to daily)");
+            { Log($"    HOLD:REMOVE {Short(s.Name)} FAILED: {re.Trim()}"); success = false; }
+            else Log($"  HOLD:REMOVE {s.Name} (demoted to daily)");
         }
         return success;
     }
@@ -849,10 +854,14 @@ bool Promote(Snap s, DateTime keepUntil, string tier, bool monthlyHeld)
     if (s.Tier != tier)      props.Add($"{propTier}={tier}");   // weekly|monthly — highest qualifying tier
     if (props.Count > 0)
     {
+        // ADD when the snapshot carried no tags before; UPDATE when an existing keeper's
+        // tier/keep_until changed (e.g. a weekly survivor promoted to monthly). The prior
+        // values come free from the batched `zfs list`, so the distinction costs no extra I/O.
+        string metaVerb = s.Tier is null && s.KeepUntil is null ? "ADD" : "UPDATE";
         var setArgs = new List<string> { "set" }; setArgs.AddRange(props); setArgs.Add(s.Name);
         var (c, _, e) = Exec("zfs", setArgs.ToArray());
-        if (c != 0) { Log($"    ERROR: set {string.Join(",", props)} failed {Short(s.Name)}: {e.Trim()}"); success = false; }
-        else Log($"  META {s.Name} ({tier}): {string.Join(" ", props)}");
+        if (c != 0) { Log($"    META:{metaVerb} {Short(s.Name)} FAILED: {e.Trim()}"); success = false; }
+        else Log($"  META:{metaVerb} {s.Name} ({tier}): {string.Join(" ", props)}");
     }
     // Hold invariant: held ⇔ tier is monthly. Create the hold on a monthly keeper that lacks
     // it; drop it from a weekly keeper that still carries one (a former month-newest now
@@ -863,20 +872,20 @@ bool Promote(Snap s, DateTime keepUntil, string tier, bool monthlyHeld)
         {
             var (c, _, e) = Exec("zfs", "hold", tagMonthly, s.Name);
             if (c == 0)
-                Log($"  HOLD {s.Name} (monthly keeper, prune ~{keepUntil:yyyy-MM-dd})");
+                Log($"  HOLD:ADD {s.Name} (monthly keeper, prune ~{keepUntil:yyyy-MM-dd})");
             else if (e.Contains("already") || e.Contains("exists"))
                 { /* idempotent: hold already present (race) */ }
             else
-                { Log($"    ERROR: hold failed {Short(s.Name)}: {e.Trim()}"); success = false; }
+                { Log($"    HOLD:ADD {Short(s.Name)} FAILED: {e.Trim()}"); success = false; }
         }
     }
     else if (monthlyHeld)   // weekly keeper still holding a monthly tag → drop it
     {
         var (rc, _, re) = Exec("zfs", "release", tagMonthly, s.Name);
         if (rc != 0 && !re.Contains("no such hold") && !re.Contains("not found"))
-            { Log($"    ERROR: release {tagMonthly} failed {Short(s.Name)}: {re.Trim()}"); success = false; }
+            { Log($"    HOLD:REMOVE {Short(s.Name)} FAILED: {re.Trim()}"); success = false; }
         else
-            Log($"  RELEASE {s.Name} (monthly→weekly)");
+            Log($"  HOLD:REMOVE {s.Name} (monthly→weekly)");
     }
     return success;
 }
