@@ -137,6 +137,11 @@ string logDir = Environment.GetEnvironmentVariable("ZFS_HOLD_TIGHT_LOG_DIR")
     ?? (cfg.TryGetProperty("logDir", out var ld) ? ld.GetString() : null)
     ?? "/mnt/archive/tools/logs";
 string logPath = Path.Combine(logDir, $"zfs-hold-tight-{DateTime.UtcNow:yyyy-MM-dd}.log");
+// Logs + lock are shared runtime *data*, not root-only *code*: create them group-writable
+// (0664) so both root (cron) and the truenas_admin operator can append/rotate them. The
+// binary + config stay root-owned; only this data dir is shared (deploy it 2775 root:operator).
+const UnixFileMode SharedDataMode = UnixFileMode.UserRead | UnixFileMode.UserWrite
+    | UnixFileMode.GroupRead | UnixFileMode.GroupWrite | UnixFileMode.OtherRead;
 
 string? hcUrl = Environment.GetEnvironmentVariable("ZFS_HOLD_TIGHT_HC_URL");
 if (string.IsNullOrEmpty(hcUrl) && cfg.TryGetProperty("healthchecksUrl", out var hu))
@@ -261,7 +266,10 @@ if (willMutate)
     try
     {
         Directory.CreateDirectory(logDir);
-        runLock = new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+        var lockOpts = new FileStreamOptions {
+            Mode = FileMode.OpenOrCreate, Access = FileAccess.ReadWrite, Share = FileShare.None };
+        if (!OperatingSystem.IsWindows()) lockOpts.UnixCreateMode = SharedDataMode;
+        runLock = new FileStream(lockPath, lockOpts);
     }
     catch (IOException)
     {
@@ -929,9 +937,18 @@ void FlushLog(List<string>? logLines = null)
     try
     {
         Directory.CreateDirectory(Path.GetDirectoryName(logPath)!);
+        // Create the day's log group-writable so the other principal (operator vs. cron) can
+        // append to it too; harmless if it already exists.
+        if (!File.Exists(logPath))
+        {
+            var newOpts = new FileStreamOptions { Mode = FileMode.CreateNew, Access = FileAccess.Write };
+            if (!OperatingSystem.IsWindows()) newOpts.UnixCreateMode = SharedDataMode;
+            try { using (new FileStream(logPath, newOpts)) { } }
+            catch (IOException) { /* another run created it first — fine */ }
+        }
         File.AppendAllText(logPath, string.Join("\n", logLines ?? lines) + "\n");
     }
-    catch { /* best effort - e.g. dry-run as non-root cannot write the root-owned log */ }
+    catch { /* best effort - e.g. a non-root run whose log dir isn't shared can't write */ }
 }
 
 (int code, string outp, string err) Exec(string file, params string[] a)
