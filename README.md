@@ -58,10 +58,12 @@ Each run, per dataset:
    deletions) and alert.
 3. Identify keepers: newest-per-ISO-week (weekly) and newest-per-month (monthly).
 4. Tag keepers with `<ns>:tier` + `<ns>:keep_until`; `zfs hold <ns>:monthly` the monthlies
-   (`<ns>` = `propertyNamespace`, default `zht`). Plain dailies stay untagged (implicitly
-   daily). Superseded keepers are demoted: tags inherited away, stale monthly hold released.
-5. Destroy dailies past expiry that are fully covered by a surviving keeper — never the
-   replication base, a keeper, or a held snapshot.
+   and `<ns>:weekly` the weekly-only keepers (`<ns>` = `propertyNamespace`, default `zht`).
+   Plain dailies stay untagged. Superseded keepers are demoted: tags inherited away, stale
+   managed holds released.
+5. Destroy plain dailies only after at least `minNewerHolds` newer held keepers exist
+   (default `2`). Never delete the replication base, a keeper within retention, or a held
+   snapshot.
 
 ## Quick start
 
@@ -94,12 +96,12 @@ run as a user able to `zfs destroy`/`hold` the target datasets (usually root).
 | Command | What it does |
 |---|---|
 | *(none)* | Dry-run: report what would be pruned. **Deletes nothing.** |
-| `--prune` | Prune + tag keepers + create monthly holds + ping healthchecks. |
+| `--prune` | Prune + tag keepers + create monthly/weekly keeper holds + ping healthchecks. |
 | `--prune --force` | Bypass the per-run delete cap (for a reviewed bulk cleanup). |
 | `-v`, `--verbose` | Log each snapshot decision. |
-| `--doctor` | Report hold status: monthlies protected ✓ / missing ✗ / unexpected. |
+| `--doctor` | Report keeper hold status: protected ✓ / missing ✗ / unexpected. |
 | `--check-holds` | Flag holds on snapshots older than their dataset's own retention. |
-| `--fix` | Create any missing `<ns>:monthly` holds on monthly keepers. |
+| `--fix` | Create missing managed holds on monthly and weekly keepers. |
 | `--hold-adhoc <snap>` | Defensive manual `<ns>:adhoc` hold on one snapshot. |
 | `--hold-latest-tier <daily\|weekly\|monthly>` | Hold the newest snapshot of a tier. |
 | `--hold-latest` | Shorthand for `--hold-latest-tier daily`. |
@@ -123,10 +125,11 @@ See [`zfs-hold-tight.example.json`](zfs-hold-tight.example.json). Top-level keys
 | `guardMaxDailyAgeHours` | `26` | `WORRY`+skip if the newest daily is older than this. |
 | `guardMaxDailyShrinkPct` | `33` | `WORRY`+skip if the newest daily references this % less data than the recent baseline (mass-**deletion** guard; `0` disables). |
 | `guardMaxDailyChurnPct` | `50` | `WORRY`+skip if the newest daily rewrites more than this % of the dataset's data in one day (mass-**rewrite / encryption** guard; `0` disables). |
-| `propertyNamespace` | `zht` | Prefix for the tool's ZFS user-properties + hold tags (`<ns>:keep_until`, `<ns>:tier`, `<ns>:monthly`, `<ns>:adhoc`, `<ns>:worry`). |
+| `propertyNamespace` | `zht` | Prefix for the tool's ZFS user-properties + hold tags (`<ns>:keep_until`, `<ns>:tier`, `<ns>:monthly`, `<ns>:weekly`, `<ns>:adhoc`, `<ns>:worry`). |
 | `zfsPath` | auto (`/usr/sbin/zfs`…) | Absolute path to the `zfs` binary. Resolved from standard locations; set explicitly to avoid trusting the (root cron's) `PATH`. |
 | `curlPath` | auto (`/usr/bin/curl`…) | Absolute path to `curl` (healthchecks only). |
-| `retentionPolicies` | — | Named `{dailyKeepDays, weeklyKeepDays, monthlyKeepDays}` profiles. |
+| `minNewerHolds` | `2` | Two-holds invariant: a plain daily drops only after this many newer held keepers (weekly/monthly grandfathers) exist. Governs the daily tail in place of a per-day window. |
+| `retentionPolicies` | — | Named `{dailyKeepDays, weeklyKeepDays, monthlyKeepDays}` profiles; policies may override `minNewerHolds`. |
 | `datasets` | — | `dataset → policy` map. Datasets must start with `archive/`. |
 
 Environment overrides: `ZFS_HOLD_TIGHT_CONFIG`, `ZFS_HOLD_TIGHT_LOG_DIR`,
@@ -160,18 +163,18 @@ HOLDs everything. See [docs/SAFETY.md](docs/SAFETY.md) for the full contract.
 4. **No sudden data shrinkage** — newest daily references ≥ `guardMaxDailyShrinkPct` (33%) less than the recent baseline ⇒ HOLD (mass-**deletion** guard).
 5. **No excessive churn** — newest daily rewrites > `guardMaxDailyChurnPct` (50%) of the dataset in one day ⇒ HOLD (mass-**rewrite / encryption** guard).
 6. **Volume circuit-breaker** — never delete more than `guardMaxDeletePerRun` without `--force`.
-7. **Population floor** — fewer dailies than the keep count ⇒ nothing to prune (noted).
+7. **Population floor** — fewer held keepers than the derived destroy depth ⇒ nothing to prune (noted).
 
 Per-snapshot, it never deletes the replication base (newest daily), a week/month keeper
-**while within its retention window**, an uncovered daily, or any held snapshot. A keeper
+**while within its retention window**, a plain daily with fewer than `minNewerHolds`
+newer held keepers, or any foreign/defensive held snapshot. A keeper
 *past* its retention ages out (so your recovery window is bounded by `weeklyKeepDays` /
 `monthlyKeepDays`, not infinite).
 
 > **On a worry, protection only ever increases.** When a guard HOLDs a dataset, the tool
-> still proactively `zfs hold`s the monthly keepers (*including* the suspect newest — a
-> false alarm costs nothing, but skipping the hold could lose the chance to protect it)
-> and records a `<ns>:worry=<date> <reason>` breadcrumb on the tip. It never releases a
-> hold or deletes anything on a worried run.
+> still proactively `zfs hold`s every keeper (`<ns>:monthly` / `<ns>:weekly`, including
+> the suspect newest where applicable) and records a `<ns>:worry=<date> <reason>`
+> breadcrumb on the tip. It never releases a hold or deletes anything on a worried run.
 
 > **`--force` removes the per-run delete throttle entirely** — use it deliberately for a
 > reviewed bulk cleanup (e.g. a first run against a large backlog), then return to plain

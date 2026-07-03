@@ -56,11 +56,11 @@ A broken source feed shows up as stale/gappy dailies, so guards 1–2 enforce re
 health by proxy.
 
 **A `SKIP` is not passive — protection only ever increases on a worry.** When any guard above
-withholds (`SKIP`s) a dataset, the tool still proactively `zfs hold`s its monthly keepers (including the
-suspect newest, since a false alarm costs nothing but skipping the hold could lose the
-chance to protect it) and writes a `<ns>:worry=<date> <reason>` breadcrumb on the tip. It
-**never releases a hold or deletes anything** on a worried run — a release/delete only ever
-happens on a fully-healthy, under-cap run.
+withholds (`SKIP`s) a dataset, the tool still proactively `zfs hold`s every keeper
+(`<ns>:monthly` / `<ns>:weekly`, including the suspect newest where applicable) and writes a
+`<ns>:worry=<date> <reason>` breadcrumb on the tip. It **never releases a hold or deletes
+anything** on a worried run — a release/delete only ever happens on a fully-healthy,
+under-cap run.
 
 > **Detection vs. recovery.** Guards 4–5 are best-effort *early warning* — they alert and
 > stop pruning the granular recent dailies, but a patient low-and-slow attack (a few % a
@@ -71,15 +71,17 @@ happens on a fully-healthy, under-cap run.
 ## Per-snapshot protections — never delete a snapshot that is…
 
 8. **The newest daily** — the replication incremental base. Absolute, always.
-9. **Within the daily-keep window** — one of the newest N (N per policy).
+9. **Within the daily tail** — a plain daily survives until at least `minNewerHolds`
+    newer held keepers exist (default `2`).
 10. **A week keeper** — newest daily in its ISO-week, within weekly retention.
 11. **A month keeper** — newest daily in its month, within monthly retention.
-12. **Not yet covered** — a daily is deleted only once a *surviving* keeper covers both
-    its ISO-week and its month. Never open a coverage hole.
-13. **Held** — any `zfs hold` (e.g. a defensive `<ns>:adhoc`) makes the snapshot
-    off-limits; it is skipped, never forced. The tool's own `<ns>:monthly` hold is
-    released immediately before it destroys an expired monthly keeper. (And if `zfs holds`
-    itself fails, the dataset is `SKIP`ped (`ERROR`) rather than pruned while blind to holds.)
+12. **Not yet covered** — a daily is deleted only once the derived destroy depth of
+    newer held keepers covers it. Never open a coverage hole.
+13. **Held** — any foreign/defensive `zfs hold` (e.g. `<ns>:adhoc`) makes the snapshot
+    off-limits; it is skipped, never forced. The tool's own managed keeper holds
+    (`<ns>:monthly` / `<ns>:weekly`) are released only for demotion or immediately before
+    destroying an expired keeper. (And if `zfs holds` itself fails, the dataset is
+    `SKIP`ped (`ERROR`) rather than pruned while blind to holds.)
 14. **Not a recognized `autosnap_<ts>_daily`** — legacy `_weekly`/`_monthly`, manual, and
     unparseable names are out of scope (and an unparseable date skips that one snapshot,
     never aborts the run).
