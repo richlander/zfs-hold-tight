@@ -409,6 +409,17 @@ foreach (var (ds, ret) in retention)
     bool IsForeignHeld(string name) =>
         holdMap.TryGetValue(name, out var tags) && tags.Any(t => t != tagMonthly && t != tagWeekly);
 
+    // Keeper/hold summary — hoisted above the worry paths so the WORRY lines and the normal
+    // line all report the same numbers. keepersHeld counts computed keepers that ALREADY carry
+    // a real <ns>:weekly / <ns>:monthly hold on disk; on a dry-run before the first prune the
+    // weekly holds are still pending, so keepersHeld < keeperNames.Count — that gap is itself
+    // the signal that a real run still has holds to place.
+    int mCount = monthKeeper.Count;
+    int wCount = weekKeeper.Count(w => !monthKeeper.Contains(w));
+    int keepersHeld = keeperNames.Count(k =>
+        holdMap.TryGetValue(k, out var kt) && (kt.Contains(tagMonthly) || kt.Contains(tagWeekly)));
+    string tail = holdFrontier == DateTime.MinValue ? "—" : holdFrontier.ToString("yyyy-MM-dd");
+
     // ---- run-level guards. On a worry, protection only ever INCREASES: still hold the
     //      monthly keepers (even the suspect newest — a false positive costs nothing, and
     //      we don't want to skip the hold and lose the chance later) and record a worry
@@ -416,7 +427,7 @@ foreach (var (ds, ret) in retention)
     string? guard = HealthGuard(snaps, ret, gd);
     if (guard is not null)
     {
-        Log($"{ds}: WORRY - {guard}");
+        Log($"{ds}: WORRY - {guard} ({keepersHeld}/{keeperNames.Count} keepers held)");
         if (prune)
         {
             // Proactively hold EVERY keeper (monthly with <ns>:monthly, weekly with <ns>:weekly).
@@ -474,7 +485,7 @@ foreach (var (ds, ret) in retention)
     //      without first issuing a burst of set/hold/inherit writes ----
     if (doomed.Count > gd.MaxDeletePerRun && !force)
     {
-        Log($"{ds}: WORRY - would delete {doomed.Count} > cap {gd.MaxDeletePerRun} (rerun with --force if intended)");
+        Log($"{ds}: WORRY - would delete {doomed.Count} > cap {gd.MaxDeletePerRun}; {keepersHeld}/{keeperNames.Count} keepers held, daily tail to {tail} (rerun with --force if intended)");
         Log($"{ds}: SKIP - volume circuit-breaker (no deletions)");
         held.Add($"{ds}: volume {doomed.Count}>cap"); continue;
     }
@@ -511,10 +522,8 @@ foreach (var (ds, ret) in retention)
     totalKeep += kept; totalDoom += doomed.Count;
     string verb = prune ? "destroy" : "would destroy";
     string rng = doomed.Count > 0 ? $" [{Short(doomed[0])} .. {Short(doomed[^1])}]" : "";
-    // keeper tag breakdown (monthly takes precedence over weekly — both now carry a real hold)
-    // and the daily-tail frontier: dailies newer than it survive (< destroyDepth held keepers ahead).
-    int mCount = monthKeeper.Count, wCount = weekKeeper.Count(w => !monthKeeper.Contains(w));
-    string tail = holdFrontier == DateTime.MinValue ? "—" : holdFrontier.ToString("yyyy-MM-dd");
+    // keeper tag breakdown (mCount/wCount/tail hoisted above the worry paths) and the daily-tail
+    // frontier: dailies newer than it survive (< destroyDepth held keepers ahead).
     Log($"{ds}: {snaps.Count} snaps -> keep {kept} ({mCount} monthly + {wCount} weekly held; daily tail: >={destroyDepth} newer holds, to {tail}), {verb} {doomed.Count}{rng}");
     foreach (var name in doomed)
     {

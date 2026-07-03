@@ -120,8 +120,8 @@ gen_feed 2025-06-01 > "$WORK/healthy"
 
 # ---- T1: healthy feed, dry-run, big backlog -> circuit-breaker HOLD, 0 destroys ----
 run_tool "$WORK/healthy"
-{ echo "$OUT" | grep -q "cap" && [ "$(grep -c '^destroy' "$OPS")" = 0 ]; } \
-  && ok "T1 healthy dry-run SKIP on circuit-breaker, no destroys" || bad "T1 (out: $(echo "$OUT"|tail -1))"
+{ echo "$OUT" | grep -qE "> cap.*keepers held, daily tail to" && [ "$(grep -c '^destroy' "$OPS")" = 0 ]; } \
+  && ok "T1 healthy dry-run SKIP on circuit-breaker (worry line shows keepers held + tail), no destroys" || bad "T1 (out: $(echo "$OUT"|tail -1))"
 
 # ---- T2: prune --force -> keeper invariant: no in-retention week/month keeper destroyed
 #          (the fixture spans ~1y, all keepers within the 5y window; T19 covers expiry) ----
