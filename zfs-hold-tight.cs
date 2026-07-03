@@ -88,8 +88,30 @@ if (!cfg.TryGetProperty("datasets", out var datasetsElem) || datasetsElem.ValueK
 
 // Validate and load numeric config with bounds
 int MaxDeletePerRun = 5, RecentWindowDays = 7, MaxDailyAgeHours = 26, MaxDailyShrinkPct = 33, MaxDailyChurnPct = 50;
+int HoldDepth = 1;              // base newer-held-keeper horizon for the daily tail
+int DestroyMultiplier = 2;      // destroy horizon = HoldDepth * DestroyMultiplier
 try
 {
+    bool hasHoldDepth = cfg.TryGetProperty("holdDepth", out var hd);
+    bool hasDestroyMultiplier = cfg.TryGetProperty("destroyMultiplier", out var dm);
+    if (hasHoldDepth)
+    {
+        HoldDepth = hd.GetInt32();
+        if (HoldDepth < 1) throw new ArgumentException("holdDepth must be >= 1");
+    }
+    if (hasDestroyMultiplier)
+    {
+        DestroyMultiplier = dm.GetInt32();
+        if (DestroyMultiplier < 1) throw new ArgumentException("destroyMultiplier must be >= 1");
+    }
+    if (cfg.TryGetProperty("minNewerHolds", out var mnh))
+    {
+        if (hasHoldDepth || hasDestroyMultiplier)
+            throw new ArgumentException("minNewerHolds is legacy; do not combine it with holdDepth/destroyMultiplier");
+        HoldDepth = 1;
+        DestroyMultiplier = mnh.GetInt32();
+        if (DestroyMultiplier < 1) throw new ArgumentException("minNewerHolds must be >= 1");
+    }
     if (cfg.TryGetProperty("guardMaxDeletePerRun", out var gdp))
     {
         MaxDeletePerRun = gdp.GetInt32();
@@ -152,12 +174,12 @@ if (string.IsNullOrEmpty(hcUrl) && cfg.TryGetProperty("healthchecksUrl", out var
 bool noHc = args.Contains("--no-hc") || string.IsNullOrEmpty(hcUrl);
 
 // Namespace for this tool's ZFS user-properties and hold tags (<ns>:keep_until,
-// <ns>:tier, <ns>:monthly, <ns>:adhoc, <ns>:worry). Configurable so the source carries
+// <ns>:tier, <ns>:monthly, <ns>:weekly, <ns>:adhoc, <ns>:worry). Configurable so the source carries
 // no site identity; defaults to "zht".
 string ns = (cfg.TryGetProperty("propertyNamespace", out var pnEl) ? pnEl.GetString() : null) ?? "zht";
 if (!Regex.IsMatch(ns, @"^[A-Za-z0-9_.-]+$"))
 { Console.Error.WriteLine($"FATAL: propertyNamespace '{ns}' must be letters/digits/._- (no colon)"); configDoc?.Dispose(); return 2; }
-string tagMonthly = $"{ns}:monthly", tagAdhoc = $"{ns}:adhoc", propKeep = $"{ns}:keep_until", propTier = $"{ns}:tier";
+string tagMonthly = $"{ns}:monthly", tagWeekly = $"{ns}:weekly", tagAdhoc = $"{ns}:adhoc", propKeep = $"{ns}:keep_until", propTier = $"{ns}:tier";
 
 // Resolve zfs/curl to absolute trusted paths rather than trusting the (root) cron's PATH —
 // a writable earlier PATH element would otherwise be root code execution. Override with
@@ -195,11 +217,25 @@ try
         int daily = p.TryGetProperty("dailyKeepDays", out var d) ? d.GetInt32() : 30;
         int weekly = p.TryGetProperty("weeklyKeepDays", out var w) ? w.GetInt32() : 5 * 365;
         int monthly = p.TryGetProperty("monthlyKeepDays", out var m) ? m.GetInt32() : 5 * 365;
+        int holdDepth = p.TryGetProperty("holdDepth", out var phd) ? phd.GetInt32() : HoldDepth;
+        int destroyMultiplier = p.TryGetProperty("destroyMultiplier", out var pdm) ? pdm.GetInt32() : DestroyMultiplier;
+        if (p.TryGetProperty("minNewerHolds", out var mn))
+        {
+            if (p.TryGetProperty("holdDepth", out _) || p.TryGetProperty("destroyMultiplier", out _))
+                throw new ArgumentException($"Policy '{policy.Name}': minNewerHolds is legacy; do not combine it with holdDepth/destroyMultiplier");
+            holdDepth = 1;
+            destroyMultiplier = mn.GetInt32();
+        }
 
         if (daily <= 0 || weekly <= 0 || monthly <= 0)
             throw new ArgumentException($"Policy '{policy.Name}': all retention days must be positive");
+        if (holdDepth < 1)
+            throw new ArgumentException($"Policy '{policy.Name}': holdDepth must be >= 1");
+        if (destroyMultiplier < 1)
+            throw new ArgumentException($"Policy '{policy.Name}': destroyMultiplier must be >= 1");
+        _ = checked(holdDepth * destroyMultiplier);
 
-        policies[policy.Name] = new Retention(daily, weekly, monthly);
+        policies[policy.Name] = new Retention(daily, weekly, monthly, holdDepth, destroyMultiplier);
         policyGuards[policy.Name] = new Guards(
             GuardInt(p, "guardMaxDeletePerRun",   MaxDeletePerRun,   v => v > 0,              "must be > 0"),
             GuardInt(p, "guardRecentWindowDays",  RecentWindowDays,  v => v > 0 && v <= 365,  "must be 1-365"),
@@ -361,11 +397,29 @@ foreach (var (ds, ret) in retention)
                            .Select(g => g.MaxBy(s => s.Date)!.Name).ToHashSet();
     var monthKeeper = snaps.GroupBy(s => (s.Date.Year, s.Date.Month)).Select(g => g.MaxBy(s => s.Date)!.Name).ToHashSet();
     var newest = snaps.MaxBy(s => s.Date)!.Name;
+    // keepers = weekKeeper ∪ monthKeeper: exactly the snapshots that carry a real hold
+    // (weekly with <ns>:weekly, monthly with <ns>:monthly). A daily is held by none of them.
+    var keeperNames = weekKeeper.Union(monthKeeper).ToHashSet();
+    // Two-holds invariant: a non-keeper daily is droppable only once at least
+    // holdDepth * destroyMultiplier held keepers are strictly NEWER than it. Equivalent
+    // clean cutoff: sort keeper dates DESC; holdFrontier = the destroy-depth keeper's date;
+    // a non-keeper daily s is doomed iff s.Date < holdFrontier. Fewer than that many keepers
+    // ⇒ nothing droppable yet (frontier = MinValue). The daily's own week+month grandfathers
+    // are strictly newer, so the default destroy depth of 2 subsumes the old week/month
+    // coverage test plus a buffer.
+    int destroyDepth = checked(ret.HoldDepth * ret.DestroyMultiplier);
+    var keeperDates = snaps.Where(s => keeperNames.Contains(s.Name)).Select(s => s.Date)
+                           .OrderByDescending(dt => dt).ToList();
+    var holdFrontier = keeperDates.Count >= destroyDepth ? keeperDates[destroyDepth - 1] : DateTime.MinValue;
+    // Only keepers have a date-based expiry (their 5-year grandfather retention); a plain daily
+    // is governed by the frontier, not a date, so it returns MaxValue here (never expires by date).
     DateTime Desired(Snap s)
     {
-        var k = s.Date.AddDays(ret.DailyKeepDays);
-        if (weekKeeper.Contains(s.Name))  k = Later(k, s.Date.AddDays(ret.WeeklyKeepDays));
-        if (monthKeeper.Contains(s.Name)) k = Later(k, s.Date.AddDays(ret.MonthlyKeepDays));
+        bool isWeek = weekKeeper.Contains(s.Name), isMonth = monthKeeper.Contains(s.Name);
+        if (!isWeek && !isMonth) return DateTime.MaxValue;
+        var k = DateTime.MinValue;
+        if (isWeek)  k = Later(k, s.Date.AddDays(ret.WeeklyKeepDays));
+        if (isMonth) k = Later(k, s.Date.AddDays(ret.MonthlyKeepDays));
         return k;
     }
 
@@ -381,7 +435,7 @@ foreach (var (ds, ret) in retention)
         continue;
     }
     bool IsForeignHeld(string name) =>
-        holdMap.TryGetValue(name, out var tags) && tags.Any(t => t != tagMonthly);
+        holdMap.TryGetValue(name, out var tags) && tags.Any(t => t != tagMonthly && t != tagWeekly);
 
     // ---- run-level guards. On a worry, protection only ever INCREASES: still hold the
     //      monthly keepers (even the suspect newest — a false positive costs nothing, and
@@ -393,6 +447,8 @@ foreach (var (ds, ret) in retention)
         Log($"{ds}: WORRY - {guard}");
         if (prune)
         {
+            // Proactively hold EVERY keeper (monthly with <ns>:monthly, weekly with <ns>:weekly).
+            // Protection only ever increases on a worry; never release or delete here.
             foreach (var mk in monthKeeper)
                 if (!(holdMap.TryGetValue(mk, out var mt) && mt.Contains(tagMonthly)))
                 {
@@ -400,6 +456,14 @@ foreach (var (ds, ret) in retention)
                     if (hc == 0) Log($"  HOLD:ADD {mk} (protected during worry)");
                     else if (!(he.Contains("already") || he.Contains("exists")))
                         Log($"    HOLD:ADD {Short(mk)} FAILED: {he.Trim()}");
+                }
+            foreach (var wk in weekKeeper.Where(w => !monthKeeper.Contains(w)))
+                if (!(holdMap.TryGetValue(wk, out var wt) && wt.Contains(tagWeekly)))
+                {
+                    var (hc, _, he) = Exec("zfs", "hold", tagWeekly, wk);
+                    if (hc == 0) Log($"  HOLD:ADD {wk} (protected during worry)");
+                    else if (!(he.Contains("already") || he.Contains("exists")))
+                        Log($"    HOLD:ADD {Short(wk)} FAILED: {he.Trim()}");
                 }
             var (wc, _, we) = Exec("zfs", "set", $"{ns}:worry={now:yyyy-MM-dd} {guard}", newest);
             if (wc == 0) Log($"  META:ADD {newest} {ns}:worry={now:yyyy-MM-dd} {guard}");
@@ -414,21 +478,22 @@ foreach (var (ds, ret) in retention)
     var doomed = new List<string>();
     foreach (var s in snaps.OrderBy(s => s.Date))
     {
-        if (now <= Desired(s)) continue;                    // still retained
         if (s.Name == newest) continue;                     // never the base (guard 7)
         if (IsForeignHeld(s.Name))                          // guard 12: held => never delete, skip cleanly
         { if (verbose) Log($"  {ds}: skip {Short(s.Name)} - held ({string.Join(",", holdMap[s.Name])})"); continue; }
-        // A non-keeper daily is deleted only once a *surviving* keeper covers its week and
-        // month (never open a coverage hole early). A week/month keeper that is itself past
-        // retention is its period's last survivor — nothing remains to cover, so it must
-        // age out rather than live forever (it being the newest in its week/month means the
-        // coverage test can never find a replacement).
-        bool isKeeper = weekKeeper.Contains(s.Name) || monthKeeper.Contains(s.Name);
-        if (!isKeeper)
+        if (keeperNames.Contains(s.Name))
         {
-            bool weekCov  = snaps.Any(o => o.Name != s.Name && SameIsoWeek(o.Date, s.Date) && Desired(o) > now);
-            bool monthCov = snaps.Any(o => o.Name != s.Name && o.Date.Year == s.Date.Year && o.Date.Month == s.Date.Month && Desired(o) > now);
-            if (!(weekCov && monthCov)) { Log($"  {ds}: skip {Short(s.Name)} - not yet covered by a keeper"); continue; }
+            // A held week/month keeper ages out only past its own grandfather retention
+            // (weekly/monthly keep-days); until then it is kept, invariant or not.
+            if (now <= Desired(s)) continue;
+        }
+        else
+        {
+            // Two-holds invariant: keep a non-keeper daily until the derived destroy depth
+            // of held keepers is strictly newer than it (its date drops below the frontier).
+            // The frontier subsumes the old week+month coverage test (its own grandfathers are
+            // strictly newer) plus a buffer, so no coverage hole can open early.
+            if (s.Date >= holdFrontier) continue;
         }
         doomed.Add(s.Name);
     }
@@ -449,8 +514,15 @@ foreach (var (ds, ret) in retention)
         foreach (var s in snaps.OrderBy(s => s.Date))
         {
             string tier = monthKeeper.Contains(s.Name) ? "monthly" : weekKeeper.Contains(s.Name) ? "weekly" : "daily";
-            bool monthlyHeld = holdMap.TryGetValue(s.Name, out var sht) && sht.Contains(tagMonthly);
-            if (!Promote(s, Desired(s), tier, monthlyHeld)) promoteErrors.Add(Short(s.Name));
+            // Our keeper holds currently on this snapshot (from the load-time holds list), so
+            // Promote can add-then-release across a tier change without a transient unheld gap.
+            var heldKeeperTags = new HashSet<string>();
+            if (holdMap.TryGetValue(s.Name, out var sht))
+            {
+                if (sht.Contains(tagMonthly)) heldKeeperTags.Add(tagMonthly);
+                if (sht.Contains(tagWeekly))  heldKeeperTags.Add(tagWeekly);
+            }
+            if (!Promote(s, Desired(s), tier, heldKeeperTags)) promoteErrors.Add(Short(s.Name));
         }
         // Metadata/hold write failures SKIP the dataset (delete nothing) and alert.
         if (promoteErrors.Count > 0)
@@ -467,22 +539,30 @@ foreach (var (ds, ret) in retention)
     totalKeep += kept; totalDoom += doomed.Count;
     string verb = prune ? "destroy" : "would destroy";
     string rng = doomed.Count > 0 ? $" [{Short(doomed[0])} .. {Short(doomed[^1])}]" : "";
-    // keeper tag breakdown (monthly takes precedence over weekly) and the next date a
-    // snapshot in this dataset is expected to age out and be pruned.
+    // keeper tag breakdown (monthly takes precedence over weekly — both now carry a real hold)
+    // and the daily-tail frontier: dailies newer than it survive (< destroyDepth held keepers ahead).
     int mCount = monthKeeper.Count, wCount = weekKeeper.Count(w => !monthKeeper.Contains(w));
-    var futureExpiry = snaps.Where(s => s.Name != newest).Select(s => Desired(s)).Where(d => d > now).ToList();
-    string nextPrune = futureExpiry.Count > 0 ? futureExpiry.Min().ToString("yyyy-MM-dd") : "—";
-    Log($"{ds}: {snaps.Count} dailies -> keep {kept} ({mCount}m/{wCount}w, d{ret.DailyKeepDays}/w{ret.WeeklyKeepDays / 7}/m{ret.MonthlyKeepDays / 30}), {verb} {doomed.Count}{rng}; next prune {nextPrune}");
+    string tail = holdFrontier == DateTime.MinValue ? "—" : holdFrontier.ToString("yyyy-MM-dd");
+    Log($"{ds}: {snaps.Count} snaps -> keep {kept} ({mCount} monthly + {wCount} weekly held; daily tail: hold={ret.HoldDepth}, destroy>={destroyDepth} holds, to {tail}), {verb} {doomed.Count}{rng}");
     foreach (var name in doomed)
     {
         if (!prune) { if (verbose) Log($"  WOULD-DESTROY {name}"); continue; }
 
-        // Release our managed <ns>:monthly hold before destroy, but ONLY for snapshots that
-        // actually have it (an expired monthly keeper, or one held at load time) — not for
-        // the common plain-daily case. (Guard 12 already excluded foreign-held snapshots.)
-        if (monthKeeper.Contains(name) || (holdMap.TryGetValue(name, out var ht) && ht.Contains(tagMonthly)))
+        // Release ANY of our managed holds (<ns>:monthly and/or <ns>:weekly) before destroy,
+        // but ONLY for snapshots that actually carry one (an expired keeper — the tag Promote
+        // gave it this run — or one held at load time) — not the common plain-daily case.
+        // (Guard 12 already excluded foreign-held snapshots.)
+        var toRelease = new HashSet<string>();
+        if (monthKeeper.Contains(name)) toRelease.Add(tagMonthly);           // Promote holds monthly (precedence)
+        else if (weekKeeper.Contains(name)) toRelease.Add(tagWeekly);        // weekly-only keeper holds weekly
+        if (holdMap.TryGetValue(name, out var ht))
         {
-            var (rc, _, re) = Exec("zfs", "release", tagMonthly, name);
+            if (ht.Contains(tagMonthly)) toRelease.Add(tagMonthly);
+            if (ht.Contains(tagWeekly))  toRelease.Add(tagWeekly);
+        }
+        foreach (var tag in toRelease)
+        {
+            var (rc, _, re) = Exec("zfs", "release", tag, name);
             if (rc != 0 && !re.Contains("no such hold") && !re.Contains("not found"))
                 Log($"    HOLD:REMOVE {Short(name)} FAILED: {re.Trim()}");
             else Log($"  HOLD:REMOVE {name} (expired keeper, before destroy)");
@@ -558,17 +638,21 @@ int CheckHolds(bool noHc)
         if (code != 0) { Log($"  WARNING: {ds}: zfs list failed"); anyFail = true; continue; }
         var holdMap = LoadHolds(snaps.Select(s => s.Name).ToList());
         if (holdMap is null) { Log($"  WARNING: {ds}: zfs holds failed"); anyFail = true; continue; }
-        int maxDays = Math.Max(ret.WeeklyKeepDays, ret.MonthlyKeepDays);
-        var cutoff = now.AddDays(-maxDays);
-        foreach (var snap in holdMap.Keys)
+        foreach (var (snap, tags) in holdMap)
         {
+            // Judge each hold against ITS tier's retention: a <ns>:weekly hold is stale past
+            // weeklyKeepDays, a <ns>:monthly hold past monthlyKeepDays. Other holds (adhoc /
+            // foreign) are judged against the longest retention, as before.
+            int days = tags.Contains(tagMonthly) ? ret.MonthlyKeepDays
+                     : tags.Contains(tagWeekly)  ? ret.WeeklyKeepDays
+                     : Math.Max(ret.WeeklyKeepDays, ret.MonthlyKeepDays);
             var m = dateRe.Match(snap);
             if (!m.Success) continue;
             if (!DateTime.TryParseExact(m.Groups[1].Value, "yyyy-MM-dd",
                 CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var snapDate))
                 continue;
-            if (snapDate < cutoff)
-                stale.Add($"{ds}: hold on {Short(snap)} exceeds its {maxDays}d retention");
+            if (snapDate < now.AddDays(-days))
+                stale.Add($"{ds}: hold on {Short(snap)} exceeds its {days}d retention");
         }
     }
 
@@ -602,16 +686,19 @@ int Doctor(string? datasetFilter)
         if (code != 0) { Log($"{ds}: ERROR - zfs list failed, cannot validate holds"); errors++; continue; }
         if (snaps.Count == 0) { Log($"{ds}: no snapshots"); continue; }
 
-        // Find monthlies
+        // Find keepers: monthlies (<ns>:monthly) and weekly-only keepers (<ns>:weekly).
         var monthKeeper = snaps.GroupBy(s => (s.Date.Year, s.Date.Month))
                               .Select(g => g.MaxBy(s => s.Date)!.Name).ToHashSet();
+        var weekKeeper = snaps.GroupBy(s => (ISOWeek.GetYear(s.Date), ISOWeek.GetWeekOfYear(s.Date)))
+                              .Select(g => g.MaxBy(s => s.Date)!.Name).ToHashSet();
+        var weekOnly = weekKeeper.Where(w => !monthKeeper.Contains(w)).ToHashSet();
 
         // Check which snapshots have holds
         var holdMap = LoadHolds(snaps.Select(s => s.Name).ToList());
         if (holdMap is null) { Log($"{ds}: ERROR - zfs holds failed, hold status unknown"); errors++; continue; }
 
-        // Report monthly status
-        Log($"{ds}: {monthKeeper.Count} monthlies");
+        // Report monthly + weekly keeper status (each expects its matching hold)
+        Log($"{ds}: {monthKeeper.Count} monthlies, {weekOnly.Count} weeklies");
         foreach (var monthly in monthKeeper.OrderByDescending(s => s))
         {
             if (holdMap.TryGetValue(monthly, out var tags) && tags.Contains(tagMonthly))
@@ -625,11 +712,25 @@ int Doctor(string? datasetFilter)
                 missing++;
             }
         }
+        foreach (var weekly in weekOnly.OrderByDescending(s => s))
+        {
+            if (holdMap.TryGetValue(weekly, out var tags) && tags.Contains(tagWeekly))
+            {
+                Log($"  ✓ {Short(weekly)} ({tagWeekly})");
+                protected_++;
+            }
+            else
+            {
+                Log($"  ✗ {Short(weekly)} MISSING HOLD");
+                missing++;
+            }
+        }
 
-        // Report other holds
+        // Report other holds — a keeper carrying its own <ns>:weekly/<ns>:monthly hold is
+        // expected, so exclude both keeper sets here; only genuinely unexpected holds remain.
         foreach (var (snap, tags) in holdMap)
         {
-            if (!monthKeeper.Contains(snap) && snap.Contains("_daily"))
+            if (!monthKeeper.Contains(snap) && !weekOnly.Contains(snap) && snap.Contains("_daily"))
             {
                 if (tags.Contains(tagAdhoc))
                 {
@@ -645,7 +746,7 @@ int Doctor(string? datasetFilter)
         }
     }
 
-    Log($"\nSummary: {protected_} monthlies protected, {missing} missing, {adhoc_} adhoc, {orphaned} unexpected"
+    Log($"\nSummary: {protected_} keepers protected, {missing} missing, {adhoc_} adhoc, {orphaned} unexpected"
         + (errors > 0 ? $", {errors} datasets unverified (zfs errors)" : ""));
     if (missing == 0 && orphaned == 0 && errors == 0)
         Log("✓ Hold strategy validated");
@@ -656,7 +757,7 @@ int Doctor(string? datasetFilter)
     return (missing > 0 || errors > 0) ? 1 : 0;
 }
 
-// ---- fix: create missing monthly holds ----
+// ---- fix: create missing managed keeper holds ----
 int Fix(string? datasetFilter)
 {
     var lines = new List<string>();
@@ -671,30 +772,38 @@ int Fix(string? datasetFilter)
         if (code != 0) { Log($"  ✗ {ds}: zfs list failed, skipping"); errors++; continue; }
         if (snaps.Count == 0) continue;
 
-        // Find monthlies, load current holds once, and hold only the ones still MISSING
-        // (batched — `zfs hold <tag> <snap>...` takes multiple snapshots).
+        // Find keepers, load current holds once, and hold only the ones still MISSING their
+        // matching tag (batched — `zfs hold <tag> <snap>...` takes multiple snapshots).
         var monthKeeper = snaps.GroupBy(s => (s.Date.Year, s.Date.Month))
                               .Select(g => g.MaxBy(s => s.Date)!.Name).ToHashSet();
+        var weekOnly = snaps.GroupBy(s => (ISOWeek.GetYear(s.Date), ISOWeek.GetWeekOfYear(s.Date)))
+                            .Select(g => g.MaxBy(s => s.Date)!.Name).Where(w => !monthKeeper.Contains(w)).ToHashSet();
         var holdMap = LoadHolds(snaps.Select(s => s.Name).ToList());
         if (holdMap is null) { Log($"  ✗ {ds}: zfs holds failed, skipping"); errors++; continue; }
 
-        var toHold = monthKeeper.Where(m => !(holdMap.TryGetValue(m, out var t) && t.Contains(tagMonthly))).ToList();
-        foreach (var m in monthKeeper.Except(toHold)) Log($"  ✓ {ds}/{Short(m)} (already held)");
-        for (int i = 0; i < toHold.Count; i += 256)
+        // Hold every keeper in `keepers` that lacks `tag`, batched with a one-by-one retry.
+        void HoldMissing(string tag, IEnumerable<string> keepers)
         {
-            var chunk = toHold.GetRange(i, Math.Min(256, toHold.Count - i));
-            var a = new List<string> { "hold", tagMonthly }; a.AddRange(chunk);
-            var (c, _, _) = Exec("zfs", a.ToArray());
-            if (c == 0) { foreach (var m in chunk) { Log($"  HOLD:ADD {m} (fix)"); fixed_++; } continue; }
-            // Chunk failed — retry one-by-one so the report names the actual bad snapshot(s)
-            // (the fast batched path stays the common case).
-            foreach (var m in chunk)
+            var toHold = keepers.Where(k => !(holdMap.TryGetValue(k, out var t) && t.Contains(tag))).ToList();
+            foreach (var k in keepers.Except(toHold)) Log($"  ✓ {ds}/{Short(k)} (already held)");
+            for (int i = 0; i < toHold.Count; i += 256)
             {
-                var (cc, _, ee) = Exec("zfs", "hold", tagMonthly, m);
-                if (cc == 0 || ee.Contains("already") || ee.Contains("exists")) { Log($"  HOLD:ADD {m} (fix)"); fixed_++; }
-                else { Log($"  ✗ {ds}/{Short(m)}: {ee.Trim()}"); errors++; }
+                var chunk = toHold.GetRange(i, Math.Min(256, toHold.Count - i));
+                var a = new List<string> { "hold", tag }; a.AddRange(chunk);
+                var (c, _, _) = Exec("zfs", a.ToArray());
+                if (c == 0) { foreach (var k in chunk) { Log($"  HOLD:ADD {k} (fix)"); fixed_++; } continue; }
+                // Chunk failed — retry one-by-one so the report names the actual bad snapshot(s)
+                // (the fast batched path stays the common case).
+                foreach (var k in chunk)
+                {
+                    var (cc, _, ee) = Exec("zfs", "hold", tag, k);
+                    if (cc == 0 || ee.Contains("already") || ee.Contains("exists")) { Log($"  HOLD:ADD {k} (fix)"); fixed_++; }
+                    else { Log($"  ✗ {ds}/{Short(k)}: {ee.Trim()}"); errors++; }
+                }
             }
         }
+        HoldMissing(tagMonthly, monthKeeper);
+        HoldMissing(tagWeekly, weekOnly);
     }
 
     Log($"Fixed {fixed_} holds" + (errors > 0 ? $", {errors} errors" : ""));
@@ -788,8 +897,12 @@ string? HealthGuard(List<Snap> snaps, Retention ret, Guards gd)
             return $"newest daily churned {100.0 * nwr / nrf:F0}% ({nwr / 1048576}MiB written vs {nrf / 1048576}MiB referenced, > {gd.MaxDailyChurnPct}%) — possible mass rewrite/encryption on source";
     }
 
-    if (snaps.Count < ret.DailyKeepDays)                                 // guard: population (note only)
-        Log($"  note: {snaps.Count} dailies < keep {ret.DailyKeepDays}, nothing beyond window");
+    // population note (informational): under the two-holds invariant nothing is droppable
+    // until the derived destroy depth of held keepers exists (a keeper ≈ one per ISO-week/month).
+    int keeperWeeks = snaps.Select(s => (ISOWeek.GetYear(s.Date), ISOWeek.GetWeekOfYear(s.Date))).Distinct().Count();
+    int destroyDepth = checked(ret.HoldDepth * ret.DestroyMultiplier);
+    if (keeperWeeks < destroyDepth)
+        Log($"  note: only ~{keeperWeeks} held keeper(s) so far, need {destroyDepth} newer before any daily drops");
     return null;
 }
 
@@ -825,15 +938,15 @@ string? HealthGuard(List<Snap> snaps, Retention ret, Guards gd)
 // writes, not ~280) and is self-correcting: a snapshot that was a keeper last run but
 // is now superseded (demotion) has its tags inherited away and its monthly hold released
 // — without that release a demoted monthly's hold would later block its own destroy.
-bool Promote(Snap s, DateTime keepUntil, string tier, bool monthlyHeld)
+bool Promote(Snap s, DateTime keepUntil, string tier, HashSet<string> heldKeeperTags)
 {
     bool success = true;
     if (tier == "daily")
     {
-        // Demotion: clear the audit tags first, and only once that's known-good release the
-        // protective monthly hold (and only if it's actually present). If an inherit fails
-        // the snapshot KEEPS its hold (stays protected) and the run SKIPs the dataset; the
-        // cleanup retries next run.
+        // Demotion: clear the audit tags first, and only once that's known-good release ALL of
+        // our protective holds (weekly and/or monthly, whichever it carries). If an inherit
+        // fails the snapshot KEEPS its holds (stays protected) and the run SKIPs the dataset;
+        // the cleanup retries next run.
         if (s.Tier != null)
         {
             var (c, _, e) = Exec("zfs", "inherit", propTier, s.Name);
@@ -845,13 +958,14 @@ bool Promote(Snap s, DateTime keepUntil, string tier, bool monthlyHeld)
             var (c, _, e) = Exec("zfs", "inherit", propKeep, s.Name);
             if (c != 0) { Log($"    META:REMOVE {Short(s.Name)} keep_until FAILED: {e.Trim()}"); success = false; }
         }
-        if (success && monthlyHeld)           // demoted monthly: drop the now-unneeded hold last
-        {
-            var (rc, _, re) = Exec("zfs", "release", tagMonthly, s.Name);
-            if (rc != 0 && !re.Contains("no such hold") && !re.Contains("not found"))
-            { Log($"    HOLD:REMOVE {Short(s.Name)} FAILED: {re.Trim()}"); success = false; }
-            else Log($"  HOLD:REMOVE {s.Name} (demoted to daily)");
-        }
+        if (success)                          // demoted keeper: drop the now-unneeded hold(s) last
+            foreach (var tag in heldKeeperTags)
+            {
+                var (rc, _, re) = Exec("zfs", "release", tag, s.Name);
+                if (rc != 0 && !re.Contains("no such hold") && !re.Contains("not found"))
+                { Log($"    HOLD:REMOVE {Short(s.Name)} FAILED: {re.Trim()}"); success = false; }
+                else Log($"  HOLD:REMOVE {s.Name} (demoted to daily)");
+            }
         return success;
     }
 
@@ -871,29 +985,30 @@ bool Promote(Snap s, DateTime keepUntil, string tier, bool monthlyHeld)
         if (c != 0) { Log($"    META:{metaVerb} {Short(s.Name)} FAILED: {e.Trim()}"); success = false; }
         else Log($"  META:{metaVerb} {s.Name} ({tier}): {string.Join(" ", props)}");
     }
-    // Hold invariant: held ⇔ tier is monthly. Create the hold on a monthly keeper that lacks
-    // it; drop it from a weekly keeper that still carries one (a former month-newest now
-    // superseded — without this, every Sunday would accumulate a stray monthly hold).
-    if (tier == "monthly")
+    // Hold invariant: held ⇔ keeper, with the tag matching the tier (monthly→<ns>:monthly,
+    // weekly→<ns>:weekly). ADD the wanted tag first (if missing), and only once it is confirmed
+    // present RELEASE any wrong-tier tag — add-then-release, so a snapshot is never transiently
+    // unheld across a tier change (e.g. weekly→monthly).
+    string wantTag  = tier == "monthly" ? tagMonthly : tagWeekly;
+    string otherTag = tier == "monthly" ? tagWeekly  : tagMonthly;
+    bool wantHeld = heldKeeperTags.Contains(wantTag);
+    if (!wantHeld)
     {
-        if (!monthlyHeld)
-        {
-            var (c, _, e) = Exec("zfs", "hold", tagMonthly, s.Name);
-            if (c == 0)
-                Log($"  HOLD:ADD {s.Name} (monthly keeper, prune ~{keepUntil:yyyy-MM-dd})");
-            else if (e.Contains("already") || e.Contains("exists"))
-                { /* idempotent: hold already present (race) */ }
-            else
-                { Log($"    HOLD:ADD {Short(s.Name)} FAILED: {e.Trim()}"); success = false; }
-        }
+        var (c, _, e) = Exec("zfs", "hold", wantTag, s.Name);
+        if (c == 0)
+            { Log($"  HOLD:ADD {s.Name} ({tier} keeper, prune ~{keepUntil:yyyy-MM-dd})"); wantHeld = true; }
+        else if (e.Contains("already") || e.Contains("exists"))
+            wantHeld = true;   // idempotent: hold already present (race)
+        else
+            { Log($"    HOLD:ADD {Short(s.Name)} FAILED: {e.Trim()}"); success = false; }
     }
-    else if (monthlyHeld)   // weekly keeper still holding a monthly tag → drop it
+    if (wantHeld && heldKeeperTags.Contains(otherTag))   // wrong-tier hold left over → release it
     {
-        var (rc, _, re) = Exec("zfs", "release", tagMonthly, s.Name);
+        var (rc, _, re) = Exec("zfs", "release", otherTag, s.Name);
         if (rc != 0 && !re.Contains("no such hold") && !re.Contains("not found"))
             { Log($"    HOLD:REMOVE {Short(s.Name)} FAILED: {re.Trim()}"); success = false; }
         else
-            Log($"  HOLD:REMOVE {s.Name} (monthly→weekly)");
+            Log($"  HOLD:REMOVE {s.Name} ({(tier == "monthly" ? "weekly→monthly" : "monthly→weekly")})");
     }
     return success;
 }
@@ -968,8 +1083,6 @@ void FlushLog(List<string>? logLines = null)
 }
 
 static DateTime Later(DateTime a, DateTime b) => a > b ? a : b;
-static bool SameIsoWeek(DateTime a, DateTime b) =>
-    ISOWeek.GetYear(a) == ISOWeek.GetYear(b) && ISOWeek.GetWeekOfYear(a) == ISOWeek.GetWeekOfYear(b);
 static string Short(string snap) => snap[(snap.IndexOf('@') + 1)..];
 
 // InformationalVersion is "<Version>+<full-sha>" when built with -p:SourceRevisionId;
@@ -983,6 +1096,6 @@ static string GetVersion()
     return (plus > 0 && info.Length > plus + 8) ? info[..(plus + 8)] : info;
 }
 
-record Retention(int DailyKeepDays, int WeeklyKeepDays, int MonthlyKeepDays);
+record Retention(int DailyKeepDays, int WeeklyKeepDays, int MonthlyKeepDays, int HoldDepth, int DestroyMultiplier);
 record Guards(int MaxDeletePerRun, int RecentWindowDays, int MaxDailyAgeHours, int MaxDailyShrinkPct, int MaxDailyChurnPct);
 record Snap(string Name, DateTime Date, long? KeepUntil, string? Tier, long? Referenced = null, long? Written = null);

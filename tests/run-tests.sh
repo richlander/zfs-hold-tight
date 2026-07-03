@@ -43,6 +43,49 @@ nonkeeper_date() {
 }
 DEMOTED_DATE="$(nonkeeper_date)"
 
+# A newest date for the small INVARIANT fixtures (T34/T36/T37): the most recent Wednesday with
+# day-of-month >= 5. Wednesday guarantees Mon/Tue/Wed share one ISO week (so within-week days are
+# non-keepers), and dom>=5 keeps a 5-day fixture inside one calendar month. Computed (not a fixed
+# offset) so the keeper structure is deterministic across the whole calendar.
+pick_N() {
+  local off cand dow dom
+  for off in $(seq 0 40); do
+    cand=$(date -u -d "$ADATE -$off days" +%Y-%m-%d)
+    dow=$(date -u -d "$cand" +%u); dom=$(date -u -d "$cand" +%d)
+    [ "$dow" = 3 ] && [ "$((10#$dom))" -ge 5 ] && { echo "$cand"; return; }
+  done
+  date -u -d "$ADATE -7 days" +%Y-%m-%d
+}
+INV_N="$(pick_N)"
+inv_day() { date -u -d "$INV_N -$1 days" +%Y-%m-%d; }   # $1 = days before INV_N
+
+# inv_config <holdDepth|-> <destroyMultiplier|-> : write an invariant-test config.
+# Relaxes freshness + window guards so a mid-week INV_N can be "newest", and lifts the
+# delete cap so the tiny doomed set is not circuit-broken. Defaults are holdDepth=1,
+# destroyMultiplier=2, so the derived destroy depth is 2 newer held keepers.
+inv_config() {
+  local hd="$1" dm="$2" line=""
+  [ "$hd" != "-" ] && line="$line \"holdDepth\": $hd,"
+  [ "$dm" != "-" ] && line="$line \"destroyMultiplier\": $dm,"
+  cat > "$WORK/cfg_inv.json" <<EOF
+{ "logDir": "$WORK/logs", "zfsPath": "$WORK/bin/zfs", $line
+  "guardMaxDeletePerRun": 50, "guardRecentWindowDays": 3, "guardMaxDailyAgeHours": 720,
+  "retentionPolicies": { "baseline": { "dailyKeepDays": 30, "weeklyKeepDays": 1825, "monthlyKeepDays": 1825 } },
+  "datasets": { "archive/home/rich": "baseline" } }
+EOF
+}
+# build the 5-day invariant fixture INV_N-4 .. INV_N (all at TIME) into $1
+inv_feed() { local f="$1" i; : > "$f"; for i in 4 3 2 1 0; do printf '%s\t-\t-\n' "$(snapname "$(inv_day "$i")")"; done > "$f"; }
+# run with the invariant config
+run_inv() {
+  local snaps="$1"; shift
+  rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"
+  cp "$snaps" "$WORK/fz/snaps"; : > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
+  OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/cfg_inv.json" \
+         ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc "$@" 2>/dev/null)"
+  RC=$?; OPS="$WORK/fz/ops.log"
+}
+
 cat > "$WORK/config.json" <<EOF
 { "logDir": "$WORK/logs", "zfsPath": "$WORK/bin/zfs", "guardMaxDeletePerRun": 5, "guardRecentWindowDays": 7,
   "retentionPolicies": { "baseline": { "dailyKeepDays": 30, "weeklyKeepDays": 1825, "monthlyKeepDays": 1825 } },
@@ -313,10 +356,10 @@ OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
   && ok "T30 weekly keeper's stray monthly hold released (held ⇔ monthly)" \
   || bad "T30 (ops: $(grep "$wkonly" "$WORK/fz/ops.log" | tr '\n' ';'))"
 
-# ---- T31: per-dataset line carries the next expected prune date ----
+# ---- T31: per-dataset line reports the new model (keeper held-counts + the daily-tail frontier) ----
 run_tool "$WORK/healthy" --prune --force
-echo "$OUT" | grep -qE 'next prune [0-9]{4}-[0-9]{2}-[0-9]{2}' \
-  && ok "T31 summary line shows next prune date" || bad "T31 (out: $(echo "$OUT"|grep next || echo none))"
+echo "$OUT" | grep -qE 'monthly \+ [0-9]+ weekly held; daily tail: hold=[0-9]+, destroy>=[0-9]+ holds, to [0-9]{4}-[0-9]{2}-[0-9]{2}' \
+  && ok "T31 summary line shows keeper held-counts + hold/destroy frontier" || bad "T31 (out: $(echo "$OUT"|grep -i tail || echo none))"
 
 # ---- T32: --version prints a version and exits 0 (works without config) ----
 run_tool "$WORK/healthy" --version
@@ -329,7 +372,10 @@ H=$(echo "$OUT" | grep -c '^  HOLD:ADD '); M=$(echo "$OUT" | grep -cE '^  META:(
 { [ "$H" -gt 0 ] && [ "$M" -gt 0 ] && [ "$D" -gt 0 ]; } \
   && ok "T33 distinct log tokens HOLD:ADD/META:*/SNAP:DESTROY ($H/$M/$D)" || bad "T33 H=$H M=$M D=$D"
 
-# ---- T13: demoted monthly keeper -> hold released + tags inherited, not destroyed ----
+# ---- T13: a snapshot no longer a keeper gets its keeper metadata + hold CLEANED UP (demotion):
+#          <ns>:tier is inherited away and the <ns>:monthly hold released. (Under the two-holds
+#          invariant this mid-week daily is legitimately below the frontier, so whether it is then
+#          pruned is calendar-dependent; T13 asserts only the cleanup, T26 covers the fail-safe.) ----
 rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"
 recent="$DEMOTED_DATE"; demoted="$(snapname "$recent")"
 # stamp it as a stale monthly (col3=monthly) with a zht:monthly hold, though it is NOT the month keeper
@@ -339,9 +385,101 @@ OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
        ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --prune --force 2>/dev/null)"
 { grep -qx "release zht:monthly $demoted" "$WORK/fz/ops.log" \
   && grep -qx "inherit zht:tier $demoted" "$WORK/fz/ops.log" \
-  && ! grep -qx "destroy $demoted" "$WORK/fz/ops.log"; } \
-  && ok "T13 demoted monthly: hold released + tags inherited, kept" \
+  && ! echo "$OUT" | grep -qi "SKIP"; } \
+  && ok "T13 demoted monthly: hold released + tags inherited (metadata cleaned up)" \
   || bad "T13 (ops: $(grep "$demoted" "$WORK/fz/ops.log" | tr '\n' ';'))"
+
+# ==== two-holds INVARIANT tests ====
+# Fixture: INV_N-4(Sat) INV_N-3(Sun) INV_N-2(Mon) INV_N-1(Tue) INV_N(Wed).
+#   ISO weeks: {N-2,N-1,N}->keeper N ; {N-4,N-3}->keeper N-3.  Month keeper: N.
+#   Held keepers newest-first: [N, N-3].  With holdDepth=1 and destroyMultiplier=2,
+#   derived destroy depth = 2, frontier = N-3.
+#   => N-4 has TWO newer held keepers (N, N-3) -> DROPPED.
+#      N-2/N-1 have ONE newer held keeper (N)  -> KEPT.
+
+# ---- T34: core invariant — exactly ONE newer held keeper keeps a daily, TWO drops it ----
+inv_config - -                                 # default holdDepth=1, destroyMultiplier=2
+inv_feed "$WORK/inv"
+run_inv "$WORK/inv" --prune --force
+d4="$(snapname "$(inv_day 4)")"; d3="$(snapname "$(inv_day 3)")"
+d2="$(snapname "$(inv_day 2)")"; d1="$(snapname "$(inv_day 1)")"
+{ grep -qx "destroy $d4" "$OPS" \
+  && ! grep -qx "destroy $d2" "$OPS" && ! grep -qx "destroy $d1" "$OPS" \
+  && ! grep -qx "destroy $d3" "$OPS"; } \
+  && ok "T34 invariant: 2 newer keepers drop a daily, 1 newer keeper keeps it" \
+  || bad "T34 (destroys: $(grep '^destroy' "$OPS" | tr '\n' ';'))"
+
+# ---- T35: weekly keepers now receive a real zfs hold (<ns>:weekly) ----
+{ grep -qx "hold zht:weekly $d3" "$OPS" && ! grep -qx "destroy $d3" "$OPS"; } \
+  && ok "T35 weekly keeper gets a zfs hold (zht:weekly), not destroyed" \
+  || bad "T35 (ops for $d3: $(grep "$d3" "$OPS" | tr '\n' ';'))"
+
+# ---- T36: destroyMultiplier derives DESTROY from HOLD — higher multiplier deepens the tail ----
+inv_config 1 3                                 # need THREE newer held keepers; only two exist
+run_inv "$WORK/inv" --prune --force
+drop3=$(grep -c '^destroy' "$OPS"); drop3=${drop3:-0}
+inv_config 1 1                                 # ONE newer held keeper suffices
+run_inv "$WORK/inv" --prune --force
+{ [ "$drop3" = 0 ] && grep -qx "destroy $d4" "$OPS" \
+  && grep -qx "destroy $d2" "$OPS" && grep -qx "destroy $d1" "$OPS"; } \
+  && ok "T36 destroyMultiplier tunes the frontier (=3 keeps all dailies; =1 drops N-1/N-2/N-4)" \
+  || bad "T36 (drop@3=$drop3, destroys@1: $(grep '^destroy' "$OPS" | tr '\n' ';'))"
+
+# ---- T36b: legacy minNewerHolds remains a compatibility alias for derived destroy depth ----
+cat > "$WORK/cfg_inv.json" <<EOF
+{ "logDir": "$WORK/logs", "zfsPath": "$WORK/bin/zfs", "minNewerHolds": 3,
+  "guardMaxDeletePerRun": 50, "guardRecentWindowDays": 3, "guardMaxDailyAgeHours": 720,
+  "retentionPolicies": { "baseline": { "dailyKeepDays": 30, "weeklyKeepDays": 1825, "monthlyKeepDays": 1825 } },
+  "datasets": { "archive/home/rich": "baseline" } }
+EOF
+run_inv "$WORK/inv" --prune --force
+drop_legacy=$(grep -c '^destroy' "$OPS"); drop_legacy=${drop_legacy:-0}
+[ "$drop_legacy" = 0 ] \
+  && ok "T36b legacy minNewerHolds=3 maps to destroy depth 3" \
+  || bad "T36b (legacy destroys: $(grep '^destroy' "$OPS" | tr '\n' ';'))"
+
+
+# ---- T36c: legacy minNewerHolds cannot be mixed with the new hold/destroy keys ----
+cat > "$WORK/cfg_inv.json" <<EOF
+{ "logDir": "$WORK/logs", "zfsPath": "$WORK/bin/zfs", "minNewerHolds": 2, "destroyMultiplier": 2,
+  "guardMaxDeletePerRun": 50, "guardRecentWindowDays": 3, "guardMaxDailyAgeHours": 720,
+  "retentionPolicies": { "baseline": { "dailyKeepDays": 30, "weeklyKeepDays": 1825, "monthlyKeepDays": 1825 } },
+  "datasets": { "archive/home/rich": "baseline" } }
+EOF
+run_inv "$WORK/inv" --prune --force
+[ "$RC" = 2 ] \
+  && ok "T36c mixing legacy minNewerHolds with destroyMultiplier is rejected" \
+  || bad "T36c (rc=$RC, out: $(echo "$OUT" | tail -1))"
+
+# ---- T37: on the healthy feed, EVERY destroyed non-keeper has >=2 surviving newer keepers
+#          (the tool never violates the two-holds invariant) ----
+run_tool "$WORK/healthy" --prune --force
+grep '^destroy' "$OPS" | awk '{print $2}' | sed -E 's/.*autosnap_([0-9-]+)_.*/\1/' | sort -u > "$WORK/ddates"
+cat "$WORK/mk" "$WORK/wk" | sort -u > "$WORK/keeperdates"   # $WORK/mk,$WORK/wk built in T2 (all keepers survive)
+inv_viol=0
+while read -r dd; do
+  cnt=$(awk -v d="$dd" '$1>d{c++} END{print c+0}' "$WORK/keeperdates")
+  [ "$cnt" -lt 2 ] && { echo "    $dd has only $cnt newer keepers"; inv_viol=1; }
+done < "$WORK/ddates"
+{ [ "$inv_viol" = 0 ] && [ -s "$WORK/ddates" ]; } \
+  && ok "T37 no invariant violation: every destroyed daily has >=2 surviving newer keepers" \
+  || bad "T37 inv_viol=$inv_viol destroyed=$(wc -l < "$WORK/ddates")"
+
+# ---- T38: weekly->monthly tier change SWAPS the hold (adds monthly, then releases weekly;
+#          never transiently unheld, no stray double-hold after convergence) ----
+rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"; cp "$WORK/healthy" "$WORK/fz/snaps"
+newestsnap="$(snapname "$ADATE")"                 # the newest = this month's keeper (monthly)
+printf '%s\tzht:weekly\t-\n' "$newestsnap" > "$WORK/fz/holds"   # but currently wrongly held as weekly
+: > "$WORK/fz/ops.log"
+OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
+       ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --prune --force 2>/dev/null)"
+addln=$(grep -n "^hold zht:monthly $newestsnap" "$WORK/fz/ops.log" | head -1 | cut -d: -f1)
+relln=$(grep -n "^release zht:weekly $newestsnap" "$WORK/fz/ops.log" | head -1 | cut -d: -f1)
+{ [ -n "$addln" ] && [ -n "$relln" ] && [ "$addln" -lt "$relln" ] \
+  && grep -qP "^$(printf '%s' "$newestsnap" | sed 's/[.[\*^$]/\\&/g')\tzht:monthly\t" "$WORK/fz/holds" \
+  && ! grep -qP "^$(printf '%s' "$newestsnap" | sed 's/[.[\*^$]/\\&/g')\tzht:weekly\t" "$WORK/fz/holds"; } \
+  && ok "T38 weekly->monthly swaps the hold add-then-release (no unheld gap, no double-hold)" \
+  || bad "T38 (add@$addln rel@$relln, final holds: $(grep "$newestsnap" "$WORK/fz/holds" | tr '\n' ';'))"
 
 echo "== $PASS passed, $FAIL failed =="
 exit $([ "$FAIL" = 0 ] && echo 0 || echo 1)
