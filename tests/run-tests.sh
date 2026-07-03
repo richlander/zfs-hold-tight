@@ -22,6 +22,27 @@ TIME=$(date -u -d "@$ANCHOR" +%H:%M:%S)
 ADATE=$(date -u -d "@$ANCHOR" +%Y-%m-%d)
 snapname() { echo "archive/home/rich@autosnap_$1_${TIME}_daily"; }   # $1=YYYY-MM-DD
 
+# A fixture date that is provably a PLAIN daily — neither an ISO-week keeper (a Sunday, the
+# newest day of its week) nor a month keeper (a month-end, the newest day of its month) — while
+# still inside the 30d daily window with a later same-week & same-month daily present. The
+# demotion tests (T13/T26) need this: a fixed "-5 days" offset silently lands on a Sunday or a
+# month boundary some weeks, and the tool then CORRECTLY tags the snapshot weekly/monthly rather
+# than clearing it, so the test — not the tool — breaks. Computing it keeps the suite
+# deterministic across the whole calendar, not just across the hour of day.
+nonkeeper_date() {
+  local off cand dow m nm
+  for off in $(seq 8 20); do
+    cand=$(date -u -d "$ADATE -$off days" +%Y-%m-%d)
+    dow=$(date -u -d "$cand" +%u)                 # 1=Mon .. 7=Sun
+    m=$(date -u -d "$cand" +%m); nm=$(date -u -d "$cand +1 day" +%m)
+    [ "$dow" = 7 ] && continue                    # Sunday    -> ISO-week keeper
+    [ "$m" != "$nm" ] && continue                 # month-end -> month keeper
+    echo "$cand"; return 0
+  done
+  date -u -d "$ADATE -10 days" +%Y-%m-%d          # fallback (unreachable in practice)
+}
+DEMOTED_DATE="$(nonkeeper_date)"
+
 cat > "$WORK/config.json" <<EOF
 { "logDir": "$WORK/logs", "zfsPath": "$WORK/bin/zfs", "guardMaxDeletePerRun": 5, "guardRecentWindowDays": 7,
   "retentionPolicies": { "baseline": { "dailyKeepDays": 30, "weeklyKeepDays": 1825, "monthlyKeepDays": 1825 } },
@@ -243,7 +264,7 @@ OUT="$(FAKE_ZFS_DIR="$WORK/fz" FAKE_ZFS_FAIL=hold ZFS_HOLD_TIGHT_CONFIG="$WORK/c
 # ---- T26: on demotion, if metadata cleanup fails the monthly hold is NOT released
 #          (snapshot stays protected) and the dataset HOLDs (finding 3 ordering) ----
 rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"
-recent=$(date -u -d "$ADATE -5 days" +%Y-%m-%d); demoted="$(snapname "$recent")"
+recent="$DEMOTED_DATE"; demoted="$(snapname "$recent")"
 awk -F'\t' -v d="$demoted" 'BEGIN{OFS="\t"} $1==d{$3="monthly"} {print}' "$WORK/healthy" > "$WORK/fz/snaps"
 printf '%s\tzht:monthly\t-\n' "$demoted" > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
 OUT="$(FAKE_ZFS_DIR="$WORK/fz" FAKE_ZFS_FAIL=inherit ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
@@ -310,7 +331,7 @@ H=$(echo "$OUT" | grep -c '^  HOLD:ADD '); M=$(echo "$OUT" | grep -cE '^  META:(
 
 # ---- T13: demoted monthly keeper -> hold released + tags inherited, not destroyed ----
 rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"
-recent=$(date -u -d "$ADATE -5 days" +%Y-%m-%d); demoted="$(snapname "$recent")"
+recent="$DEMOTED_DATE"; demoted="$(snapname "$recent")"
 # stamp it as a stale monthly (col3=monthly) with a zht:monthly hold, though it is NOT the month keeper
 awk -F'\t' -v d="$demoted" 'BEGIN{OFS="\t"} $1==d{$3="monthly"} {print}' "$WORK/healthy" > "$WORK/fz/snaps"
 printf '%s\tzht:monthly\t-\n' "$demoted" > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
