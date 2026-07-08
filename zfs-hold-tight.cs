@@ -481,16 +481,16 @@ foreach (var (ds, ret) in retention)
         doomed.Add(s.Name);
     }
 
-    // ---- volume circuit-breaker — BEFORE any mutation, so a capped dataset SKIPs cleanly
-    //      without first issuing a burst of set/hold/inherit writes ----
-    if (doomed.Count > gd.MaxDeletePerRun && !force)
-    {
+    // ---- volume circuit-breaker: caps DESTROYS only. Keeper hold-tagging and demotion
+    //      cleanup below still run on a capped dataset — "on a worry, protection only
+    //      ever increases" (same principle as the HealthGuard branch above). Gating Promote
+    //      behind this guard would leave newly-due weekly/monthly keepers unheld for as long
+    //      as the dataset stays capped: a protection regression masquerading as a safety win.
+    bool volumeCapped = doomed.Count > gd.MaxDeletePerRun && !force;
+    if (volumeCapped)
         Log($"{ds}: WORRY - would delete {doomed.Count} > cap {gd.MaxDeletePerRun}; {keepersHeld}/{keeperNames.Count} keepers held, daily tail to {tail} (rerun with --force if intended)");
-        Log($"{ds}: SKIP - volume circuit-breaker (no deletions)");
-        held.Add($"{ds}: volume {doomed.Count}>cap"); continue;
-    }
 
-    // ---- tag keepers / clean up demotions (prune only, now that the run will proceed) ----
+    // ---- tag keepers / clean up demotions (prune only) ----
     if (prune)
     {
         var promoteErrors = new List<string>();  // snapshots whose metadata/hold write failed
@@ -516,6 +516,12 @@ foreach (var (ds, ret) in retention)
             metadataErrors.AddRange(promoteErrors.Select(n => $"  {ds}@{n}"));
             continue;
         }
+    }
+
+    if (volumeCapped)
+    {
+        Log($"{ds}: SKIP - volume circuit-breaker (no deletions)");
+        held.Add($"{ds}: volume {doomed.Count}>cap"); continue;
     }
 
     int kept = snaps.Count - doomed.Count;

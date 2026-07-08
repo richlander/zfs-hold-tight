@@ -314,13 +314,16 @@ OUT="$(FAKE_ZFS_DIR="$WORK/fz" FAKE_ZFS_FAIL=inherit ZFS_HOLD_TIGHT_CONFIG="$WOR
 { ! grep -qx "release zht:monthly $demoted" "$WORK/fz/ops.log" && echo "$OUT" | grep -qi "SKIP"; } \
   && ok "T26 demotion: inherit-fail keeps the hold + SKIPs dataset" || bad "T26 (out: $(echo "$OUT"|tail -1))"
 
-# ---- T28: a capped --prune (no --force) HOLDs without mutating anything first (finding 1) ----
+# ---- T28: a capped --prune (no --force) still HOLDs/tags keepers - protection only ever
+#          increases, even when destroys are capped (reversed 2026-07-08: hold-tagging must
+#          not be gated behind the volume circuit-breaker) - but performs zero destroys ----
 rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"; cp "$WORK/healthy" "$WORK/fz/snaps"; : > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
 OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
        ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --prune 2>/dev/null)"
-muts=$(grep -cE '^(set|hold|inherit|release|destroy)' "$WORK/fz/ops.log"); muts=${muts:-0}
-{ echo "$OUT" | grep -qi "cap" && [ "$muts" = 0 ]; } \
-  && ok "T28 capped --prune SKIPs with zero metadata writes" || bad "T28 muts=$muts (out: $(echo "$OUT"|tail -1))"
+destroys=$(grep -cE '^destroy' "$WORK/fz/ops.log"); destroys=${destroys:-0}
+holds=$(grep -cE '^hold' "$WORK/fz/ops.log"); holds=${holds:-0}
+{ echo "$OUT" | grep -qi "cap" && [ "$destroys" = 0 ] && [ "$holds" -gt 0 ]; } \
+  && ok "T28 capped --prune still holds/tags keepers, zero destroys" || bad "T28 destroys=$destroys holds=$holds (out: $(echo "$OUT"|tail -1))"
 
 # ---- T27: monthly keepers already held are NOT re-held every prune (finding 3) ----
 rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"; cp "$WORK/healthy" "$WORK/fz/snaps"; : > "$WORK/fz/ops.log"
