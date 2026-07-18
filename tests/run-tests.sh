@@ -114,12 +114,25 @@ run_tool() {
          ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc "$@" 2>/dev/null)"
   RC=$?; OPS="$WORK/fz/ops.log"
 }
+# establish_oldest <src-file> <dst-file>: copy src to dst, pre-tagging its OLDEST entry as
+# an already-held monthly keeper — simulates "this dataset has prior history" for tests
+# exercising behavior that's gated on being established (routine volume circuit-breaker,
+# the cold-start floor's non-blocked path), without needing a real prior --force run.
+establish_oldest() {
+  local src="$1" dst="$2" oldest
+  oldest="$(sort "$src" | head -1 | cut -f1)"
+  awk -F'\t' -v OFS='\t' -v s="$oldest" '$1==s{$2=9999999999;$3="monthly"} {print}' "$src" > "$dst"
+}
 
 echo "== Target: $TARGET =="
 gen_feed 2025-06-01 > "$WORK/healthy"
+# An "established" variant (one entry pre-tagged) for tests exercising the ROUTINE volume
+# circuit-breaker specifically — the cold-start floor (unestablished + nonzero doomed)
+# would otherwise preempt it, since $WORK/healthy itself is all tier=-.
+establish_oldest "$WORK/healthy" "$WORK/healthy_established"
 
 # ---- T1: healthy feed, dry-run, big backlog -> circuit-breaker HOLD, 0 destroys ----
-run_tool "$WORK/healthy"
+run_tool "$WORK/healthy_established"
 { echo "$OUT" | grep -qE "> cap.*keepers held, daily tail to" && [ "$(grep -c '^destroy' "$OPS")" = 0 ]; } \
   && ok "T1 healthy dry-run SKIP on circuit-breaker (worry line shows keepers held + tail), no destroys" || bad "T1 (out: $(echo "$OUT"|tail -1))"
 
@@ -155,10 +168,43 @@ run_tool "$WORK/fresh" --force
 { ! echo "$OUT" | grep -qi "SKIP"; } && ok "T3b fresh newest (10h) proceeds, no SKIP" || bad "T3b held a fresh feed (out: $(echo "$OUT"|tail -1))"
 
 # ---- T4: gap in last 7d -> HOLD ----
-gap=$(date -u -d "$ADATE -3 days" +%Y-%m-%d)
+# Must remove a day that's NEVER covered by the (now frontier-aware) guard 1 — i.e.
+# always >= the hold frontier, regardless of which weekday the suite runs on. The
+# frontier is at oldest "yesterday" (when today is a Monday, yesterday=last Sunday=the
+# just-closed week's keeper) and newer on every other day of the week, so "yesterday" is
+# the latest day that's provably never legitimately-pruned-and-therefore-excused.
+gap=$(date -u -d "$ADATE -1 days" +%Y-%m-%d)
 grep -v "$gap" "$WORK/healthy" > "$WORK/gap"
 run_tool "$WORK/gap" --force
 { echo "$OUT" | grep -qi "gap"; } && ok "T4 gap in window -> WORRY+SKIP" || bad "T4 (out: $(echo "$OUT"|tail -1))"
+
+# ---- T4b: gap deeper in the window, closer to the frontier boundary — T4 only ever
+#      exercises "yesterday" (trivially always on the checked side), so a bug that
+#      mis-scopes the frontier itself (an off-by-one, or holdFrontier computed a day too
+#      old) could ship undetected, since nothing else tests a gap that's real but sits
+#      nearer the boundary. Computed dynamically, mirroring nonkeeper_date()'s approach —
+#      the "checked, not yet excused" range shifts with which weekday "today" is, so no
+#      fixed offset works every day. The true frontier (2nd-newest keeper, minNewerHolds=2)
+#      is the more recent of the last CLOSED Sunday (weekly) and the last day of the
+#      PREVIOUS month (monthly) — near a month boundary the monthly keeper can be nearer
+#      to today than the last closed Sunday, so both must be considered or this degenerates
+#      to a gap the tool legitimately excuses (found by an independent review; a fixed
+#      day-of-week-only formula fails on ~53/730 calendar dates, clustered in the first few
+#      days of a month). Degenerates to the same day T4 already covers on a Monday anchor
+#      (the checked range is only 1 day wide that day); every other day it exercises
+#      meaningfully deeper, distinct coverage. ----
+dow=$(date -u -d "$ADATE" +%u)                       # 1=Mon .. 7=Sun
+back_to_frontier=$(( dow == 7 ? 7 : dow ))            # days back to the last CLOSED Sunday
+last_sunday=$(date -u -d "$ADATE -$back_to_frontier days" +%Y-%m-%d)
+prev_month_end=$(date -u -d "$(date -u -d "$ADATE" +%Y-%m-01) -1 day" +%Y-%m-%d)
+frontier_date="$last_sunday"
+[[ "$prev_month_end" > "$frontier_date" ]] && frontier_date="$prev_month_end"
+deep_gap=$(date -u -d "$frontier_date +1 day" +%Y-%m-%d)   # just inside the checked range
+yesterday=$(date -u -d "$ADATE -1 days" +%Y-%m-%d)
+[[ "$deep_gap" > "$yesterday" ]] && deep_gap="$yesterday"  # never target "today" itself
+grep -v "$deep_gap" "$WORK/healthy" > "$WORK/gap2"
+run_tool "$WORK/gap2" --force
+{ echo "$OUT" | grep -qi "gap"; } && ok "T4b gap deeper in window, near the frontier boundary -> WORRY+SKIP" || bad "T4b (gap day=$deep_gap, out: $(echo "$OUT"|tail -1))"
 
 # ---- T5: future-dated snapshot -> HOLD ----
 cp "$WORK/healthy" "$WORK/future"
@@ -188,14 +234,14 @@ run_tool "$WORK/healthy" --check-holds
 { { [ "$RC" = 0 ] || [ "$RC" = 1 ]; } && echo "$OUT" | grep -qi "check-holds"; } \
   && ok "T9 --check-holds wired" || bad "T9 (rc=$RC)"
 
-# ---- T10: adhoc-held expired snapshot skipped, not destroy-failed (guard 12) ----
+# ---- T10: adhoc-held expired snapshot skipped, not destroy-failed (guard 14) ----
 rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"; cp "$WORK/healthy" "$WORK/fz/snaps"
 held="$(snapname 2025-06-15)"                      # old, not a keeper, expired
 printf '%s\tzht:adhoc\t-\n' "$held" > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
 OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
        ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --prune --force 2>/dev/null)"
 { ! grep -qx "destroy $held" "$WORK/fz/ops.log"; } \
-  && ok "T10 adhoc-held expired snap not destroyed (guard 12)" || bad "T10 held snap destroyed"
+  && ok "T10 adhoc-held expired snap not destroyed (guard 14)" || bad "T10 held snap destroyed"
 
 # ---- T11: --hold-adhoc rejects target outside archive/ allowlist ----
 run_tool "$WORK/healthy" --hold-adhoc "tank/secret@autosnap_${ADATE}_${TIME}_daily"
@@ -275,7 +321,7 @@ run_tool "$WORK/healthy" --prune --dataset
 run_tool "$WORK/healthy" --doctor --dataset archive/does-not-exist
 [ "$RC" = 2 ] && ok "T21 unknown --dataset rejected in --doctor (rc=2)" || bad "T21 (rc=$RC)"
 
-# ---- T22: `zfs holds` failure SKIPs the dataset (can't verify guard 12), 0 destroys ----
+# ---- T22: `zfs holds` failure SKIPs the dataset (can't verify guard 14), 0 destroys ----
 rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"; cp "$WORK/healthy" "$WORK/fz/snaps"; : > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
 OUT="$(FAKE_ZFS_DIR="$WORK/fz" FAKE_ZFS_FAIL=holds ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
        ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --prune --force 2>/dev/null)"
@@ -297,6 +343,21 @@ OUT="$(FAKE_ZFS_DIR="$WORK/fz" FAKE_ZFS_FAIL=list ZFS_HOLD_TIGHT_CONFIG="$WORK/c
        ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --doctor 2>/dev/null)"; RC=$?
 [ "$RC" = 1 ] && ok "T24 --doctor nonzero on zfs list failure" || bad "T24 (rc=$RC)"
 
+# ---- T24b: --doctor's zfs-list failure detail must reach the PERSISTED LOG FILE, not
+#      just the console. ListDailies is a top-level local function; if it logged via a
+#      Log() resolved at ITS OWN declaration site (the outer top-level scope) instead of
+#      forwarding warnings back to the caller's own Log(), the detail would print to
+#      Console fine but never reach whichever function's FlushLog(lines) actually persists
+#      the log file — since --doctor keeps its own separate `lines` list.
+#      Log filename found via `ls -t` (most recently modified), not by independently
+#      recomputing `date -u +%F` in bash: the C# process stamps the filename with ITS OWN
+#      `now` at process start, so a separate bash `date` call afterward could disagree by
+#      one day if the run straddles UTC midnight — narrow, but a real source of flaky CI. ----
+logfile24b="$(ls -t "$WORK"/logs/zfs-hold-tight-*.log 2>/dev/null | head -1)"
+grep -q "ERROR: zfs list archive/home/rich failed:" "$logfile24b" \
+  && ok "T24b --doctor's zfs-list failure detail reaches the log file (not console-only)" \
+  || bad "T24b (logfile: $(cat "$logfile24b" 2>/dev/null | tr '\n' '|'))"
+
 # ---- T25: --fix returns nonzero when a hold fails (no false "repaired") ----
 rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"; cp "$WORK/healthy" "$WORK/fz/snaps"; : > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
 OUT="$(FAKE_ZFS_DIR="$WORK/fz" FAKE_ZFS_FAIL=hold ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
@@ -317,7 +378,7 @@ OUT="$(FAKE_ZFS_DIR="$WORK/fz" FAKE_ZFS_FAIL=inherit ZFS_HOLD_TIGHT_CONFIG="$WOR
 # ---- T28: a capped --prune (no --force) still HOLDs/tags keepers - protection only ever
 #          increases, even when destroys are capped (reversed 2026-07-08: hold-tagging must
 #          not be gated behind the volume circuit-breaker) - but performs zero destroys ----
-rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"; cp "$WORK/healthy" "$WORK/fz/snaps"; : > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
+rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"; cp "$WORK/healthy_established" "$WORK/fz/snaps"; : > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
 OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
        ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --prune 2>/dev/null)"
 destroys=$(grep -cE '^destroy' "$WORK/fz/ops.log"); destroys=${destroys:-0}
@@ -467,6 +528,231 @@ relln=$(grep -n "^release zht:weekly $newestsnap" "$WORK/fz/ops.log" | head -1 |
   && ! grep -qP "^$(printf '%s' "$newestsnap" | sed 's/[.[\*^$]/\\&/g')\tzht:weekly\t" "$WORK/fz/holds"; } \
   && ok "T38 weekly->monthly swaps the hold add-then-release (no unheld gap, no double-hold)" \
   || bad "T38 (add@$addln rel@$relln, final holds: $(grep "$newestsnap" "$WORK/fz/holds" | tr '\n' ';'))"
+
+# ---- T39/T40/T41/T42: cold-start floor — a dataset with no prior <ns>:tier (never
+#      established) requires --force for ANY nonzero doomed count, regardless of the
+#      configured guardMaxDeletePerRun (14, sized for a routine weekly batch on an
+#      established dataset), and Promote must NOT run while blocked (no "tier=" writes in
+#      ops.log) — that's the mechanism that stops a blocked run from self-clearing the
+#      floor. Once established, the SAME backlog proceeds under the routine cap with no
+#      --force needed. guardRecentWindowDays is widened to 10 here (vs. the 7 default)
+#      specifically so T42's regression check (does a prior prune's own destroys avoid
+#      falsely tripping guard 1) reliably has overlap to detect on every weekday — the
+#      hold frontier can land up to 6 days back depending on which day "today" is, and a
+#      7-day window doesn't always reach that far, making the check pass vacuously on
+#      Sat/Sun anchors regardless of whether the guard-1 fix is actually working. ----
+cat > "$WORK/cfg_cold.json" <<EOF
+{ "logDir": "$WORK/logs", "zfsPath": "$WORK/bin/zfs", "guardMaxDeletePerRun": 14, "guardRecentWindowDays": 10,
+  "retentionPolicies": { "baseline": { "dailyKeepDays": 30, "weeklyKeepDays": 1825, "monthlyKeepDays": 1825 } },
+  "datasets": { "archive/home/rich": "baseline" } }
+EOF
+gen_feed "$(date -u -d "$ADATE -20 days" +%Y-%m-%d)" > "$WORK/cold"   # ~21 raw days, all tier=-
+rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"; cp "$WORK/cold" "$WORK/fz/snaps"; : > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
+OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/cfg_cold.json" \
+       ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --prune 2>/dev/null)"
+{ echo "$OUT" | grep -qi "cold start" \
+  && [ "$(grep -c '^destroy' "$WORK/fz/ops.log")" = 0 ] \
+  && [ "$(grep -c 'hold ' "$WORK/fz/ops.log")" -gt 0 ] \
+  && [ "$(grep -c 'tier=' "$WORK/fz/ops.log")" = 0 ]; } \
+  && ok "T39 cold-start floor: unforced prune on never-processed dataset WORRYs, holds keepers, 0 destroys, Promote skipped (no tier writes)" \
+  || bad "T39 (out: $(echo "$OUT" | grep -i "cold start\|WORRY" | tr '\n' '|'); destroys=$(grep -c '^destroy' "$WORK/fz/ops.log"); tier-writes=$(grep -c 'tier=' "$WORK/fz/ops.log"))"
+
+rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"; cp "$WORK/cold" "$WORK/fz/snaps"; : > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
+OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/cfg_cold.json" \
+       ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --prune --force 2>/dev/null)"
+{ ! echo "$OUT" | grep -qi "cold start" \
+  && [ "$(grep -c '^destroy' "$WORK/fz/ops.log")" -gt 0 ] \
+  && [ "$(grep -c 'tier=' "$WORK/fz/ops.log")" -gt 0 ]; } \
+  && ok "T40 cold-start floor: --force bypasses it, Promote runs (tier written), real destroys happen" \
+  || bad "T40 (out: $(echo "$OUT" | grep -i "cold start\|WORRY" | tr '\n' '|'); destroys=$(grep -c '^destroy' "$WORK/fz/ops.log"); tier-writes=$(grep -c 'tier=' "$WORK/fz/ops.log"))"
+
+# T41: an ALREADY-established dataset (one snapshot pre-tagged, simulating a prior
+# completed prune) with a SMALL backlog proceeds under the routine cap (14) with NO
+# --force needed, and actually destroys something — proving the floor is specifically
+# about "never established," not just "backlog is nonzero." Uses its own short (~13-day)
+# fixture, NOT $WORK/cold (~21 days): a 21-day backlog's doomed count varies with which
+# weekday "today" is (11-17 depending on ISO-week alignment) and can exceed 14, in which
+# case even an established dataset legitimately gets volume-capped (0 destroys) — that's
+# correct guard-6 behavior, but it would make this test pass vacuously (no "cold start"
+# text appears either way) without proving what it claims. ~13 days keeps doomed
+# comfortably under 14 regardless of weekday, and asserting destroys>0 makes the test
+# fail loudly instead of passing vacuously if that assumption ever breaks.
+gen_feed "$(date -u -d "$ADATE -13 days" +%Y-%m-%d)" > "$WORK/small"
+establish_oldest "$WORK/small" "$WORK/small_established"
+rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"; cp "$WORK/small_established" "$WORK/fz/snaps"; : > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
+OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/cfg_cold.json" \
+       ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --prune 2>/dev/null)"
+{ ! echo "$OUT" | grep -qi "cold start" \
+  && ! echo "$OUT" | grep -qi "> cap" \
+  && [ "$(grep -c '^destroy' "$WORK/fz/ops.log")" -gt 0 ]; } \
+  && ok "T41 cold-start floor: an already-established dataset is NOT blocked by the floor, small backlog proceeds and destroys without --force" \
+  || bad "T41 (out: $(echo "$OUT" | grep -i "cold start\|WORRY" | tr '\n' '|'); destroys=$(grep -c '^destroy' "$WORK/fz/ops.log"))"
+
+# T42: the genuine multi-run lifecycle T39/T40/T41 approximate via pre-tagged fixtures —
+# T40's forced run against the SAME fixture dir (not wiped), then a second, unforced
+# run: does establishment actually carry over via persisted <ns>:tier (exercising the
+# tests/fake-zfs `set`-persistence this diff added), or does it only work because T41's
+# fixture was hand-tagged? Reuses the small (~13-day) backlog so the routine cap can't
+# confound the result.
+rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"; cp "$WORK/small" "$WORK/fz/snaps"; : > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
+FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/cfg_cold.json" \
+  ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --prune --force >/dev/null 2>&1
+first_destroys=$(grep -c '^destroy' "$WORK/fz/ops.log")
+: > "$WORK/fz/ops.log"   # clear ops.log only — snaps/holds carry forward, as a real second invocation would see
+OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/cfg_cold.json" \
+       ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --prune 2>/dev/null)"
+{ [ "$first_destroys" -gt 0 ] && ! echo "$OUT" | grep -qi "cold start" && ! echo "$OUT" | grep -qi "gap in last"; } \
+  && ok "T42 establishment persists across separate invocations (not just within one run) via real <ns>:tier writes, and the prior run's own destroys don't trip guard 1's gap check" \
+  || bad "T42 (first_destroys=$first_destroys, second out: $(echo "$OUT" | grep -i "cold start\|gap\|WORRY" | tr '\n' '|'))"
+
+# ---- T44: the COMPILED DEFAULT of guardMaxDeletePerRun is 14, not just a value every
+#      test config happens to set explicitly. Uses a config that OMITS the key entirely
+#      (unlike every other test config here), against the established ~21-day "$WORK/cold"
+#      backlog, whose doomed count (11-17, see T41's comment) straddles 14 depending on
+#      weekday — either branch below rules out the OLD default of 5: if it destroys
+#      without a cap trip, a backlog >5 got through uncapped; if it DOES cap (doomed
+#      15-17), the message must name "cap 14" specifically, which also pins the exact
+#      value (the no-cap-trip branch only proves >5, not =14). ----
+establish_oldest "$WORK/cold" "$WORK/cold_established"
+cat > "$WORK/cfg_nocap.json" <<EOF
+{ "logDir": "$WORK/logs", "zfsPath": "$WORK/bin/zfs", "guardRecentWindowDays": 10,
+  "retentionPolicies": { "baseline": { "dailyKeepDays": 30, "weeklyKeepDays": 1825, "monthlyKeepDays": 1825 } },
+  "datasets": { "archive/home/rich": "baseline" } }
+EOF
+rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"; cp "$WORK/cold_established" "$WORK/fz/snaps"; : > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
+OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/cfg_nocap.json" \
+       ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --prune 2>/dev/null)"
+destroys=$(grep -c '^destroy' "$WORK/fz/ops.log")
+if echo "$OUT" | grep -qi "> cap"; then
+  { echo "$OUT" | grep -q "> cap 14"; } \
+    && ok "T44 default guardMaxDeletePerRun is 14 (cap trip named it explicitly)" \
+    || bad "T44 (cap message didn't name 14: $(echo "$OUT" | grep -i "> cap"))"
+else
+  { [ "$destroys" -gt 5 ]; } \
+    && ok "T44 default guardMaxDeletePerRun is 14 (backlog >5 proceeded uncapped, ruling out the old default of 5)" \
+    || bad "T44 (destroys=$destroys, out: $(echo "$OUT" | tail -1))"
+fi
+
+# ---- T45/T46/T47/T48: --summary markdown table ----
+# T45: dense, gap-free feed -> header line + a clean single-row table (Continuity "✓").
+run_tool "$WORK/healthy" --summary
+{ echo "$OUT" | grep -q '^| Dataset | Monthlies | Weeklies | Dailies | Start | End | Continuity |$' \
+  && echo "$OUT" | grep -q "| archive/home/rich |" \
+  && echo "$OUT" | grep -q "| $ADATE | ✓ |"; } \
+  && ok "T45 --summary: gap-free feed -> header + clean row" \
+  || bad "T45 (out: $(echo "$OUT" | tail -3 | tr '\n' '|'))"
+
+# T46: a gap inside the daily tail (yesterday — always within the frontier, see T4's
+# reasoning, which this reuses) must show up in Continuity, not be silently excused.
+gap46=$(date -u -d "$ADATE -1 days" +%Y-%m-%d)
+grep -v "$gap46" "$WORK/healthy" > "$WORK/gap46"
+run_tool "$WORK/gap46" --summary
+echo "$OUT" | grep -q "$gap46" \
+  && ok "T46 --summary: gap in daily tail shown in Continuity" \
+  || bad "T46 (gap=$gap46, out: $(echo "$OUT" | tail -3 | tr '\n' '|'))"
+
+# T47: a gap 100 days back sits well beyond the frontier (holdFrontier is always <=7 days
+# back — see T4b's frontier derivation above — so 100 gives a wide safety margin) ->
+# excused, same "✓" as a genuinely gap-free feed. Same narrow scope as guard 1.
+gap47=$(date -u -d "$ADATE -100 days" +%Y-%m-%d)
+grep -v "$gap47" "$WORK/healthy" > "$WORK/gap47"
+run_tool "$WORK/gap47" --summary
+{ ! echo "$OUT" | grep -q "$gap47" && echo "$OUT" | grep -q '✓'; } \
+  && ok "T47 --summary: gap beyond the frontier is excused, not flagged" \
+  || bad "T47 (gap=$gap47, out: $(echo "$OUT" | tail -3 | tr '\n' '|'))"
+
+# T48: --since narrows the reported window — Start reflects the requested date (not the
+# feed's true oldest, 2025-06-01).
+since48=$(date -u -d "$ADATE -20 days" +%Y-%m-%d)
+run_tool "$WORK/healthy" --summary --since "$since48"
+echo "$OUT" | grep -q "| $since48 | $ADATE |" \
+  && ok "T48 --summary --since narrows Start to the requested date" \
+  || bad "T48 (since=$since48, out: $(echo "$OUT" | tail -3 | tr '\n' '|'))"
+
+# T49: --since is only clamped to a LOWER bound (oldest); a --since AFTER the newest
+# snapshot must not silently produce a Start>End row with a false "✓" Continuity (an
+# entirely out-of-range/empty window looking identical to a genuinely gap-free one) — it
+# must be reported explicitly instead.
+future49=$(date -u -d "$ADATE +30 days" +%Y-%m-%d)
+run_tool "$WORK/healthy" --summary --since "$future49"
+{ echo "$OUT" | grep -q "after the newest snapshot" && ! echo "$OUT" | grep -q "| $future49 | $ADATE | ✓ |"; } \
+  && ok "T49 --summary --since after newest is reported, not silently \"✓\"" \
+  || bad "T49 (since=$future49, out: $(echo "$OUT" | tail -3 | tr '\n' '|'))"
+
+# T50: a zfs-list failure during --summary must be reported ONLY as this row's own
+# "ERROR: zfs list failed (see log)" cell on stdout — not ALSO as a separate, untabulated
+# "ERROR: zfs list <ds> failed: ..." line, which would break the piped markdown's table
+# contiguity (nightly.sh pipes --summary's stdout straight to the pushed summary file) —
+# but the full
+# detail must still land in the day's LOG FILE (not just silently discarded).
+rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"; cp "$WORK/healthy" "$WORK/fz/snaps"; : > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
+OUT="$(FAKE_ZFS_DIR="$WORK/fz" FAKE_ZFS_FAIL=list ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
+       ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --summary 2>/dev/null)"
+logfile="$(ls -t "$WORK"/logs/zfs-hold-tight-*.log 2>/dev/null | head -1)"
+{ echo "$OUT" | grep -q "| archive/home/rich | — | — | — | — | — | ERROR: zfs list failed (see log) |" \
+  && ! echo "$OUT" | grep -qE '^ERROR: zfs list ' \
+  && grep -q "ERROR: zfs list archive/home/rich failed:" "$logfile"; } \
+  && ok "T50 --summary: zfs-list failure stays inside the table (no stray line) but full detail reaches the log file" \
+  || bad "T50 (out: $(echo "$OUT" | tr '\n' '|'); logfile: $(cat "$logfile" 2>/dev/null | tr '\n' '|'))"
+
+# T51: an unparseable-snapshot-date warning (a regex-shaped but out-of-range date, see T6's
+# $WORK/bad fixture) during --summary must be noted compactly in the Continuity cell — not
+# silently dropped (the risk quiet:true reintroduced for this warning type specifically,
+# distinct from T50's zfs-list-failure case) and not a stray untabulated console line
+# either; full detail must still reach the day's log file.
+run_tool "$WORK/bad" --summary
+logfile51="$(ls -t "$WORK"/logs/zfs-hold-tight-*.log 2>/dev/null | head -1)"
+{ echo "$OUT" | grep -q "snapshot(s) skipped, see log" \
+  && ! echo "$OUT" | grep -qE '^  WARNING: unparseable' \
+  && grep -q "WARNING: unparseable snapshot date, skipping:.*2026-13-45" "$logfile51"; } \
+  && ok "T51 --summary: unparseable-date warning noted in Continuity, full detail in log" \
+  || bad "T51 (out: $(echo "$OUT" | tail -3 | tr '\n' '|'); logfile: $(grep -c unparseable "$logfile51" 2>/dev/null))"
+
+# ---- T52: the hold frontier must never be anchored on a keeper that is ITSELF destroyed
+#      in the same run. If it were, a plain daily could be doomed because a keeper "N
+#      positions newer" than it still existed at the START of the run's frontier
+#      computation — but if that SAME keeper is independently past its own weekly/monthly
+#      retention, this run would destroy the keeper too, retroactively leaving the daily
+#      with fewer than minNewerHolds SURVIVING newer keepers. Reproduced with short
+#      weekly/monthly retention (10d) relative to minNewerHolds=3, so the 3rd-newest
+#      keeper is reliably already past its own retention (~14-21 days back at ~weekly
+#      cadence) by the time it would otherwise anchor the frontier. Not reachable with
+#      this tool's shipped 5-year retention defaults — this guards the general case. ----
+cfg52="$WORK/cfg_expiring_frontier.json"
+cat > "$cfg52" <<EOF
+{ "logDir": "$WORK/logs", "zfsPath": "$WORK/bin/zfs", "minNewerHolds": 3,
+  "guardMaxDeletePerRun": 200, "guardRecentWindowDays": 3, "guardMaxDailyAgeHours": 720,
+  "retentionPolicies": { "baseline": { "dailyKeepDays": 30, "weeklyKeepDays": 10, "monthlyKeepDays": 10 } },
+  "datasets": { "archive/home/rich": "baseline" } }
+EOF
+gen_feed "$(date -u -d "$ADATE -45 days" +%Y-%m-%d)" > "$WORK/expiring_frontier"
+establish_oldest "$WORK/expiring_frontier" "$WORK/expiring_frontier_established"
+
+rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"
+cp "$WORK/expiring_frontier_established" "$WORK/fz/snaps"; : > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
+FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$cfg52" ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" \
+  dotnet run "$TARGET" -- --no-hc --prune --force >/dev/null 2>&1
+
+# All structurally-elected keeper dates (newest-per-ISO-week ∪ newest-per-month) — same
+# awk pattern T2 already uses (line ~144-146) to compute $WORK/mk / $WORK/wk.
+awk -F'\t' '{print $1}' "$WORK/expiring_frontier" | sed -E 's/.*autosnap_([0-9-]+)_.*/\1/' > "$WORK/dates52"
+awk '{m=substr($1,1,7); last[m]=$1} END{for(k in last)print last[k]}' "$WORK/dates52" > "$WORK/mk52"
+while read -r d; do echo "$(date -u -d "$d" +%G-%V) $d"; done < "$WORK/dates52" \
+  | awk '{last[$1]=$2} END{for(k in last)print last[k]}' > "$WORK/wk52"
+cat "$WORK/mk52" "$WORK/wk52" | sort -u > "$WORK/allkeeperdates52"
+
+grep '^destroy' "$WORK/fz/ops.log" | awk '{print $2}' | sed -E 's/.*autosnap_([0-9-]+)_.*/\1/' | sort -u > "$WORK/destroyed52"
+comm -23 <(sort -u "$WORK/allkeeperdates52") "$WORK/destroyed52" > "$WORK/survivingkeepers52"
+
+inv_viol52=0
+while read -r dd; do
+  grep -qx "$dd" "$WORK/allkeeperdates52" && continue    # keepers expire by date, not this rule
+  cnt=$(awk -v d="$dd" '$1>d{c++} END{print c+0}' "$WORK/survivingkeepers52")
+  [ "$cnt" -lt 3 ] && { echo "    $dd has only $cnt SURVIVING newer keepers"; inv_viol52=1; }
+done < "$WORK/destroyed52"
+{ [ "$inv_viol52" = 0 ] && [ -s "$WORK/destroyed52" ]; } \
+  && ok "T52 frontier never anchored on a keeper destroyed the same run (surviving-keeper invariant holds)" \
+  || bad "T52 inv_viol=$inv_viol52 destroyed=$(wc -l < "$WORK/destroyed52" 2>/dev/null)"
 
 echo "== $PASS passed, $FAIL failed =="
 exit $([ "$FAIL" = 0 ] && echo 0 || echo 1)

@@ -9,6 +9,16 @@ set -u
 D="$FAKE_ZFS_DIR"
 sub="${1:-}"; shift || true
 log() { echo "$*" >> "$D/ops.log"; }
+# update_snap_field <snap> <col> <val>: set column <col> (2=keep_until, 3=tier) of the
+# matching $D/snaps line to <val> — the shared persistence mechanism `set` and `inherit`
+# both use, so `zfs list` in a later invocation sees the mutation (needed to test
+# multi-run transitions: establishment carrying forward, demotion actually clearing).
+update_snap_field() {
+  local snap="$1" col="$2" val="$3"
+  [ -f "$D/snaps" ] || return 0
+  awk -F'\t' -v OFS='\t' -v snap="$snap" -v col="$col" -v val="$val" \
+    '$1==snap{$col=val} {print}' "$D/snaps" > "$D/snaps.tmp" && mv "$D/snaps.tmp" "$D/snaps"
+}
 [ "${FAKE_ZFS_FAIL:-}" = "$sub" ] && { echo "fake: forced failure on $sub" >&2; exit 1; }
 case "$sub" in
   list)
@@ -22,9 +32,36 @@ case "$sub" in
     [ -f "$D/holds" ] && cat "$D/holds"
     exit 0 ;;
   set)
-    log "set $*"; exit 0 ;;          # `set <prop=val>... <snap>` — may carry multiple props
+    log "set $*"
+    # `set <prop=val>... <target>` — persist keep_until/tier writes on a snapshot target
+    # back into $D/snaps (via update_snap_field above), so a later invocation's `list`
+    # sees them (needed to test multi-run transitions, e.g. cold-start establishment
+    # carrying into a later run).
+    args=("$@"); n=${#args[@]}
+    if [ "$n" -gt 0 ]; then
+      target="${args[$((n-1))]}"
+      case "$target" in
+        *@*)
+          for ((i=0; i<n-1; i++)); do
+            case "${args[$i]}" in
+              *:keep_until=*) update_snap_field "$target" 2 "${args[$i]#*:keep_until=}" ;;
+              *:tier=*)       update_snap_field "$target" 3 "${args[$i]#*:tier=}" ;;
+            esac
+          done ;;
+      esac
+    fi
+    exit 0 ;;
   inherit)
-    log "inherit $1 $2"; exit 0 ;;
+    log "inherit $1 $2"
+    # `inherit <prop> <snap>` — mirror of the `set` persistence above: clear the matching
+    # column back to "-" in $D/snaps, so a later invocation's `list` sees the demotion
+    # (needed to let a multi-run test actually catch a broken demotion/inherit path,
+    # instead of `list` keeping stale keep_until/tier from before the inherit).
+    case "$1" in
+      *:keep_until) update_snap_field "$2" 2 "-" ;;
+      *:tier)       update_snap_field "$2" 3 "-" ;;
+    esac
+    exit 0 ;;
   hold)
     # `hold <tag> <snap>...` — may carry multiple snapshots
     tag="$1"; shift

@@ -14,11 +14,23 @@
 // SAFETY: it deletes only when the dataset's feed is provably healthy; otherwise it
 // HOLDs (deletes nothing) and alerts. Full contract: docs/SAFETY.md.
 //   Run-level guards, evaluated INDEPENDENTLY PER DATASET (SKIP that dataset on failure):
-//   recent 7-day window complete, newest daily fresh (<=26h, guardMaxDailyAgeHours),
+//   recent 7-day window complete (frontier-aware — a day already covered by the
+//   two-holds invariant isn't a gap, so this tool's own routine pruning can't trip its
+//   own feed-gap check; this guard protects only this tool's pruning decision, not
+//   replication health in general — see docs/SAFETY.md guard 1 for the scope), newest
+//   daily fresh (<=26h, guardMaxDailyAgeHours),
 //   clock sane, no sudden data shrinkage (guardMaxDailyShrinkPct — mass deletion), no
 //   excessive churn (guardMaxDailyChurnPct — mass rewrite/encryption), volume
-//   circuit-breaker (<=5/run w/o --force). Each guard threshold defaults globally but
-//   may be overridden per retention policy.
+//   circuit-breaker (<=14/run w/o --force — 2x the 7-day ISO-week cadence a weekly
+//   keeper promotes on, since that promotion is a once-a-week batch event, not a smooth
+//   daily one). Accepted tradeoff: 14 also raises the bar for catching a non-routine
+//   steady-state anomaly (misconfig/bug), not just routine weekly batches — deliberate,
+//   since the old cap of 5 never cleared a real routine week either, so it only ever
+//   fired on the routine case. See docs/SAFETY.md guard 6. Separately, a cold-start
+//   floor (any nonzero doomed count, gated on prior <ns>:tier history) guarantees a
+//   reviewed --force on a dataset's first-ever prune regardless of the 14 cap — see
+//   docs/SAFETY.md guard 7. Each guard threshold defaults globally but may be
+//   overridden per retention policy.
 //   Per-snapshot: never the newest/base, a week/month keeper still WITHIN its retention,
 //   an uncovered daily, a held snapshot, or a non-_daily snapshot. (A keeper past its
 //   retention ages out — see docs/SAFETY.md.)
@@ -35,6 +47,7 @@
 //
 // Usage: zfs-hold-tight [--prune] [--force] [--dataset archive/<name>] [-v] [--no-hc]
 //        zfs-hold-tight --doctor [--dataset archive/<name>]
+//        zfs-hold-tight --summary [--dataset archive/<name>] [--since YYYY-MM-DD]
 //        zfs-hold-tight --check-holds [--no-hc]
 //        zfs-hold-tight --fix [--dataset archive/<name>]
 //        zfs-hold-tight --hold-adhoc <snapshot> [--no-hc]
@@ -87,7 +100,7 @@ if (!cfg.TryGetProperty("datasets", out var datasetsElem) || datasetsElem.ValueK
 }
 
 // Validate and load numeric config with bounds
-int MaxDeletePerRun = 5, RecentWindowDays = 7, MaxDailyAgeHours = 26, MaxDailyShrinkPct = 33, MaxDailyChurnPct = 50;
+int MaxDeletePerRun = 14, RecentWindowDays = 7, MaxDailyAgeHours = 26, MaxDailyShrinkPct = 33, MaxDailyChurnPct = 50;
 int MinNewerHolds = 2;          // a non-keeper daily drops once this many held keepers are newer than it
 try
 {
@@ -264,6 +277,18 @@ if (dsIdx >= 0)
     { Console.Error.WriteLine($"unknown dataset '{datasetFilter}'"); configDoc?.Dispose(); return 2; }
 }
 
+// Parse --since if present (--summary only; ignored by every other mode).
+DateTime? since = null;
+int sinceIdx = Array.IndexOf(args, "--since");
+if (sinceIdx >= 0)
+{
+    if (sinceIdx + 1 >= args.Length ||
+        !DateTime.TryParseExact(args[sinceIdx + 1], "yyyy-MM-dd", CultureInfo.InvariantCulture,
+            DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var sinceVal))
+    { Console.Error.WriteLine("--since requires a YYYY-MM-DD date"); configDoc?.Dispose(); return 2; }
+    since = sinceVal;
+}
+
 // Run-lock: serialize any run that mutates ZFS state (prune/fix/hold-*), so two
 // overlapping cron invocations can't double-process. Read-only modes skip the lock.
 bool willMutate = args.Contains("--prune") || args.Contains("--fix")
@@ -280,6 +305,17 @@ if (willMutate)
         if (!OperatingSystem.IsWindows()) lockOpts.UnixCreateMode = SharedDataMode;
         runLock = new FileStream(lockPath, lockOpts);
     }
+    // DirectoryNotFoundException derives from IOException, so it needs its own catch
+    // BEFORE the generic one below — otherwise a bad/vanished logDir (race between the
+    // CreateDirectory above and the FileStream open, or an invalid configured path)
+    // misreports as "another run is in progress", sending an operator to look for a
+    // nonexistent concurrent run instead of the actual directory problem.
+    catch (DirectoryNotFoundException ex)
+    {
+        Console.Error.WriteLine($"FATAL: log directory problem: {ex.Message}");
+        configDoc?.Dispose();
+        return 2;
+    }
     catch (IOException)
     {
         Console.Error.WriteLine("another zfs-hold-tight run is in progress (lock held); exiting");
@@ -292,6 +328,13 @@ if (willMutate)
 if (args.Contains("--doctor"))
 {
     var result = Doctor(datasetFilter);
+    configDoc?.Dispose();
+    return result;
+}
+
+if (args.Contains("--summary"))
+{
+    var result = Summary(datasetFilter, since);
     configDoc?.Dispose();
     return result;
 }
@@ -354,10 +397,11 @@ var metadataErrors = new List<string>();  // metadata/hold failures
 foreach (var (ds, ret) in retention)
 {
     if (only is not null && ds != only) continue;
-    var (listCode, snaps) = ListDailies(ds);
+    var (listCode, snaps, listWarnings) = ListDailies(ds);
+    foreach (var w in listWarnings) Log(w);
     if (listCode != 0)
     {
-        // ListDailies already logged the ERROR detail; emit the dataset verdict.
+        // The ERROR detail was just logged above; emit the dataset verdict.
         Log($"{ds}: SKIP - zfs list failed (cannot verify feed health)");
         held.Add($"{ds}: zfs list error");
         continue;
@@ -366,13 +410,9 @@ foreach (var (ds, ret) in retention)
     var gd = guardsByDataset[ds];   // this dataset's effective guard thresholds
 
     // ---- keepers + desired keep_until ----
-    var weekKeeper  = snaps.GroupBy(s => (ISOWeek.GetYear(s.Date), ISOWeek.GetWeekOfYear(s.Date)))
-                           .Select(g => g.MaxBy(s => s.Date)!.Name).ToHashSet();
-    var monthKeeper = snaps.GroupBy(s => (s.Date.Year, s.Date.Month)).Select(g => g.MaxBy(s => s.Date)!.Name).ToHashSet();
     var newest = snaps.MaxBy(s => s.Date)!.Name;
     // keepers = weekKeeper ∪ monthKeeper: exactly the snapshots that carry a real hold
     // (weekly with <ns>:weekly, monthly with <ns>:monthly). A daily is held by none of them.
-    var keeperNames = weekKeeper.Union(monthKeeper).ToHashSet();
     // Two-holds invariant: a non-keeper daily is droppable only once at least minNewerHolds
     // held keepers are strictly NEWER than it. Equivalent clean cutoff: sort keeper dates DESC;
     // holdFrontier = the Nth-newest keeper's date; a non-keeper daily s is doomed iff
@@ -380,24 +420,14 @@ foreach (var (ds, ret) in retention)
     // The daily's own week+month grandfathers are strictly newer, so the default of 2 subsumes
     // the old week/month coverage test plus a buffer.
     int destroyDepth = ret.MinNewerHolds;
-    var keeperDates = snaps.Where(s => keeperNames.Contains(s.Name)).Select(s => s.Date)
-                           .OrderByDescending(dt => dt).ToList();
-    var holdFrontier = keeperDates.Count >= destroyDepth ? keeperDates[destroyDepth - 1] : DateTime.MinValue;
-    // Only keepers have a date-based expiry (their 5-year grandfather retention); a plain daily
-    // is governed by the frontier, not a date, so it returns MaxValue here (never expires by date).
-    DateTime Desired(Snap s)
-    {
-        bool isWeek = weekKeeper.Contains(s.Name), isMonth = monthKeeper.Contains(s.Name);
-        if (!isWeek && !isMonth) return DateTime.MaxValue;
-        var k = DateTime.MinValue;
-        if (isWeek)  k = Later(k, s.Date.AddDays(ret.WeeklyKeepDays));
-        if (isMonth) k = Later(k, s.Date.AddDays(ret.MonthlyKeepDays));
-        return k;
-    }
+    // Desired (a keeper's date-based expiry) comes from ComputeKeepersAndFrontier itself
+    // now — the exact function it already uses internally to decide the frontier, not a
+    // second hand-maintained copy that could silently drift from it.
+    var (weekKeeper, monthKeeper, keeperNames, holdFrontier, Desired) = ComputeKeepersAndFrontier(snaps, ret, now);
 
-    // Current holds on this dataset — used to (a) honor guard 12 (never delete a held
+    // Current holds on this dataset — used to (a) honor guard 14 (never delete a held
     // snapshot) and (b) tell our managed <ns>:monthly hold from foreign/defensive ones.
-    // A holds-list failure means we can't verify guard 12, so SKIP rather than guess.
+    // A holds-list failure means we can't verify guard 14, so SKIP rather than guess.
     var holdMap = LoadHolds(snaps.Select(s => s.Name).ToList());
     if (holdMap is null)
     {
@@ -419,35 +449,54 @@ foreach (var (ds, ret) in retention)
     int keepersHeld = keeperNames.Count(k =>
         holdMap.TryGetValue(k, out var kt) && (kt.Contains(tagMonthly) || kt.Contains(tagWeekly)));
     string tail = holdFrontier == DateTime.MinValue ? "—" : holdFrontier.ToString("yyyy-MM-dd");
+    // Shared by every WORRY line below so they can never drift from each other.
+    string keeperTailSuffix = $"{keepersHeld}/{keeperNames.Count} keepers held, daily tail to {tail} (rerun with --force if intended)";
+
+    // Proactively hold every computed candidate keeper (monthly with <ns>:monthly, weekly
+    // with <ns>:weekly) — shared by every "protection only ever increases" WORRY path.
+    // Never releases or deletes; only ever adds.
+    void HoldCandidateKeepersDefensively(string reasonLabel)
+    {
+        // Batched (like HoldMissing in --fix mode below): a cold-start dataset can carry a
+        // year+ of un-held keepers, and one zfs subprocess per keeper doesn't scale to that.
+        void HoldMissingKeepers(string tag, IEnumerable<string> keepers)
+        {
+            var toHold = keepers.Where(k => !(holdMap.TryGetValue(k, out var t) && t.Contains(tag))).ToList();
+            for (int i = 0; i < toHold.Count; i += 256)
+            {
+                var chunk = toHold.GetRange(i, Math.Min(256, toHold.Count - i));
+                var a = new List<string> { "hold", tag }; a.AddRange(chunk);
+                var (c, _, _) = Exec("zfs", a.ToArray());
+                if (c == 0) { foreach (var k in chunk) Log($"  HOLD:ADD {k} (protected during {reasonLabel})"); continue; }
+                // Chunk failed — retry one-by-one so the report names the actual bad snapshot(s)
+                // (the fast batched path stays the common case).
+                foreach (var k in chunk)
+                {
+                    var (cc, _, ee) = Exec("zfs", "hold", tag, k);
+                    // "already"/"exists" here means the failed batch call DID apply this one before
+                    // erroring out on another target — it's a real hold placed just now, not a stale
+                    // no-op, so it gets the same success log as HoldMissing's --fix retry does.
+                    if (cc == 0 || ee.Contains("already") || ee.Contains("exists")) Log($"  HOLD:ADD {k} (protected during {reasonLabel})");
+                    else
+                        Log($"    HOLD:ADD {Short(k)} FAILED: {ee.Trim()}");
+                }
+            }
+        }
+        HoldMissingKeepers(tagMonthly, monthKeeper);
+        HoldMissingKeepers(tagWeekly, weekKeeper.Where(w => !monthKeeper.Contains(w)));
+    }
 
     // ---- run-level guards. On a worry, protection only ever INCREASES: still hold the
     //      monthly keepers (even the suspect newest — a false positive costs nothing, and
     //      we don't want to skip the hold and lose the chance later) and record a worry
     //      breadcrumb on the tip — but never release a hold or delete anything. ----
-    string? guard = HealthGuard(snaps, ret, gd);
+    string? guard = HealthGuard(snaps, ret, gd, holdFrontier);
     if (guard is not null)
     {
         Log($"{ds}: WORRY - {guard} ({keepersHeld}/{keeperNames.Count} keepers held)");
         if (prune)
         {
-            // Proactively hold EVERY keeper (monthly with <ns>:monthly, weekly with <ns>:weekly).
-            // Protection only ever increases on a worry; never release or delete here.
-            foreach (var mk in monthKeeper)
-                if (!(holdMap.TryGetValue(mk, out var mt) && mt.Contains(tagMonthly)))
-                {
-                    var (hc, _, he) = Exec("zfs", "hold", tagMonthly, mk);
-                    if (hc == 0) Log($"  HOLD:ADD {mk} (protected during worry)");
-                    else if (!(he.Contains("already") || he.Contains("exists")))
-                        Log($"    HOLD:ADD {Short(mk)} FAILED: {he.Trim()}");
-                }
-            foreach (var wk in weekKeeper.Where(w => !monthKeeper.Contains(w)))
-                if (!(holdMap.TryGetValue(wk, out var wt) && wt.Contains(tagWeekly)))
-                {
-                    var (hc, _, he) = Exec("zfs", "hold", tagWeekly, wk);
-                    if (hc == 0) Log($"  HOLD:ADD {wk} (protected during worry)");
-                    else if (!(he.Contains("already") || he.Contains("exists")))
-                        Log($"    HOLD:ADD {Short(wk)} FAILED: {he.Trim()}");
-                }
+            HoldCandidateKeepersDefensively("worry");
             var (wc, _, we) = Exec("zfs", "set", $"{ns}:worry={now:yyyy-MM-dd} {guard}", newest);
             if (wc == 0) Log($"  META:ADD {newest} {ns}:worry={now:yyyy-MM-dd} {guard}");
             else Log($"    META:ADD {Short(newest)} FAILED: {we.Trim()}");
@@ -461,8 +510,8 @@ foreach (var (ds, ret) in retention)
     var doomed = new List<string>();
     foreach (var s in snaps.OrderBy(s => s.Date))
     {
-        if (s.Name == newest) continue;                     // never the base (guard 7)
-        if (IsForeignHeld(s.Name))                          // guard 12: held => never delete, skip cleanly
+        if (s.Name == newest) continue;                     // never the base (guard 9)
+        if (IsForeignHeld(s.Name))                          // guard 14: held => never delete, skip cleanly
         { if (verbose) Log($"  {ds}: skip {Short(s.Name)} - held ({string.Join(",", holdMap[s.Name])})"); continue; }
         if (keeperNames.Contains(s.Name))
         {
@@ -481,6 +530,30 @@ foreach (var (ds, ret) in retention)
         doomed.Add(s.Name);
     }
 
+    // ---- cold-start floor: the FIRST time this tool ever destroys anything on a dataset
+    //      must be a reviewed, conscious decision — guardMaxDeletePerRun (14) is sized for
+    //      a ROUTINE weekly batch on a dataset this tool already manages, not for "is it OK
+    //      to destroy anything at all here for the first time." So this floor is not a
+    //      smaller cap, it is a flat requirement: ANY doomed snapshot on a
+    //      never-established dataset needs --force, regardless of count (see
+    //      docs/SAFETY.md guard 6 "Accepted tradeoff" and guard 7). "Established" = at
+    //      least one snapshot already carries a real <ns>:tier value. This check runs, and
+    //      `continue`s, BEFORE Promote (unlike the routine volume-capped case below, where
+    //      Promote deliberately keeps running while capped) specifically so a blocked
+    //      cold-start pass can never tag a keeper and thereby self-clear the floor without
+    //      --force ever being used. A dataset with zero doomed snapshots (nothing
+    //      destructive to decide on yet) establishes on its first plain --prune — Promote
+    //      only ever tags/holds keepers, never destroys, so there is nothing to review.
+    bool everEstablished = snaps.Any(s => s.Tier is not null);
+    if (!everEstablished && doomed.Count > 0 && !force)
+    {
+        Log($"{ds}: WORRY - cold start: would delete {doomed.Count} (dataset not yet established — no snapshot carries a real {propTier} value; if --force was already used and this persists, Promote's metadata/hold writes may be failing rather than never having run); {keeperTailSuffix}");
+        if (prune) HoldCandidateKeepersDefensively("cold start");
+        Log($"{ds}: SKIP - cold-start floor (no deletions)");
+        held.Add($"{ds}: cold start, needs --force");
+        continue;
+    }
+
     // ---- volume circuit-breaker: caps DESTROYS only. Keeper hold-tagging and demotion
     //      cleanup below still run on a capped dataset — "on a worry, protection only
     //      ever increases" (same principle as the HealthGuard branch above). Gating Promote
@@ -488,7 +561,7 @@ foreach (var (ds, ret) in retention)
     //      as the dataset stays capped: a protection regression masquerading as a safety win.
     bool volumeCapped = doomed.Count > gd.MaxDeletePerRun && !force;
     if (volumeCapped)
-        Log($"{ds}: WORRY - would delete {doomed.Count} > cap {gd.MaxDeletePerRun}; {keepersHeld}/{keeperNames.Count} keepers held, daily tail to {tail} (rerun with --force if intended)");
+        Log($"{ds}: WORRY - would delete {doomed.Count} > cap {gd.MaxDeletePerRun}; {keeperTailSuffix}");
 
     // ---- tag keepers / clean up demotions (prune only) ----
     if (prune)
@@ -538,7 +611,7 @@ foreach (var (ds, ret) in retention)
         // Release ANY of our managed holds (<ns>:monthly and/or <ns>:weekly) before destroy,
         // but ONLY for snapshots that actually carry one (an expired keeper — the tag Promote
         // gave it this run — or one held at load time) — not the common plain-daily case.
-        // (Guard 12 already excluded foreign-held snapshots.)
+        // (Guard 14 already excluded foreign-held snapshots.)
         var toRelease = new HashSet<string>();
         if (monthKeeper.Contains(name)) toRelease.Add(tagMonthly);           // Promote holds monthly (precedence)
         else if (weekKeeper.Contains(name)) toRelease.Add(tagWeekly);        // weekly-only keeper holds weekly
@@ -621,7 +694,8 @@ int CheckHolds(bool noHc)
     bool anyFail = false;
     foreach (var (ds, ret) in retention)
     {
-        var (code, snaps) = ListDailies(ds);
+        var (code, snaps, listWarnings) = ListDailies(ds);
+        foreach (var w in listWarnings) Log(w);
         if (code != 0) { Log($"  WARNING: {ds}: zfs list failed"); anyFail = true; continue; }
         var holdMap = LoadHolds(snaps.Select(s => s.Name).ToList());
         if (holdMap is null) { Log($"  WARNING: {ds}: zfs holds failed"); anyFail = true; continue; }
@@ -658,6 +732,95 @@ int CheckHolds(bool noHc)
     return trouble ? 1 : 0;
 }
 
+// ---- summary: compact per-dataset markdown table (dataset health at a glance, for
+//      pasting into a gist/PR/chat — not a replacement for --doctor's per-keeper detail
+//      or the safety guards' own run-time decisions). ----
+int Summary(string? datasetFilter, DateTime? since)
+{
+    var lines = new List<string>();
+    void Log(string m) { Console.WriteLine(m); lines.Add(m); }
+    // Log-file-only: lands in the day's log (tail -40 .../logs/...) for full detail, but
+    // never on Console — Console.WriteLine output is exactly what nightly.sh pipes
+    // straight into the pushed summary file, so it must stay a strict, well-formed
+    // markdown table.
+    void LogFile(string m) { lines.Add(m); }
+
+    Log("| Dataset | Monthlies | Weeklies | Dailies | Start | End | Continuity |");
+    Log("|---|---|---|---|---|---|---|");
+
+    int errors = 0;
+    foreach (var (ds, ret) in retention)
+    {
+        if (datasetFilter is not null && ds != datasetFilter) continue;
+        // Warnings go to LogFile (day's log only), never Log/Console — Console.WriteLine
+        // output is exactly what nightly.sh pipes straight into the pushed summary file,
+        // so it must stay a strict, well-formed markdown table; a short note is appended
+        // to the row below.
+        var (code, snaps, warnings) = ListDailies(ds);
+        foreach (var w in warnings) LogFile(w);
+        if (code != 0) { Log($"| {ds} | — | — | — | — | — | ERROR: zfs list failed (see log) |"); errors++; continue; }
+        if (snaps.Count == 0) { Log($"| {ds} | 0 | 0 | 0 | — | — | no snapshots |"); continue; }
+
+        var oldest = snaps.Min(s => s.Date).Date;
+        var newest = snaps.Max(s => s.Date).Date;
+        // --since narrows the report window; it can never claim data older than what's
+        // actually retained (clamped to `oldest`, the default when --since is omitted),
+        // and a --since after the newest snapshot is reported explicitly rather than
+        // silently producing an empty, vacuously "✓" window.
+        var effectiveSince = Later(since ?? oldest, oldest).Date;
+        if (effectiveSince > newest)
+        {
+            Log($"| {ds} | 0 | 0 | 0 | {effectiveSince:yyyy-MM-dd} | {newest:yyyy-MM-dd} | --since is after the newest snapshot |");
+            continue;
+        }
+
+        var (weekKeeper, monthKeeper, keeperNames, holdFrontier, _) = ComputeKeepersAndFrontier(snaps, ret, now);
+
+        var windowed = snaps.Where(s => s.Date.Date >= effectiveSince).ToList();
+        int monthlies = windowed.Count(s => monthKeeper.Contains(s.Name));
+        int weeklies  = windowed.Count(s => weekKeeper.Contains(s.Name) && !monthKeeper.Contains(s.Name));
+        int dailies   = windowed.Count - monthlies - weeklies;
+
+        // Continuity: scan the DAILY TAIL from max(effectiveSince, holdFrontier) to newest —
+        // the same frontier-aware scope guard 1 uses (docs/SAFETY.md guard 1), just extended
+        // across the whole requested window instead of a fixed recent-window cap, so a day
+        // this tool legitimately pruned is never reported as a break. Older than the frontier,
+        // only keeper cadence exists (by GFS design) — this report doesn't attempt to detect
+        // a missing week/month there; that's a materially different check.
+        var scanStart = holdFrontier == DateTime.MinValue ? effectiveSince : Later(effectiveSince, holdFrontier.Date);
+        var existingDays = snaps.Select(s => s.Date.Date).ToHashSet();
+        var missing = new List<DateTime>();
+        for (var d = scanStart; d <= newest; d = d.AddDays(1))
+            if (!existingDays.Contains(d)) missing.Add(d);
+
+        string continuity = missing.Count == 0 ? "✓" : FormatRanges(missing);
+        // warnings here means "unparseable snapshot date" (code==0 path only — the
+        // code!=0 path already `continue`d above) — noted compactly; full detail is in
+        // the log file via the LogFile(w) loop above, not repeated in the table cell.
+        if (warnings.Count > 0) continuity += $" ({warnings.Count} snapshot(s) skipped, see log)";
+        Log($"| {ds} | {monthlies} | {weeklies} | {dailies} | {effectiveSince:yyyy-MM-dd} | {newest:yyyy-MM-dd} | {continuity} |");
+    }
+
+    FlushLog(lines);
+    return errors > 0 ? 1 : 0;
+}
+
+// Consolidate sorted-or-not missing days into compact "date" / "date..date" runs.
+static string FormatRanges(List<DateTime> days)
+{
+    days.Sort();
+    var parts = new List<string>();
+    int i = 0;
+    while (i < days.Count)
+    {
+        int j = i;
+        while (j + 1 < days.Count && (days[j + 1] - days[j]).Days == 1) j++;
+        parts.Add(i == j ? days[i].ToString("yyyy-MM-dd") : $"{days[i]:yyyy-MM-dd}..{days[j]:yyyy-MM-dd}");
+        i = j + 1;
+    }
+    return string.Join(", ", parts);
+}
+
 // ---- doctor: validate hold strategy ----
 int Doctor(string? datasetFilter)
 {
@@ -669,7 +832,8 @@ int Doctor(string? datasetFilter)
     foreach (var (ds, _) in retention)
     {
         if (datasetFilter is not null && ds != datasetFilter) continue;
-        var (code, snaps) = ListDailies(ds);
+        var (code, snaps, listWarnings) = ListDailies(ds);
+        foreach (var w in listWarnings) Log(w);
         if (code != 0) { Log($"{ds}: ERROR - zfs list failed, cannot validate holds"); errors++; continue; }
         if (snaps.Count == 0) { Log($"{ds}: no snapshots"); continue; }
 
@@ -755,7 +919,8 @@ int Fix(string? datasetFilter)
     foreach (var (ds, _) in retention)
     {
         if (datasetFilter is not null && ds != datasetFilter) continue;
-        var (code, snaps) = ListDailies(ds);
+        var (code, snaps, listWarnings) = ListDailies(ds);
+        foreach (var w in listWarnings) Log(w);
         if (code != 0) { Log($"  ✗ {ds}: zfs list failed, skipping"); errors++; continue; }
         if (snaps.Count == 0) continue;
 
@@ -809,7 +974,8 @@ int HoldLatestTier(string tier, string? datasetFilter, bool noHc)
     foreach (var (ds, _) in retention)
     {
         if (datasetFilter is not null && ds != datasetFilter) continue;
-        var (code, snaps) = ListDailies(ds);
+        var (code, snaps, listWarnings) = ListDailies(ds);
+        foreach (var w in listWarnings) Log(w);
         if (code != 0) { Log($"  ✗ {ds}: zfs list failed, skipping"); errors++; continue; }
         if (snaps.Count == 0) continue;
 
@@ -842,7 +1008,7 @@ int HoldLatestTier(string tier, string? datasetFilter, bool noHc)
 }
 
 // ---- guards (evaluated independently per dataset; thresholds from that dataset's policy) ----
-string? HealthGuard(List<Snap> snaps, Retention ret, Guards gd)
+string? HealthGuard(List<Snap> snaps, Retention ret, Guards gd, DateTime holdFrontier)
 {
     var newest = snaps.Max(s => s.Date);
     var newestSnap = snaps.MaxBy(s => s.Date)!;
@@ -855,6 +1021,12 @@ string? HealthGuard(List<Snap> snaps, Retention ret, Guards gd)
     for (int d = 0; d < gd.RecentWindowDays; d++)
     {
         var day = newest.Date.AddDays(-d);
+        // A day older than the hold frontier is covered by sufficient newer keepers — it was
+        // legitimately pruned by this tool's own retention policy, not a feed gap. Only flag a
+        // day that's neither present NOR already accounted for by coverage; this is the
+        // "coverage" question (is it safe that this day is gone), kept distinct from the
+        // "scale" question (is the amount of change unusual), which is guard 6's job alone.
+        if (day < holdFrontier.Date) continue;
         if (!days.Contains(day)) missing.Add(day.ToString("MM-dd"));
     }
     if (missing.Count > 0) return $"gap in last {gd.RecentWindowDays}d: missing {string.Join(",", missing)}";
@@ -894,12 +1066,21 @@ string? HealthGuard(List<Snap> snaps, Retention ret, Guards gd)
 }
 
 // ---- helpers ----
-(int, List<Snap>) ListDailies(string ds)
+// ListDailies never logs anything itself — it only RETURNS warnings/errors in `warnings`.
+// Every caller loops over `warnings` and logs them through its OWN local Log(), so each
+// message lands in the log file that caller's own FlushLog(lines) actually persists.
+// (An earlier version had ListDailies call a shared top-level Log() directly: since
+// ListDailies is a top-level local function, that Log() lexically resolves to the
+// top-level `lines` list, not whichever function's `lines` is calling it right now — so
+// the message printed to Console fine, but silently never reached the log FILE for any
+// caller other than the one function whose Log() happens to BE that top-level one.)
+(int, List<Snap>, List<string> warnings) ListDailies(string ds)
 {
+    var warnings = new List<string>();
     // -p: exact bytes for referenced/written (the shrinkage + churn guards need raw numbers).
     var (code, outp, err) = Exec("zfs", "list", "-Hp", "-t", "snapshot", "-o", $"name,{propKeep},{propTier},referenced,written", "-d", "1", ds);
     var list = new List<Snap>();
-    if (code != 0) { Log($"ERROR: zfs list {ds} failed: {err.Trim()}"); return (code, list); }
+    if (code != 0) { warnings.Add($"ERROR: zfs list {ds} failed: {err.Trim()}"); return (code, list, warnings); }
     foreach (var line in outp.Split('\n', StringSplitOptions.RemoveEmptyEntries))
     {
         var cols = line.Split('\t');
@@ -909,14 +1090,14 @@ string? HealthGuard(List<Snap> snaps, Retention ret, Guards gd)
         // must skip that one snapshot, never abort the whole run.
         if (!DateTime.TryParseExact(m.Groups[1].Value, "yyyy-MM-dd_HH:mm:ss",
             CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var date))
-        { Log($"  WARNING: unparseable snapshot date, skipping: {cols[0]}"); continue; }
+        { warnings.Add($"  WARNING: unparseable snapshot date, skipping: {cols[0]}"); continue; }
         long? ku = cols.Length > 1 && long.TryParse(cols[1], out var v) ? v : null;
         string? tier = cols.Length > 2 && cols[2] != "-" ? cols[2] : null;
         long? refb = cols.Length > 3 && long.TryParse(cols[3], out var rb) ? rb : null;
         long? wrb = cols.Length > 4 && long.TryParse(cols[4], out var wb) ? wb : null;
         list.Add(new Snap(cols[0], date, ku, tier, refb, wrb));
     }
-    return (0, list);
+    return (0, list, warnings);
 }
 
 // Annotate one snapshot for its current tier. Returns false if any write failed.
@@ -1070,6 +1251,49 @@ void FlushLog(List<string>? logLines = null)
 }
 
 static DateTime Later(DateTime a, DateTime b) => a > b ? a : b;
+
+// Shared by the main per-dataset loop and --summary: weekly/monthly keepers (newest
+// snapshot per ISO-week / calendar-month group) and the resulting hold frontier — the
+// Nth-newest (N = minNewerHolds) keeper's date, below which a non-keeper daily is doomed.
+// A single implementation so a future change to this math (e.g. minNewerHolds semantics,
+// or how a keeper's own expiry date is derived) can't silently drift between what --prune
+// actually decides and what --summary reports — the caller-facing `Desired` delegate
+// returned below is the SAME function this method uses internally to compute the
+// frontier, not a second copy that has to be kept in sync by hand.
+//
+// Frontier candidates exclude a keeper whose OWN weekly/monthly retention has already
+// expired (`now > Desired(keeper)`). Without this exclusion, an expired keeper could
+// still count as one of the "N newer holds" that justifies dooming older plain dailies —
+// and since an expired keeper is ALSO independently doomed by its own retention, the SAME
+// run could destroy both the keeper and the dailies whose protection depended on it still
+// existing, retroactively invalidating the two-holds invariant within one run. Only
+// reachable when a keeper can expire within `minNewerHolds` keepers of the newest one
+// (short weekly/monthly retention relative to minNewerHolds) — not reachable with this
+// tool's shipped 5-year defaults, but nothing in config validation forbids a shorter one.
+static (HashSet<string> weekKeeper, HashSet<string> monthKeeper, HashSet<string> keeperNames, DateTime holdFrontier, Func<Snap, DateTime> Desired)
+    ComputeKeepersAndFrontier(List<Snap> snaps, Retention ret, DateTime now)
+{
+    var weekKeeper  = snaps.GroupBy(s => (ISOWeek.GetYear(s.Date), ISOWeek.GetWeekOfYear(s.Date)))
+                           .Select(g => g.MaxBy(s => s.Date)!.Name).ToHashSet();
+    var monthKeeper = snaps.GroupBy(s => (s.Date.Year, s.Date.Month)).Select(g => g.MaxBy(s => s.Date)!.Name).ToHashSet();
+    var keeperNames = weekKeeper.Union(monthKeeper).ToHashSet();
+    // Only keepers have a date-based expiry (their weekly/monthly grandfather retention);
+    // a plain daily is governed by the frontier, not a date, so it returns MaxValue here
+    // (never expires by date).
+    DateTime Desired(Snap s)
+    {
+        bool isWeek = weekKeeper.Contains(s.Name), isMonth = monthKeeper.Contains(s.Name);
+        if (!isWeek && !isMonth) return DateTime.MaxValue;
+        var k = DateTime.MinValue;
+        if (isWeek)  k = Later(k, s.Date.AddDays(ret.WeeklyKeepDays));
+        if (isMonth) k = Later(k, s.Date.AddDays(ret.MonthlyKeepDays));
+        return k;
+    }
+    var keeperDates = snaps.Where(s => keeperNames.Contains(s.Name) && now <= Desired(s))
+                           .Select(s => s.Date).OrderByDescending(dt => dt).ToList();
+    var holdFrontier = keeperDates.Count >= ret.MinNewerHolds ? keeperDates[ret.MinNewerHolds - 1] : DateTime.MinValue;
+    return (weekKeeper, monthKeeper, keeperNames, holdFrontier, Desired);
+}
 static string Short(string snap) => snap[(snap.IndexOf('@') + 1)..];
 
 // InformationalVersion is "<Version>+<full-sha>" when built with -p:SourceRevisionId;

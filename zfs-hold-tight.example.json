@@ -16,7 +16,7 @@
   "minNewerHolds": 2,
 
   "_comment_guards": "These are the GLOBAL DEFAULTS. Each guard is evaluated INDEPENDENTLY per dataset (a small dataset's deletion/encryption is flagged on its own scale). Any guard key may also be set inside a retention policy to override the default for that group of datasets.",
-  "guardMaxDeletePerRun": 5,
+  "guardMaxDeletePerRun": 14,
   "guardRecentWindowDays": 7,
   "guardMaxDailyAgeHours": 26,
   "_comment_shrink": "HOLD + alert when the newest daily references this many % less data than the recent baseline median — catches mass DELETION. 0 disables.",
