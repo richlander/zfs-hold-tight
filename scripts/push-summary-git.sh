@@ -105,6 +105,7 @@ if [ ! -d "$REPO_DIR" ]; then
         exit 1
     fi
 fi
+
 # A stale lock from a run killed mid-commit (same failure class as the repair above, but
 # rev-parse alone doesn't catch it — the checkout itself is still perfectly valid, just
 # holding a lock nothing will ever release). Gated on BOTH age AND no live git process
@@ -123,6 +124,21 @@ if [ -f "$lock_file" ]; then
         rm -f "$lock_file"
     fi
 fi
+
+# NOTE: an earlier version of this script tried to `git fetch` + `git reset --hard
+# origin/<branch>` HERE, before writing new content, on the theory that this would keep
+# the "did anything change" comparison honest against the true remote state. Reverted
+# after review found it silently discards a PRIOR run's locally-committed-but-not-yet-
+# pushed commit whenever that run's own push had failed (e.g. a network blip) — the reset
+# rewinds local HEAD to match origin's still-stale tip, permanently losing that commit
+# and the audit-trail entry it represented, with no error. That scenario is exactly what
+# the "always attempt push even when there's nothing new to commit" fall-through below
+# exists to recover from; an upfront destructive reset defeated it. Remote divergence
+# (e.g. a commit added via GitHub's own web UI) is instead reconciled safely at PUSH time
+# only, via `fetch` + `push --force-with-lease` right before the push itself (see below) —
+# this repo holds nothing but one regenerated-every-run file, so overwriting a divergent
+# remote tip there is safe; discarding OUR OWN not-yet-pushed commit here would not have
+# been.
 
 # Checked, not a bare redirect: an unwritable/full state filesystem would otherwise leave
 # $FILE holding STALE content from a previous run, and everything downstream (git add,
@@ -155,17 +171,19 @@ else
     fi
 fi
 
-# Fetch first, then push --force-with-lease rather than a plain push: this repo holds
-# nothing but this one regenerated-every-run file, entirely owned by this tool, so there
-# is nothing to merge or preserve if the remote ever diverges (e.g. a README added via
-# GitHub's own "create repo" web UI, or any other manual commit) — OUR content should
-# just win. A plain `git push` would instead reject that as non-fast-forward FOREVER,
-# every single night, since local HEAD can never fast-forward past a commit it doesn't
-# have. `--force-with-lease` (not a bare `--force`) still refuses if the remote changed
-# in a way this run doesn't know about — the `fetch` immediately before it is what lets
-# the lease see the ACTUAL current remote state so a genuine divergence still overwrites
-# cleanly instead of refusing. Fetch failure is only logged, not fatal: if it's a real
-# network problem, the push right after will fail for the same reason and report it.
+# Fetch immediately before push, then push --force-with-lease rather than a plain push:
+# this repo holds nothing but this one regenerated-every-run file, entirely owned by this
+# tool, so there is nothing to merge or preserve if the remote ever diverges (e.g. a
+# README added via GitHub's own "create repo" web UI, or any other manual commit) — OUR
+# content should just win. A plain `git push` would instead reject that as non-fast-
+# forward FOREVER, every single night, since local HEAD can never fast-forward past a
+# commit it doesn't have. `--force-with-lease` (not a bare `--force`) still refuses if the
+# remote changed in a way this run doesn't know about — the `fetch` immediately before it
+# is what lets the lease see the ACTUAL current remote state (as close to push-time as
+# possible) so a genuine divergence still overwrites cleanly instead of refusing. Fetch
+# failure here is only logged, not separately fatal: if it's a real, persistent network
+# problem, the push right after fails for the same reason, and THAT failure is checked
+# and reported below.
 git -C "$REPO_DIR" fetch -q origin 2>&1 | sed 's/^/push-summary-git: fetch: /' >&2
 
 # No `if var="$(cmd)"; then ...` dance needed here (unlike the old gist script's curl
