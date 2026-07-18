@@ -22,13 +22,20 @@
 # stderr and exit nonzero; nothing here pings healthchecks or blocks the caller.
 #
 # Usage: zfs-hold-tight --summary | push-summary-git.sh
-# Env:   SUMMARY_REPO_URL   (default: git@github.com:richlander/zfs-hold-tight-logs.git)
+# Env:   SUMMARY_REPO_URL   (default: ssh://git@ssh.github.com:443/richlander/zfs-hold-tight-logs.git)
 #        SUMMARY_REPO_DIR   (default: /mnt/archive/tools/state/summary-repo)
 #        SUMMARY_SSH_KEY    (default: /mnt/archive/tools/state/zfs-hold-tight-deploy-key)
 #        SUMMARY_FILE       (default: SUMMARY.md)
 set -uo pipefail
 
-REPO_URL="${SUMMARY_REPO_URL:-git@github.com:richlander/zfs-hold-tight-logs.git}"
+# The default URL uses GitHub's SSH-over-443 endpoint (ssh.github.com:443), not the
+# standard git@github.com:... shorthand (which is always port 22): outbound port 22 is
+# blocked/dropped on this network (confirmed via `nc -zv github.com 22` timing out, vs
+# `nc -zv ssh.github.com 443` succeeding instantly) — a silently-dropped SYN makes ssh hang
+# indefinitely waiting for a TCP handshake that never completes, rather than failing fast.
+# GitHub documents this exact endpoint for networks that block/restrict outbound 22:
+# https://docs.github.com/en/authentication/troubleshooting-ssh/using-ssh-over-the-https-port
+REPO_URL="${SUMMARY_REPO_URL:-ssh://git@ssh.github.com:443/richlander/zfs-hold-tight-logs.git}"
 REPO_DIR="${SUMMARY_REPO_DIR:-/mnt/archive/tools/state/summary-repo}"
 SSH_KEY="${SUMMARY_SSH_KEY:-/mnt/archive/tools/state/zfs-hold-tight-deploy-key}"
 FILE="${SUMMARY_FILE:-SUMMARY.md}"
