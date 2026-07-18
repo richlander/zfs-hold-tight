@@ -128,7 +128,7 @@ See [`zfs-hold-tight.example.json`](zfs-hold-tight.example.json). Top-level keys
 |---|---|---|
 | `logDir` | `/mnt/archive/tools/logs` | Daily log files (auto-created). |
 | `healthchecksUrl` | *(unset → pings disabled)* | healthchecks.io base ping URL. |
-| `guardMaxDeletePerRun` | `minNewerHolds × 7`, per-policy | Per-run delete cap (circuit-breaker; `--force` overrides). Derived, not flat: a weekly keeper's dailies become doomed as a ~6-7 batch once a week, not smoothly, so the cap needs headroom for a routine week — but a policy's *first-ever* frontier activation releases a backlog proportional to `minNewerHolds` (e.g. `archive/memories`'s `minNewerHolds=24` → cap 168), so a single flat number can't fit every policy. Set explicitly (global or per-policy) to override the derived default. |
+| `guardMaxDeletePerRun` | `14` | Per-run delete cap (circuit-breaker; `--force` overrides). 2x the 7-day ISO-week cadence — a weekly keeper's dailies become doomed as a ~6-7 batch once a week, not smoothly, so the cap needs headroom for a routine week, not just a single day. |
 | `guardRecentWindowDays` | `7` | Require an unbroken daily window this many days back. |
 | `guardMaxDailyAgeHours` | `26` | `WORRY`+skip if the newest daily is older than this. |
 | `guardMaxDailyShrinkPct` | `33` | `WORRY`+skip if the newest daily references this % less data than the recent baseline (mass-**deletion** guard; `0` disables). |

@@ -20,11 +20,9 @@ terms, in one place, before the detail:
 - **A plain daily survives until at least 2 newer held keepers exist.** That's the entire
   retention invariant — no day-count window, just "is it covered by something newer that
   will survive." (`minNewerHolds`, see Context below.)
-- **Never delete more than `minNewerHolds × 7` in one run without `--force`.** A routine
-  week's batch is only ~6-7 regardless of `minNewerHolds`; the cap scales because a deep
-  daily tail's first-ever activation releases a backlog proportional to `minNewerHolds`,
-  not a flat amount — a flat cap sized for the shallow case can never fit the deep one.
-  (Guard 6.)
+- **Never delete more than 2x the weekly cadence (14) in one run without `--force`.** A
+  routine week's batch is only ~6-7; an extra week of slack is cheap, and a flat cap beats
+  trying to time it precisely. (Guard 6.)
 - **A dataset's first-ever destructive prune always needs `--force`, no matter how
   small the backlog.** (A first prune with nothing yet doomed establishes on its own —
   there's nothing destructive to gate.) The routine cap above governs "is this normal,"
@@ -110,37 +108,36 @@ content guards while a churny scratch policy relaxes them).
    since encryption preserves size while scrambling contents). Heuristic: legitimately
    churny datasets will trip it, so relax/disable it per policy. Set to 0 to disable.
 6. **Volume circuit-breaker.** A single run may not delete more than
-   `guardMaxDeletePerRun` snapshots for one dataset without `--force`. A weekly keeper only
-   becomes permanent when its ISO-week closes, so the dailies it stops covering become
-   doomed together, once a week, not smoothly day by day — steady state is a ~6-7 batch
-   every 7 days, not 0–1/day.
-   **Default is DERIVED per-policy, not one flat number** — `minNewerHolds × 7` (the
-   `_comment` on `guardMaxDeletePerRun` doesn't exist in config; this is compiled in,
-   `BacklogPerKeeperInterval` in the source). Every closed ISO week yields exactly one
-   keeper and ~6 plain (non-keeper) dailies. While a policy's hold frontier hasn't
-   activated yet (fewer than `minNewerHolds` keepers exist), none of the accumulating
-   plain dailies are doomed — the frontier is `MinValue`, nothing prunes. The moment the
-   Nth keeper finally appears, ALL of that backlog becomes doomed **simultaneously, in one
-   run**: a one-time activation batch that scales with `minNewerHolds` (~6×), not a fixed
-   size. A flat cap sized for `minNewerHolds=2`'s ~12-14 activation batch can never fit
-   `archive/memories`'s `minNewerHolds=24` (~144) without either permanently blocking that
-   dataset's legitimate one-time activation, or being uselessly loose for a shallow
-   policy — the factor of 7 (vs. the derived ~6) preserves the same ~17% headroom ratio
-   this tool has always used (7×2=14, unchanged from before this formula existed), just
-   applied per-policy instead of once, globally. An explicit `guardMaxDeletePerRun` in
-   config (global or per-policy) always overrides the derived default, same as any other
-   guard.
+   `guardMaxDeletePerRun` (default 14 — 2x the 7-day ISO-week cadence) snapshots for one
+   dataset without `--force`. A weekly keeper only becomes permanent when its ISO-week
+   closes, so the dailies it stops covering become doomed together, once a week, not
+   smoothly day by day — steady state is a ~6-7 batch every 7 days, not 0–1/day. The 2x
+   multiplier gives one full extra week of slack (e.g. a missed run) before a batch is
+   treated as abnormal rather than routine.
+   **Considered and rejected: deriving the default from `minNewerHolds` (× 7 per policy),**
+   on the theory that a deep-tail policy's (e.g. `archive/memories`, `minNewerHolds=24`)
+   first-ever hold-frontier activation releases a backlog proportional to `minNewerHolds`.
+   Simulated the actual algorithm for an organically-grown dataset and that premise is
+   false: the max single-run doomed count stays ~6 regardless of `minNewerHolds`, because
+   an organic dataset's own history never extends further back than its keeper count
+   implies — there's no room for a backlog to build up behind the frontier. Confirmed
+   against `archive/memories`' real snapshot history on the live deployment: its
+   daily-tagged history starts exactly as far back as its snapshot count implies, one per
+   day, no gap — genuinely organic, not a cold-started backlog. The one scenario that DOES
+   release a real `minNewerHolds`-dependent burst — reducing `minNewerHolds` on an
+   already-established dataset — isn't fixed by deriving from the new (smaller) N either.
+   Don't re-derive this without re-simulating first.
    **Accepted tradeoff:** this guard is also the last line of defense against non-routine
    *steady-state* anomalies (a retention-policy misconfig, a frontier-calc bug, a
-   keeper-history gap) — the derived cap raises that bar in proportion to `minNewerHolds`
-   too, not just the activation-batch tolerance: on `archive/memories`, a bug producing
-   15-168 unexpected doomed dailies (the exact boundary: `doomed.Count > MaxDeletePerRun`)
-   now prunes silently instead of tripping WORRY, with no other check that re-narrows this
-   bound — a much wider window than baseline's 1-14. Deliberate: a cap too tight to ever
-   clear a real activation isn't a functioning anomaly detector either, it's a permanent
-   false alarm requiring manual `--force` review forever. The wider tolerance is the
-   direct, disclosed cost of making a deep-tail policy's one-time activation actually
-   autonomous.
+   keeper-history gap) — raising it from 5 to 14 raises that bar too, not just the
+   routine-batch tolerance: a bug producing 6-14 unexpected doomed dailies (the exact
+   boundary: `doomed.Count > MaxDeletePerRun`, so 14 itself still passes) now prunes
+   silently instead of tripping WORRY, with no other check that re-narrows this bound.
+   Deliberate: the guard's old resolution (5) never once passed a real routine week on
+   this deployment, so it never actually functioned as a steady-state anomaly detector
+   either — it only ever fired on the routine case. 14 is a resolution the tool can
+   actually clear in normal operation, in exchange for coarser steady-state anomaly
+   detection.
 7. **Cold-start floor.** Independent of `guardMaxDeletePerRun`, a dataset this tool has
    never established requires `--force` for **any** nonzero doomed count, not just a
    large one — guard 6's cap governs "is this ROUTINE," not "is it OK to destroy

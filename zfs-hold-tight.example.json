@@ -16,7 +16,7 @@
   "minNewerHolds": 2,
 
   "_comment_guards": "These are the GLOBAL DEFAULTS. Each guard is evaluated INDEPENDENTLY per dataset (a small dataset's deletion/encryption is flagged on its own scale). Any guard key may also be set inside a retention policy to override the default for that group of datasets.",
-  "_comment_max_delete": "guardMaxDeletePerRun is DERIVED, not set here: minNewerHolds x 7 per policy (14 for baseline's minNewerHolds=2, 21 for low's minNewerHolds=3 below) -- a deep daily tail's first-ever activation releases a backlog proportional to minNewerHolds, so one flat number can't fit every policy. Set it explicitly (here, or inside a policy) only to override the derived default.",
+  "guardMaxDeletePerRun": 14,
   "guardRecentWindowDays": 7,
   "guardMaxDailyAgeHours": 26,
   "_comment_shrink": "HOLD + alert when the newest daily references this many % less data than the recent baseline median — catches mass DELETION. 0 disables.",

@@ -21,20 +21,16 @@
 //   daily fresh (<=26h, guardMaxDailyAgeHours),
 //   clock sane, no sudden data shrinkage (guardMaxDailyShrinkPct — mass deletion), no
 //   excessive churn (guardMaxDailyChurnPct — mass rewrite/encryption), volume
-//   circuit-breaker (w/o --force — DERIVED per-policy as minNewerHolds * 7, not one flat
-//   number: a policy's first-ever hold-frontier activation releases a one-time backlog
-//   proportional to its own minNewerHolds, e.g. 14 for minNewerHolds=2, 168 for
-//   minNewerHolds=24 — a flat cap sized for the shallow case could never fit the deep
-//   one). Accepted tradeoff: the derived cap also raises the bar for catching a
-//   non-routine steady-state anomaly (misconfig/bug) in proportion to minNewerHolds, not
-//   just the activation-batch tolerance — deliberate, since a cap too tight to ever clear
-//   a real activation isn't a functioning anomaly detector either, it only ever fires on
-//   the routine case. See docs/SAFETY.md guard 6. Separately, a cold-start floor (any
-//   nonzero doomed count, gated on prior <ns>:tier history) guarantees a reviewed --force
-//   on a dataset's first-ever prune regardless of the derived cap — see docs/SAFETY.md
-//   guard 7. Each guard threshold defaults globally but may be overridden per retention
-//   policy (guardMaxDeletePerRun's derived default is itself already per-policy; an
-//   explicit override, global or per-policy, always wins over the derivation).
+//   circuit-breaker (<=14/run w/o --force — 2x the 7-day ISO-week cadence a weekly
+//   keeper promotes on, since that promotion is a once-a-week batch event, not a smooth
+//   daily one). Accepted tradeoff: 14 also raises the bar for catching a non-routine
+//   steady-state anomaly (misconfig/bug), not just routine weekly batches — deliberate,
+//   since the old cap of 5 never cleared a real routine week either, so it only ever
+//   fired on the routine case. See docs/SAFETY.md guard 6. Separately, a cold-start
+//   floor (any nonzero doomed count, gated on prior <ns>:tier history) guarantees a
+//   reviewed --force on a dataset's first-ever prune regardless of the 14 cap — see
+//   docs/SAFETY.md guard 7. Each guard threshold defaults globally but may be
+//   overridden per retention policy.
 //   Per-snapshot: never the newest/base, a week/month keeper still WITHIN its retention,
 //   an uncovered daily, a held snapshot, or a non-_daily snapshot. (A keeper past its
 //   retention ages out — see docs/SAFETY.md.)
@@ -104,25 +100,18 @@ if (!cfg.TryGetProperty("datasets", out var datasetsElem) || datasetsElem.ValueK
 }
 
 // Validate and load numeric config with bounds
-// guardMaxDeletePerRun has no flat compiled-in default (see BacklogPerKeeperInterval
-// below, where the per-policy default is DERIVED from that policy's own minNewerHolds
-// instead) — MaxDeletePerRun stays null unless the config explicitly sets a value, which
-// then acts as an override (global here, or per-policy — see policyGuards below).
-int? MaxDeletePerRun = null;
-int RecentWindowDays = 7, MaxDailyAgeHours = 26, MaxDailyShrinkPct = 33, MaxDailyChurnPct = 50;
+int MaxDeletePerRun = 14, RecentWindowDays = 7, MaxDailyAgeHours = 26, MaxDailyShrinkPct = 33, MaxDailyChurnPct = 50;
 int MinNewerHolds = 2;          // a non-keeper daily drops once this many held keepers are newer than it
 try
 {
     if (cfg.TryGetProperty("minNewerHolds", out var mnh))
     {
         MinNewerHolds = mnh.GetInt32();
-        // Upper-bounded, not just >= 1: guardMaxDeletePerRun's default is DERIVED as
-        // minNewerHolds * BacklogPerKeeperInterval (see the retentionPolicies loop below)
-        // — an unbounded minNewerHolds could overflow that int multiplication and wrap to
-        // a small, negative, or even a large POSITIVE value, the last of which would
-        // silently disable the volume circuit-breaker (the exact guard this bound
-        // protects) instead of erroring. 10000 (~192 years of weekly keepers) is far
-        // beyond any realistic policy and leaves no realistic path to overflow.
+        // Upper-bounded, not just >= 1: kept even though guardMaxDeletePerRun is no
+        // longer derived FROM minNewerHolds (see the "Considered and rejected" note
+        // where BacklogPerKeeperInterval used to be) — bounding user input is cheap
+        // insurance against any future arithmetic that uses this value, and there is no
+        // legitimate reason to configure a value anywhere near this range regardless.
         if (MinNewerHolds < 1 || MinNewerHolds > 10000) throw new ArgumentException("minNewerHolds must be 1-10000");
     }
     if (cfg.TryGetProperty("guardMaxDeletePerRun", out var gdp))
@@ -221,21 +210,22 @@ var policies = new Dictionary<string, Retention>();
 var policyGuards = new Dictionary<string, Guards>();
 const string DatasetPrefix = "archive/";  // allowlist: only prune archive/* datasets
 
-// Volume circuit-breaker default, DERIVED per-policy from that policy's own
-// minNewerHolds rather than one flat number for every policy — see guard 6 in
-// docs/SAFETY.md for the full derivation. Short version: every closed ISO week yields
-// exactly one keeper and ~6 plain (non-keeper) dailies; while a policy's hold frontier
-// hasn't activated yet (fewer than minNewerHolds keepers exist), NONE of those
-// accumulating plain dailies are doomed — they all become doomed simultaneously the
-// moment the Nth keeper finally appears. So the one-time activation backlog for a policy
-// scales with minNewerHolds (roughly 6x), not a fixed amount: minNewerHolds=2 activates
-// at ~12, minNewerHolds=24 (archive/memories) at ~144. A single flat cap sized for the
-// low end (14, historically chosen as 2x minNewerHolds=2's ~6-7/week steady-state batch)
-// can never fit the high end without either permanently blocking a deep-tail policy's
-// legitimate one-time activation or being uselessly loose for a shallow one. 7 preserves
-// today's exact default for minNewerHolds=2 (7*2=14) with the same ~17% headroom ratio
-// scaled to any minNewerHolds.
-const int BacklogPerKeeperInterval = 7;
+// Considered and rejected: deriving guardMaxDeletePerRun's default per-policy as
+// minNewerHolds * 7, on the theory that a policy's first-ever hold-frontier activation
+// releases a one-time backlog proportional to minNewerHolds. Simulated the actual
+// algorithm for an ORGANICALLY-grown dataset (one snapshot/day since day 1, pruned every
+// day) and that premise is false: the max single-run doomed count stays ~6, independent
+// of minNewerHolds, for every N from 1 to 10000+. The frontier's position moves back in
+// time as N grows, but an organic dataset's own history only extends as far back as N
+// grows too — there's no room for a backlog to accumulate behind the frontier, because
+// the oldest of the N keepers is never far from day 1. Confirmed against archive/memories'
+// actual snapshot history on the live deployment: its daily-tagged history starts exactly
+// as far back as its snapshot count implies, one per day, no gap — organic growth, not a
+// pre-existing backlog cold-started under a high minNewerHolds. The one scenario that DOES
+// release a real N-dependent burst — REDUCING minNewerHolds on an already-established
+// dataset — isn't fixed by deriving from the new (smaller) N either. See git history for
+// the reverted change if this needs revisiting; don't re-derive from minNewerHolds without
+// re-simulating first.
 
 // Load and validate retention policies + their (optional) per-policy guard overrides.
 try
@@ -253,13 +243,9 @@ try
         if (minNewerHolds < 1 || minNewerHolds > 10000)
             throw new ArgumentException($"Policy '{policy.Name}': minNewerHolds must be 1-10000");
 
-        // Explicit config (global or per-policy, checked by GuardInt below) always wins;
-        // only the DEFAULT — when nothing at all is configured — is auto-derived.
-        int maxDeletePerRunDefault = MaxDeletePerRun ?? (minNewerHolds * BacklogPerKeeperInterval);
-
         policies[policy.Name] = new Retention(daily, weekly, monthly, minNewerHolds);
         policyGuards[policy.Name] = new Guards(
-            GuardInt(p, "guardMaxDeletePerRun",   maxDeletePerRunDefault, v => v > 0,              "must be > 0"),
+            GuardInt(p, "guardMaxDeletePerRun",   MaxDeletePerRun,   v => v > 0,              "must be > 0"),
             GuardInt(p, "guardRecentWindowDays",  RecentWindowDays,  v => v > 0 && v <= 365,  "must be 1-365"),
             GuardInt(p, "guardMaxDailyAgeHours",  MaxDailyAgeHours,  v => v > 0 && v <= 720,  "must be 1-720"),
             GuardInt(p, "guardMaxDailyShrinkPct", MaxDailyShrinkPct, v => v >= 0 && v <= 99,  "must be 0-99 (0 disables)"),
@@ -567,10 +553,9 @@ foreach (var (ds, ret) in retention)
     }
 
     // ---- cold-start floor: the FIRST time this tool ever destroys anything on a dataset
-    //      must be a reviewed, conscious decision — guardMaxDeletePerRun (derived per-
-    //      policy as minNewerHolds * 7) is sized for a ROUTINE batch on a dataset this
-    //      tool already manages, not for "is it OK to destroy anything at all here for the
-    //      first time." So this floor is not a
+    //      must be a reviewed, conscious decision — guardMaxDeletePerRun (14) is sized for
+    //      a ROUTINE weekly batch on a dataset this tool already manages, not for "is it OK
+    //      to destroy anything at all here for the first time." So this floor is not a
     //      smaller cap, it is a flat requirement: ANY doomed snapshot on a
     //      never-established dataset needs --force, regardless of count (see
     //      docs/SAFETY.md guard 6 "Accepted tradeoff" and guard 7). "Established" = at

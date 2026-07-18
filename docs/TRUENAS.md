@@ -91,28 +91,26 @@ cd /mnt/archive/tools
 
 On the **first** real prune against a pre-existing backlog of untagged dailies, the
 **cold-start floor** guarantees a reviewed `--force` for any nonzero backlog, not just a
-large one: `guardMaxDeletePerRun` (default `minNewerHolds × 7` — 14 for the default
-`minNewerHolds` of 2, more for a deeper-tail policy) is sized for a *routine* weekly
-batch on a dataset this tool already manages, so on its own it wouldn't reliably gate a
-first prune. Keepers are *computed*, not held — `minNewerHolds` (default 2) counts
-candidate weekly/monthly keepers derived from the snapshot dates themselves (no `zfs
-hold` needs to have ever been placed), so a cold backlog can have `doomed.Count > 0` from
-its very first run, well before any hold exists. Whether that count clears the cap on its
-own depends on how the backlog's dates land against ISO-week/month boundaries, not on a
-fixed day count — comfortably under 14 for roughly 2 weeks of backlog (at the default
-`minNewerHolds`), but it's been observed to exceed 14 in as little as ~18 days depending
-on alignment, so don't rely on any specific day count as a safe cutoff. Either way, a
-backlog short enough to stay under the cap would otherwise clear on the very first
-`--prune` with no confirmation. The cold-start floor closes that gap unconditionally: a
-dataset that has never been established requires `--force` for *any* nonzero doomed
-count — so the very first real `--prune` against this backlog will `WORRY`+`SKIP` with
-`cold start: would delete N` for any pre-existing backlog with something to destroy,
-regardless of how it compares to the cap. That's the circuit-breaker doing its job, not
-an error — review the dry-run output, then do the one-time backlog cleanup with `--prune
---force`. A dataset establishes the first time `--prune` completes for it — with no
-`--force` needed if there was nothing doomed yet (nothing destructive to review), or via
-`--force` the first time there was. Every unforced run after that is governed by the
-routine `guardMaxDeletePerRun` instead.
+large one: `guardMaxDeletePerRun` (default 14) is sized for a *routine* weekly batch on a
+dataset this tool already manages, so on its own it wouldn't reliably gate a first prune.
+Keepers are *computed*, not held — `minNewerHolds` (default 2) counts candidate
+weekly/monthly keepers derived from the snapshot dates themselves (no `zfs hold` needs to
+have ever been placed), so a cold backlog can have `doomed.Count > 0` from its very first
+run, well before any hold exists. Whether that count clears 14 on its own depends on how
+the backlog's dates land against ISO-week/month boundaries, not on a fixed day count —
+comfortably under 14 for roughly 2 weeks of backlog, but it's been observed to exceed 14
+in as little as ~18 days depending on alignment, so don't rely on any specific day count
+as a safe cutoff. Either way, a backlog short enough to stay under 14 would otherwise
+clear on the very first `--prune` with no confirmation. The cold-start floor closes that
+gap unconditionally: a dataset that has never been
+established requires `--force` for *any* nonzero doomed count — so the very first real
+`--prune` against this backlog will `WORRY`+`SKIP` with `cold start: would delete N` for
+any pre-existing backlog with something to destroy, regardless of how it compares to 14.
+That's the circuit-breaker doing its job, not an error — review the dry-run output, then
+do the one-time backlog cleanup with `--prune --force`. A dataset establishes the first time
+`--prune` completes for it — with no `--force` needed if there was nothing doomed yet
+(nothing destructive to review), or via `--force` the first time there was. Every unforced
+run after that is governed by the routine `guardMaxDeletePerRun` (14) instead.
 
 Once running continuously (not a cold start), steady state is different: a weekly keeper
 only becomes permanent when its ISO-week closes, so the dailies it stops covering become

@@ -754,39 +754,11 @@ done < "$WORK/destroyed52"
   && ok "T52 frontier never anchored on a keeper destroyed the same run (surviving-keeper invariant holds)" \
   || bad "T52 inv_viol=$inv_viol52 destroyed=$(wc -l < "$WORK/destroyed52" 2>/dev/null)"
 
-# ---- T53: guardMaxDeletePerRun's DEFAULT is derived per-policy from that policy's own
-#      minNewerHolds (7x), not one flat number for every policy — this is what makes
-#      archive/memories-style deep-tail policies (minNewerHolds=24, cap should auto-derive
-#      to 168) actually autonomous: their much larger one-time frontier-activation backlog
-#      (roughly 6x minNewerHolds, since 6 non-keeper dailies accumulate per closed ISO
-#      week while the frontier hasn't activated yet) would otherwise permanently exceed a
-#      flat cap sized for minNewerHolds=2's much smaller ~12-14 backlog. Reproduced with a
-#      dense ~250-day feed and minNewerHolds=24 (no explicit guardMaxDeletePerRun set —
-#      must auto-derive): doomed comes out around 90+ (comfortably over the OLD flat
-#      default of 14, proving this genuinely needs the scaled cap, not a coincidence) but
-#      well under the new derived cap of 24*7=168, so it must proceed with NO WORRY. ----
-gen_feed "$(date -u -d "$ADATE -250 days" +%Y-%m-%d)" > "$WORK/deep_tail"
-establish_oldest "$WORK/deep_tail" "$WORK/deep_tail_established"
-cat > "$WORK/cfg_deep_tail.json" <<EOF
-{ "logDir": "$WORK/logs", "zfsPath": "$WORK/bin/zfs", "guardRecentWindowDays": 10,
-  "retentionPolicies": { "baseline": { "dailyKeepDays": 30, "weeklyKeepDays": 1825, "monthlyKeepDays": 1825, "minNewerHolds": 24 } },
-  "datasets": { "archive/home/rich": "baseline" } }
-EOF
-rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"
-cp "$WORK/deep_tail_established" "$WORK/fz/snaps"; : > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
-OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/cfg_deep_tail.json" \
-       ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc 2>/dev/null)"
-destroy53=$(echo "$OUT" | grep -oE 'would destroy [0-9]+' | grep -oE '[0-9]+' | head -1)
-{ ! echo "$OUT" | grep -qi "WORRY" && [ -n "$destroy53" ] && [ "$destroy53" -gt 14 ] && [ "$destroy53" -le 168 ]; } \
-  && ok "T53 guardMaxDeletePerRun auto-derives from minNewerHolds (24*7=168 covers a $destroy53-doomed batch that would have tripped the old flat 14)" \
-  || bad "T53 (destroy=$destroy53, out: $(echo "$OUT" | tail -3 | tr '\n' '|'))"
-
 # ---- T54: minNewerHolds is upper-bounded (1-10000), rejected with a clean FATAL + exit 2,
-#      not silently allowed through to overflow the guardMaxDeletePerRun derivation
-#      (minNewerHolds * 7) — an unbounded value could wrap the int multiplication to a
-#      small/negative/huge-positive number, the last of which would silently DISABLE the
-#      volume circuit-breaker instead of erroring. Covers both validation sites: the
-#      per-policy check and the separate global top-level check. ----
+#      not silently allowed through as arbitrary user input — cheap insurance against any
+#      arithmetic that uses this value (kept even though guardMaxDeletePerRun is no longer
+#      derived FROM it; see the "Considered and rejected" note in zfs-hold-tight.cs).
+#      Covers both validation sites: the per-policy check and the global top-level check. ----
 cat > "$WORK/cfg_huge_policy.json" <<EOF
 { "logDir": "$WORK/logs", "zfsPath": "$WORK/bin/zfs",
   "retentionPolicies": { "baseline": { "dailyKeepDays": 30, "weeklyKeepDays": 1825, "monthlyKeepDays": 1825, "minNewerHolds": 700000000 } },
