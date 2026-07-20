@@ -51,11 +51,17 @@ for a pull-replication backup target where creating snapshots is impossible.
 
 ## How it works
 
-Each run, per dataset:
+First, once per run, **before** touching any individual dataset: a fleet-wide pre-pass
+lists every configured dataset (ignoring `--dataset`) and checks each for content shock
+(guards 4/5 — mass deletion / mass rewrite-encryption). If any dataset shows shock, or
+the fleet is already latched from a past run, every dataset below is frozen for this
+entire run regardless of its own result — see [Cross-dataset shock](#cross-dataset-shock).
+
+Then, per dataset:
 
 1. List the daily snapshots (`autosnap_<ts>_daily`).
-2. Run the [health guards](#safety-guards). If any fails, **HOLD** the dataset (no
-   deletions) and alert.
+2. Run the [health guards](#safety-guards). If any fails — including the fleet-wide
+   latch from the pre-pass above — **HOLD** the dataset (no deletions) and alert.
 3. Identify keepers: newest-per-ISO-week (weekly) and newest-per-month (monthly).
 4. Tag keepers with `<ns>:tier` + `<ns>:keep_until`; `zfs hold <ns>:monthly` the monthlies
    and `<ns>:weekly` the weekly-only keepers (`<ns>` = `propertyNamespace`, default `zht`).
@@ -66,6 +72,10 @@ Each run, per dataset:
    calendar floor that bounds how much daily-granularity history a single ISO-week close
    can collapse in one run. Never delete the replication base, a keeper within retention,
    or a held snapshot.
+6. On a clean pass (steps 2-5 all healthy), advance `<ns>:pruned_through` to today — a
+   persisted fact later runs use to tell "already legitimately pruned" from "a genuine
+   feed gap," instead of re-deriving that from whatever the retention policy happens to
+   be at the time (see [docs/MODEL.md](docs/MODEL.md)).
 
 ## Quick start
 
@@ -245,7 +255,7 @@ snapshot's full name follows the token.
 | `HOLD:ADD` | a `zfs hold` was placed (monthly keeper protected) | `grep HOLD:ADD` |
 | `HOLD:REMOVE` | a hold was released (demotion / weekly-downgrade / before destroy) | `grep HOLD:REMOVE` |
 | `META:ADD` | tier/keep_until tags written on a newly-tagged keeper | `grep META:ADD` |
-| `META:UPDATE` | an existing keeper's tag changed (e.g. weekly→monthly promotion), or the dataset's `<ns>:pruned_through` watermark advanced | `grep META:UPDATE` |
+| `META:UPDATE` | an existing keeper's tag changed (e.g. weekly→monthly promotion), a dataset's `<ns>:pruned_through` watermark advanced, or the fleet-wide `<ns>:health` latch changed | `grep META:UPDATE` |
 | `META:REMOVE` | tags inherited away on demotion | `grep META:REMOVE` |
 | `SNAP:DESTROY` | a snapshot was **pruned** (irreversible) | `grep SNAP:DESTROY` |
 
@@ -254,7 +264,7 @@ reason (`WORRY` or `ERROR`), and a failed individual op carries a `FAILED` suffi
 
 | token | meaning | grep |
 |---|---|---|
-| `WORRY` | a guard tripped (stale/gap/clock/shrink/churn/over-cap) — keepers protected, nothing deleted | `grep WORRY` |
+| `WORRY` | a guard tripped (stale/gap/clock/shrink/churn/over-cap), or the fleet-wide health latch is unhealthy — keepers protected, nothing deleted | `grep WORRY` |
 | `ERROR` | a `zfs` verification call (list/holds) failed — cannot proceed safely | `grep ERROR` |
 | `FAILED` | an individual op (hold/set/inherit/destroy) returned nonzero | `grep FAILED` |
 | `SKIP` | the dataset was withheld this run (verdict; see the `WORRY`/`ERROR` above it) | `grep SKIP` |
@@ -263,7 +273,10 @@ So "did anything get deleted this week?" → `grep SNAP:DESTROY logs/*.log`; "di
 wrong?" → `grep -E 'WORRY|ERROR|FAILED|SKIP' logs/*.log` (**empty = all clear**); "which build
 ran?" → `grep '^===' logs/*.log`. Invariants worth knowing: `HOLD:ADD == META:ADD/UPDATE` on
 monthlies, `HOLD:REMOVE == META:REMOVE` on demotions, and `SNAP:DESTROY` count matches the
-`PRUNED: kept N, destroyed X/Y` summary.
+`PRUNED: kept N, destroyed X/Y` summary. A raw `grep -c META:UPDATE` won't line up with
+`HOLD:ADD` 1:1 fleet-wide, though — `pruned_through` and `<ns>:health` writes also use the
+`META:UPDATE` token (they're metadata changes too, just not keeper-tag ones); scope the
+comparison to a single dataset's keeper lines if you need the strict count.
 
 ## Building
 
@@ -306,8 +319,15 @@ tests/run-tests.sh                       # or: tests/run-tests.sh path/to/zfs-ho
 
 The suite drives the tool against a fake `zfs` (`tests/fake-zfs`) — no real pool needed —
 and asserts the core invariant (*no week/month keeper is destroyed while within retention*)
-plus every
-guard, the hold lifecycle, the run-lock, and input validation. Requires the .NET SDK.
+plus every guard, the `pruned_through` watermark (including its exact boundary and a
+direct reproduction of the incident that motivated it — see
+[docs/MODEL.md](docs/MODEL.md)), the fleet-wide health latch, the hold lifecycle, the
+run-lock, and input validation. Requires the .NET SDK.
+
+The `pruned_through` watermark and the fleet-wide health latch are also modeled in TLA+
+and machine-checked (SANY + TLC) across billions of states, not just the hand-written
+fixtures above: [`docs/model/ZfsHoldTight.tla`](docs/model/ZfsHoldTight.tla) — see
+[docs/MODEL.md](docs/MODEL.md) for the design rationale and results.
 
 ## License
 
