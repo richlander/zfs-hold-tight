@@ -188,6 +188,14 @@ string tagMonthly = $"{ns}:monthly", tagWeekly = $"{ns}:weekly", tagAdhoc = $"{n
 // CURRENT retention policy, so raising minNewerHolds/dailyKeepDays can never retroactively
 // make already-legitimately-pruned history look like an unexplained gap.
 string propPrunedThrough = $"{ns}:pruned_through";
+// Fleet-wide (NOT per-dataset) latch: "starting" (never set) | "healthy" | "unhealthy".
+// Lives on the pool/prefix parent dataset (e.g. "archive"), not any one managed leaf --
+// there's one of these for the whole tool, not one per dataset. Set to "unhealthy" the
+// moment ANY dataset shows a content shock (guard 4/5); once set, EVERY dataset freezes
+// (no destroy, no pruned_through advance) on every subsequent run regardless of that
+// run's own guard results, until an operator runs --reset-health. See docs/MODEL.md
+// "Cross-dataset shock".
+string propHealth = $"{ns}:health";
 
 // Resolve zfs/curl to absolute trusted paths rather than trusting the (root) cron's PATH —
 // a writable earlier PATH element would otherwise be root code execution. Override with
@@ -215,6 +223,7 @@ var guardsByDataset = new Dictionary<string, Guards>();
 var policies = new Dictionary<string, Retention>();
 var policyGuards = new Dictionary<string, Guards>();
 const string DatasetPrefix = "archive/";  // allowlist: only prune archive/* datasets
+string poolDataset = DatasetPrefix.TrimEnd('/');  // where the fleet-wide health latch lives
 
 // Considered and rejected: deriving guardMaxDeletePerRun's default per-policy as
 // minNewerHolds * 7, on the theory that a policy's first-ever hold-frontier activation
@@ -320,7 +329,8 @@ if (sinceIdx >= 0)
 // Run-lock: serialize any run that mutates ZFS state (prune/fix/hold-*), so two
 // overlapping cron invocations can't double-process. Read-only modes skip the lock.
 bool willMutate = args.Contains("--prune") || args.Contains("--fix")
-    || args.Contains("--hold-adhoc") || args.Contains("--hold-latest-tier") || args.Contains("--hold-latest");
+    || args.Contains("--hold-adhoc") || args.Contains("--hold-latest-tier") || args.Contains("--hold-latest")
+    || args.Contains("--reset-health");
 FileStream? runLock = null;
 if (willMutate)
 {
@@ -410,6 +420,13 @@ if (args.Contains("--hold-latest"))
     return result;
 }
 
+if (args.Contains("--reset-health"))
+{
+    var result = ResetHealth(noHc);
+    configDoc?.Dispose();
+    return result;
+}
+
 bool prune = args.Contains("--prune");
 bool force = args.Contains("--force");
 bool verbose = args.Contains("-v") || args.Contains("--verbose");
@@ -422,10 +439,63 @@ int totalKeep = 0, totalDoom = 0, destroyAttempted = 0, destroySucceeded = 0, de
 var held = new List<string>();   // datasets held by a guard
 var metadataErrors = new List<string>();  // metadata/hold failures
 
+// ---- PRE-PASS: fleet-wide health check (docs/MODEL.md "Cross-dataset shock"). Lists
+//      EVERY dataset once — ignoring --dataset, a filtered run must not blind the
+//      fleet-wide latch to a shock on a dataset it isn't touching this run — and checks
+//      guards 4/5 (content shock: mass deletion / mass rewrite-encryption) on each. If
+//      ransomware is on the source machine, it plausibly hit every dataset, not just the
+//      one loud enough to trip its own threshold, so ANY single shock distrusts the WHOLE
+//      fleet, not just that dataset. Cached here so the main loop below doesn't re-list.
+var dsCache = new Dictionary<string, (int code, List<Snap> snaps, List<string> warnings)>();
+string? shockReason = null;
+foreach (var (dsP, retP) in retention)
+{
+    var (codeP, snapsP, warningsP) = ListDailies(dsP);
+    dsCache[dsP] = (codeP, snapsP, warningsP);
+    if (shockReason is not null) continue;   // already found one; still cache the rest
+    if (codeP != 0) { shockReason = $"{dsP}: zfs list failed, cannot verify"; continue; }
+    if (snapsP.Count == 0) continue;
+    var contentShock = ContentShockGuard(snapsP, guardsByDataset[dsP]);
+    if (contentShock is not null) shockReason = $"{dsP}: {contentShock}";
+}
+
+// health: "" (never set, shown as "starting") | "healthy" | "unhealthy". A read FAILURE
+// fails toward frozen (globalFreeze = true) -- unlike pruned_through's read failure,
+// which fails toward the merely-cautious direction, not being able to verify whether the
+// fleet is ALREADY latched unhealthy must not be silently treated as "fine" (same
+// reasoning a `zfs holds` failure already SKIPs a dataset elsewhere in this tool).
+var (healthOk, health) = LoadHealth();
+bool globalFreeze; string healthLabel; string freezeReason;
+if (!healthOk)
+{
+    globalFreeze = true; healthLabel = "unknown";
+    freezeReason = "cannot verify fleet-wide health state (zfs get failed) — failing toward frozen";
+}
+else if (health == "unhealthy")
+{
+    globalFreeze = true; healthLabel = "unhealthy";
+    freezeReason = "already latched unhealthy — run --reset-health after review";
+}
+else if (shockReason is not null)
+{
+    globalFreeze = true; healthLabel = "unhealthy";
+    freezeReason = $"content shock detected — {shockReason}";
+    if (prune) { var (_, whMsg) = WriteHealth("unhealthy", shockReason); Log(whMsg); }
+}
+else
+{
+    globalFreeze = false; healthLabel = "healthy"; freezeReason = "";
+    // First-ever clean pass: "starting" -> "healthy". Never the reverse direction of
+    // "unhealthy" -> anything -- that's --reset-health's job alone (see ResetHealth).
+    if (prune && health == "") { var (_, whMsg) = WriteHealth("healthy", null); Log(whMsg); }
+}
+if (globalFreeze)
+    Log($"*** FLEET STATE: {healthLabel} — {freezeReason} ***");
+
 foreach (var (ds, ret) in retention)
 {
     if (only is not null && ds != only) continue;
-    var (listCode, snaps, listWarnings) = ListDailies(ds);
+    var (listCode, snaps, listWarnings) = dsCache[ds];
     foreach (var w in listWarnings) Log(w);
     if (listCode != 0)
     {
@@ -527,17 +597,28 @@ foreach (var (ds, ret) in retention)
     // ---- run-level guards. On a worry, protection only ever INCREASES: still hold the
     //      monthly keepers (even the suspect newest — a false positive costs nothing, and
     //      we don't want to skip the hold and lose the chance later) and record a worry
-    //      breadcrumb on the tip — but never release a hold or delete anything. ----
-    string? guard = HealthGuard(snaps, ret, gd, prunedThrough);
+    //      breadcrumb on the tip — but never release a hold or delete anything. Combined
+    //      with the fleet-wide health latch (docs/MODEL.md "Cross-dataset shock"): EITHER
+    //      this dataset's own guard tripping OR the fleet latch alone is enough to
+    //      withhold it, and a dataset that tripped its OWN guard still gets its specific
+    //      reason + worry tag rather than just the generic fleet message — only a dataset
+    //      that's frozen purely as collateral (its own guards are clean) falls back to
+    //      that. Either way, no destroy and no pruned_through advance while either is
+    //      true (see FrozenWhileUnhealthyStep in docs/model/ZfsHoldTight.tla). ----
+    string? ownGuard = HealthGuard(snaps, ret, gd, prunedThrough);
+    string? guard = ownGuard ?? (globalFreeze ? $"fleet health {healthLabel}: {freezeReason}" : null);
     if (guard is not null)
     {
         Log($"{ds}: WORRY - {guard} ({keepersHeld}/{keeperNames.Count} keepers held)");
         if (prune)
         {
             HoldCandidateKeepersDefensively("worry");
-            var (wc, _, we) = Exec("zfs", "set", $"{ns}:worry={now:yyyy-MM-dd} {guard}", newest);
-            if (wc == 0) Log($"  META:ADD {newest} {ns}:worry={now:yyyy-MM-dd} {guard}");
-            else Log($"    META:ADD {Short(newest)} FAILED: {we.Trim()}");
+            if (ownGuard is not null)
+            {
+                var (wc, _, we) = Exec("zfs", "set", $"{ns}:worry={now:yyyy-MM-dd} {ownGuard}", newest);
+                if (wc == 0) Log($"  META:ADD {newest} {ns}:worry={now:yyyy-MM-dd} {ownGuard}");
+                else Log($"    META:ADD {Short(newest)} FAILED: {we.Trim()}");
+            }
         }
         Log($"{ds}: SKIP - guard tripped (keepers protected, no deletions)");
         held.Add($"{ds}: {guard}");
@@ -737,6 +818,37 @@ int HoldAdhoc(string snap, bool noHc)
     return 0;
 }
 
+// ---- reset the fleet-wide health latch back to healthy -- the ONLY way it clears.
+//      Never bundled with --force (that means something else entirely: bypass the
+//      routine volume cap) -- an operator's habitual --force reflex must never double
+//      as "yes, I reviewed a possible mass-deletion/encryption event." A separate,
+//      explicitly-named command that does only this one thing. ----
+int ResetHealth(bool noHc)
+{
+    var lines = new List<string>();
+    void Log(string m) { Console.WriteLine(m); lines.Add(m); }
+    var now = DateTime.UtcNow;
+    Log($"=== zfs-hold-tight {Version} {now:yyyy-MM-dd HH:mm:ss}Z  mode=reset-health ===");
+
+    var (ok, health) = LoadHealth();
+    if (!ok) { Log("FAIL: zfs get failed, cannot verify current health state"); FlushLog(lines); return 1; }
+    if (health != "unhealthy")
+    {
+        string shown = health == "" ? "starting" : health;
+        Log($"Nothing to reset: current state is {shown}, not unhealthy");
+        FlushLog(lines);
+        if (!noHc) HcPing(hcUrl + "/reset-health", $"no-op: state was {shown}");
+        return 0;
+    }
+
+    var (wok, msg) = WriteHealth("healthy", "reset via --reset-health");
+    Log(msg);
+    FlushLog(lines);
+    if (!noHc)
+        HcPing(wok ? hcUrl + "/reset-health" : hcUrl + "/fail", wok ? "ok: health reset to healthy" : "reset-health: write failed");
+    return wok ? 0 : 1;
+}
+
 // ---- check holds exceeding retention ----
 int CheckHolds(bool noHc)
 {
@@ -803,6 +915,17 @@ int Summary(string? datasetFilter, DateTime? since)
     // straight into the pushed summary file, so it must stay a strict, well-formed
     // markdown table.
     void LogFile(string m) { lines.Add(m); }
+
+    // Fleet-wide health banner (docs/MODEL.md "Cross-dataset shock") -- prepended so it's
+    // unmissable at the top of exactly the artifact an operator actually reads (this
+    // Console output is what nightly.sh pushes verbatim). A plain bold markdown line, not
+    // part of the table, so a strict markdown-table parser downstream still sees a
+    // well-formed table starting at the next line either way.
+    var (healthOk, health) = LoadHealth();
+    if (!healthOk)
+        Log("**STATE: unknown — cannot verify fleet-wide health (zfs get failed); treat as unhealthy until confirmed otherwise**\n");
+    else if (health == "unhealthy")
+        Log("**STATE: unhealthy — frozen fleet-wide (no dataset prunes, no pruned_through advances) until `--reset-health` runs after review**\n");
 
     Log("| Dataset | Monthlies | Weeklies | Dailies | Start | End | Continuity |");
     Log("|---|---|---|---|---|---|---|");
@@ -900,6 +1023,14 @@ int Doctor(string? datasetFilter)
     var lines = new List<string>();
     void Log(string m) { Console.WriteLine(m); lines.Add(m); }
     Log($"=== zfs-hold-tight {Version} {now:yyyy-MM-dd HH:mm:ss}Z  mode=doctor ===");
+
+    // Fleet-wide health latch (docs/MODEL.md "Cross-dataset shock") -- surfaced first so
+    // it's the first thing an operator running --doctor sees.
+    var (healthOk, health) = LoadHealth();
+    if (!healthOk)
+        Log("FLEET STATE: unknown — cannot verify (zfs get failed); treat as unhealthy until confirmed otherwise");
+    else
+        Log($"FLEET STATE: {(health == "" ? "starting" : health)}" + (health == "unhealthy" ? " — run --reset-health after review" : ""));
 
     int missing = 0, protected_ = 0, adhoc_ = 0, orphaned = 0, errors = 0;
     foreach (var (ds, _) in retention)
@@ -1110,6 +1241,28 @@ string? HealthGuard(List<Snap> snaps, Retention ret, Guards gd, DateTime prunedT
         return $"gap in last {gd.RecentWindowDays}d: missing {string.Join(",", missing)} (pruned_through={pt})";
     }
 
+    string? shock = ContentShockGuard(snaps, gd);
+    if (shock is not null) return shock;
+
+    // population note (informational): under the two-holds invariant nothing is droppable
+    // until the derived destroy depth of held keepers exists (a keeper ≈ one per ISO-week/month).
+    int keeperWeeks = snaps.Select(s => (ISOWeek.GetYear(s.Date), ISOWeek.GetWeekOfYear(s.Date))).Distinct().Count();
+    int destroyDepth = ret.MinNewerHolds;
+    if (keeperWeeks < destroyDepth)
+        Log($"  note: only ~{keeperWeeks} held keeper(s) so far, need {destroyDepth} newer before any daily drops");
+    return null;
+}
+
+// Guards 4-5 only: content-level "shock" (mass deletion / mass rewrite-encryption),
+// extracted from HealthGuard so the cross-dataset pre-pass (see the fleet-wide
+// <ns>:health latch, docs/MODEL.md "Cross-dataset shock") can check it for every
+// dataset BEFORE any dataset commits to destroying anything, without duplicating the
+// threshold logic. A dataset's own per-run HealthGuard call still goes through this
+// same function, so the two can never drift apart.
+string? ContentShockGuard(List<Snap> snaps, Guards gd)
+{
+    var newest = snaps.Max(s => s.Date);
+    var newestSnap = snaps.MaxBy(s => s.Date)!;
     // baseline = recent dailies of THIS dataset (so a small dataset is judged on its own scale)
     var baseline = snaps.Where(s => s.Name != newestSnap.Name && s.Date >= newest.AddDays(-gd.RecentWindowDays))
                         .ToList();
@@ -1134,13 +1287,6 @@ string? HealthGuard(List<Snap> snaps, Retention ret, Guards gd, DateTime prunedT
         if (nwr > nrf * gd.MaxDailyChurnPct / 100.0)
             return $"newest daily churned {100.0 * nwr / nrf:F0}% ({nwr / 1048576}MiB written vs {nrf / 1048576}MiB referenced, > {gd.MaxDailyChurnPct}%) — possible mass rewrite/encryption on source";
     }
-
-    // population note (informational): under the two-holds invariant nothing is droppable
-    // until the derived destroy depth of held keepers exists (a keeper ≈ one per ISO-week/month).
-    int keeperWeeks = snaps.Select(s => (ISOWeek.GetYear(s.Date), ISOWeek.GetWeekOfYear(s.Date))).Distinct().Count();
-    int destroyDepth = ret.MinNewerHolds;
-    if (keeperWeeks < destroyDepth)
-        Log($"  note: only ~{keeperWeeks} held keeper(s) so far, need {destroyDepth} newer before any daily drops");
     return null;
 }
 
@@ -1190,6 +1336,34 @@ DateTime? LoadPrunedThrough(string ds)
     if (code != 0) return null;
     var v = outp.Trim();
     return long.TryParse(v, out var secs) ? DateTimeOffset.FromUnixTimeSeconds(secs).UtcDateTime : (DateTime?)null;
+}
+
+// Reads the fleet-wide <ns>:health latch (see propHealth above). Returns (false, _) on
+// a read FAILURE -- unlike LoadPrunedThrough, this fails toward the CAUTIOUS direction:
+// if we can't even verify whether the fleet is already latched unhealthy, we must not
+// silently assume it's fine (same reasoning `zfs holds` failures already SKIP a dataset
+// elsewhere in this tool). Returns (true, "") for never-set (reported as "starting"),
+// otherwise (true, "healthy") or (true, "unhealthy").
+(bool ok, string value) LoadHealth()
+{
+    var (code, outp, _) = Exec("zfs", "get", "-H", "-o", "value", propHealth, poolDataset);
+    if (code != 0) return (false, "");
+    var v = outp.Trim();
+    return (true, v == "-" ? "" : v);
+}
+
+// Writes the fleet-wide health latch. Does NOT log itself -- unlike most write helpers
+// in this file, this one is called both from the main top-level prune loop (whose Log()
+// it could safely close over) AND from the standalone --reset-health command (which has
+// its OWN separate `lines`/Log()); a shared top-level Log() call here would lexically
+// resolve to the main loop's `lines` regardless of which caller invoked it, silently
+// never reaching --reset-health's own log file (the exact bug class ListDailies's own
+// comment already documents once). Caller logs the returned message with its own Log().
+(bool ok, string message) WriteHealth(string value, string? reason)
+{
+    var (c, _, e) = Exec("zfs", "set", $"{propHealth}={value}", poolDataset);
+    if (c != 0) return (false, $"    META:UPDATE {poolDataset} {propHealth} FAILED: {e.Trim()}");
+    return (true, $"  META:UPDATE {poolDataset} {propHealth}={value}" + (reason is null ? "" : $" ({reason})"));
 }
 
 // Annotate one snapshot for its current tier. Returns false if any write failed.

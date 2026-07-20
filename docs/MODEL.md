@@ -125,6 +125,69 @@ oscillating, `dailyKeepDays` dropping right after being raised, a policy change
 mid-backlog). That's precisely the class of scenario that let both real incidents in
 this history slip past 63 hand-written test cases.
 
+## Cross-dataset shock
+
+Everything above is about a *single* dataset's own timeline. That's not the whole
+threat model. The invariant to protect is different in kind:
+
+- One or more datasets shows a **snapshot shock** — guard 4 or 5 tripping (e.g. 50% of
+  files disappear or change in one daily).
+- The response must be: **no snapshots across ANY dataset are pruned, and no
+  `pruned_through` anywhere advances** — not just on the dataset that tripped.
+
+**Why per-dataset isolation is the wrong default here.** The tool's existing operational
+guarantee (`docs/SAFETY.md` #17, tested by the old T18) was "a guard tripping on one
+dataset HOLDs only that dataset; healthy datasets still prune." That's the right call for
+guards 1-3 (a feed gap or staleness on one dataset says little about the others), but
+wrong for guards 4-5: if ransomware is on the source machine, it plausibly touched every
+dataset, not just the one loud enough — or configured with a tight enough threshold — to
+trip its own guard. The others may already be compromised too, just under threshold, or
+on a policy that relaxed the churn guard (e.g. `volatile`, which disables it entirely).
+Trusting them to keep pruning normally because *their own* number didn't cross a line is
+exactly the reasoning this tool exists to distrust.
+
+**The response also can't self-heal.** "Self-functioning, but a shock requires a reset"
+means: once flagged, the tool must NOT resume automatically just because a later run's
+own numbers look clean again — that's not evidence of safety, it could just mean the
+attacker moved on to slower, quieter changes. This needs a **latch**, not a live
+recheck: a state that only a human, having actually reviewed the incident, can clear.
+
+**Design, borrowing Docker's health-check vocabulary (not its auto-recovery
+behavior):** a new, fleet-wide (not per-dataset) `<ns>:health` property, stored on the
+pool/prefix parent dataset (e.g. `archive`), with three values:
+
+- `starting` (property never set — no verdict established yet)
+- `healthy` (normal)
+- `unhealthy` (latched — frozen)
+
+Unlike Docker's own `unhealthy`, which clears automatically the moment its check passes
+again, this one **only** clears via an explicit `--reset-health` command — never via
+`--force` (which already means something unrelated: bypass the routine volume cap, not
+"I reviewed a possible mass-deletion/encryption event"), and never automatically.
+
+Mechanically: every `--prune`/dry-run first does a pre-pass across **every** configured
+dataset (ignoring `--dataset` — a filtered run must not blind the fleet-wide latch to a
+shock on a dataset it isn't touching this run), checking guards 4/5 in isolation. If any
+dataset shows shock, or the latch is already `unhealthy`, or the health property itself
+can't be read (fails toward frozen, not toward assuming it's fine), every dataset this
+run holds its keepers defensively and skips destroy + the `pruned_through` advance — the
+dataset that actually tripped its own guard still gets its specific reason and
+`<ns>:worry` tag; the others fall back to the generic fleet message.
+
+This is modeled as an extension to `docs/model/ZfsHoldTight.tla`: `health` is a variable
+shared by the whole fleet (not scoped to the one dataset the rest of the model already
+tracks in detail); `Shock` is an exogenous, nondeterministic action standing in for
+"guard 4/5 tripped on SOME dataset" (which one, and the actual shrink/churn byte-percent
+arithmetic, is a mundane numeric threshold check, not the bug-prone part — the latch's
+behavior is); `ResetHealth` is the only transition back. The property that matters:
+`FrozenWhileUnhealthyStep` — while `health` is unhealthy before AND after a step, no
+`Prune` action may destroy anything or advance `prunedThrough`, no matter how clean that
+dataset's own feed looks. An early version of this property said "`snaps` must be
+completely unchanged," and TLC immediately found a `Shock`-then-`AdvanceDay`
+counterexample — correctly: replication delivering a new daily is an exogenous event
+this tool doesn't control and shouldn't try to block. Only destroy (snaps *shrinking*)
+and a `pruned_through` advance are actually forbidden; fixed to say exactly that.
+
 ## Status
 
 **Modeled and validated.** `docs/model/ZfsHoldTight.tla` is a TLA+ encoding of the
@@ -157,3 +220,19 @@ a dataset with history already pruned under the old policy, re-evaluated under
 already-certified gap. T4b tests the watermark's boundary is exact (excused at the
 watermark, not the day after); T59/T59b confirm the watermark only ever advances on a
 run that was actually healthy.
+
+**Cross-dataset shock latch: modeled, validated, implemented.** The `health`/`Shock`/
+`ResetHealth` extension parsed clean with SANY; TLC model-checked it exhaustively at the
+same bounds plus the two new actions — 1,919,526,996 states generated, 128,050,380
+distinct states found, search depth 25, zero violations of `FrozenWhileUnhealthyStep` or
+`NoAutoRecoveryStep` (fingerprint-collision estimate ~1.2% at that scale — noted
+honestly, not claimed as 100% exhaustive). Implemented as `<ns>:health` on the pool
+dataset, a pre-pass in `zfs-hold-tight.cs` that checks guards 4/5 across every configured
+dataset before any dataset commits to anything, and a new `--reset-health` command that
+is the only way to clear it. `tests/run-tests.sh`: T18 (rewritten — a shock on one
+dataset now freezes the entire fleet, reversing what it used to check), T60 (the latch
+does not auto-heal across a second, individually-clean run), T61 (`--reset-health`
+clears it and a subsequent prune proceeds normally), T62 (`--reset-health` is a safe
+no-op when not latched), T63 (`--force` does not clear it), T64 (`--dataset` filtering
+doesn't blind the pre-pass to a shock on a different dataset), T65 (a clean first run
+explicitly writes `health=healthy`, not left implicit).

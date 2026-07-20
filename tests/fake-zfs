@@ -59,8 +59,14 @@ case "$sub" in
                 p="${args[$i]%%=*}"; v="${args[$i]#*=}"
                 esc_t=$(printf '%s' "$target" | sed 's/[.[\*^$]/\\&/g')
                 esc_p=$(printf '%s' "$p" | sed 's/[.[\*^$]/\\&/g')
-                [ -f "$D/dsprops" ] && grep -vP "^${esc_t}\t${esc_p}\t" "$D/dsprops" > "$D/dsprops.tmp" 2>/dev/null \
-                  && mv "$D/dsprops.tmp" "$D/dsprops"
+                # NOT `grep ... && mv ...`: grep -v exits 1 (no output) when EVERY line
+                # matches (i.e. dsprops has exactly one prior entry for this target+prop),
+                # which would short-circuit past the mv and leave the stale line in place
+                # -- the very next append then leaves BOTH the old and new value present.
+                if [ -f "$D/dsprops" ]; then
+                  grep -vP "^${esc_t}\t${esc_p}\t" "$D/dsprops" > "$D/dsprops.tmp" 2>/dev/null
+                  mv "$D/dsprops.tmp" "$D/dsprops"
+                fi
                 printf '%s\t%s\t%s\n' "$target" "$p" "$v" >> "$D/dsprops"
                 ;;
             esac

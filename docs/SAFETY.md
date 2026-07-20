@@ -121,12 +121,13 @@ content guards while a churny scratch policy relaxes them).
 4. **No sudden data shrinkage.** If the newest daily references more than
    `guardMaxDailyShrinkPct` (default 33%) less data than the recent baseline median, HOLD
    — a likely mass deletion on the source. Catches outright **deletion** (`referenced`
-   drops). Set to 0 to disable.
+   drops). Set to 0 to disable. **Fleet-wide, not per-dataset** — see guard 20.
 5. **No excessive churn.** If the newest daily's `written` (bytes changed since the prior
    snapshot) exceeds `guardMaxDailyChurnPct` (default 50%) of the dataset's `referenced`
    size, HOLD — a likely mass rewrite / **in-place encryption** (which guard 4 misses,
    since encryption preserves size while scrambling contents). Heuristic: legitimately
    churny datasets will trip it, so relax/disable it per policy. Set to 0 to disable.
+   **Fleet-wide, not per-dataset** — see guard 20.
 6. **Volume circuit-breaker.** A single run may not delete more than
    `guardMaxDeletePerRun` (default 14 — 2x the 7-day ISO-week cadence) snapshots for one
    dataset without `--force`. A weekly keeper only becomes permanent when its ISO-week
@@ -214,6 +215,13 @@ and healthchecks `/fail` ping instead, not a snapshot property.
 > pre-incident keepers survive defender-side for years (independent of the source), so you
 > recover by rolling back to one as long as you notice within the retention window.
 >
+> Detection, when it does fire, now also distrusts the whole fleet, not just the dataset
+> that tripped — see guard 20. A ransomware attacker on the source machine plausibly hit
+> every dataset, not just the one loud enough to cross its own threshold; the others may
+> already be compromised too, just under threshold or on a policy that relaxed the churn
+> guard. Trusting them to keep pruning normally because *their own* number didn't cross a
+> line would be exactly the reasoning this tool exists to distrust.
+>
 > That fallback has a sharp edge worth naming: the weekly keeper for a week that's still
 > being actively attacked is, by construction, the *newest* day of that week — plausibly
 > the most-corrupted point in it. Before `dailyKeepDays` existed, the two-holds invariant
@@ -245,14 +253,40 @@ and healthchecks `/fail` ping instead, not a snapshot property.
 ## Operational guarantees
 
 16. **Dry-run by default.** Deletion happens only with `--prune`.
-17. **Per-dataset isolation.** A guard tripping on one dataset HOLDs only that dataset;
-    healthy datasets still prune. A global fault (e.g. a bad clock) HOLDs everything.
+17. **Per-dataset isolation — guards 1-3, 6-8 only.** A guard tripping on one dataset
+    HOLDs only that dataset; healthy datasets still prune. A global fault (e.g. a bad
+    clock) HOLDs everything. Guards 4-5 are the deliberate exception — see guard 20.
 18. **Single run at a time.** A mutating run takes an exclusive lock; a second overlapping
     run exits without touching anything.
 19. **Always logs; alerts on trouble.** Every run appends a timestamped record to the log
     directory (and stdout). On `--prune` it pings healthchecks.io on a clean run, and
     `<url>/fail` (with diagnostics) whenever any guard HOLDs a dataset or a destroy fails
     — so an unhealthy-but-not-pruning state is **visible, never silent**.
+20. **Cross-dataset shock latch.** Guards 4-5 are the one exception to per-dataset
+    isolation (guarantee 17): if content shock is detected on **any** configured
+    dataset — checked in a pre-pass that runs before any dataset commits to anything,
+    and that always scans every configured dataset regardless of `--dataset` filtering
+    — a fleet-wide `<ns>:health` property (stored on the pool/prefix parent dataset,
+    e.g. `archive`, not any one managed leaf) latches to `unhealthy`. While latched,
+    **every** dataset holds its keepers defensively and withholds destroy + the
+    `pruned_through` advance, regardless of how clean that dataset's own feed looks that
+    run — the dataset that actually tripped its own guard still gets its specific reason
+    and `<ns>:worry` tag; others fall back to the generic fleet message. Values:
+    `starting` (never set) / `healthy` / `unhealthy`. Borrows Docker's health-check
+    vocabulary, **not** its auto-recovery behavior: unlike a Docker container, this does
+    **not** clear itself the moment a later run looks clean again — a quieter run is not
+    evidence of safety, since a patient attacker may simply have moved on to slower
+    changes. The **only** way to clear it is the explicit `--reset-health` command
+    (`unhealthy` → `healthy`); never `--force` (which already means something
+    unrelated — bypass the routine volume cap, not "I reviewed a possible mass
+    deletion/encryption event"), and never automatically. A read failure on the health
+    property itself fails toward frozen, the same direction as a `zfs holds` failure
+    already SKIPs a dataset elsewhere in this tool — not being able to verify the fleet
+    isn't already latched must never be silently treated as "fine." Modeled and
+    model-checked in `docs/model/ZfsHoldTight.tla` (`Shock`/`ResetHealth` actions,
+    `FrozenWhileUnhealthyStep`/`NoAutoRecoveryStep` properties); full design rationale in
+    `docs/MODEL.md` "Cross-dataset shock"; reproduced against the real implementation in
+    `tests/run-tests.sh` T18/T60-T65.
 
 ## Worked example (the trap guards 1–2 prevent)
 

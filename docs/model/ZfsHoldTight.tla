@@ -16,7 +16,14 @@
    Parsed with SANY and model-checked with TLC against ZfsHoldTight.cfg: zero
    violations across 51.4M distinct states (see docs/MODEL.md Status section for the
    full run parameters and result). Implemented in zfs-hold-tight.cs and covered by
-   tests/run-tests.sh T58/T4b/T59/T59b against the real code, not just this model. *)
+   tests/run-tests.sh T58/T4b/T59/T59b against the real code, not just this model.
+
+   Extended with the cross-dataset health latch (docs/MODEL.md "Cross-dataset shock"
+   section): `health` is deliberately modeled as a variable shared by the whole fleet,
+   not scoped to the one dataset the rest of this model already tracks in detail --
+   `Shock` is an exogenous, nondeterministic action standing in for "guard 4/5 tripped
+   on SOME dataset" (which one, and the shrink/churn byte-threshold arithmetic itself,
+   is a mundane numeric check, not the bug-prone part; the latch's behavior is). *)
 
 EXTENDS Integers, FiniteSets, TLC
 
@@ -49,9 +56,10 @@ VARIABLES
     prunedThrough,   \* persisted watermark: everything <= this was already decided
     minNewerHolds,   \* current policy value -- CAN change mid-run, that's the point
     dailyKeepDays,   \* current policy value -- CAN change mid-run
-    lastVerdict      \* "n/a" | "ok" | "worry" -- last guard verdict, for inspection
+    lastVerdict,     \* "n/a" | "ok" | "worry" -- last guard verdict, for inspection
+    health           \* "starting" | "healthy" | "unhealthy" -- fleet-wide, not per-dataset
 
-vars == << now, snaps, prunedThrough, minNewerHolds, dailyKeepDays, lastVerdict >>
+vars == << now, snaps, prunedThrough, minNewerHolds, dailyKeepDays, lastVerdict, health >>
 
 TypeOK ==
     /\ now \in Nat
@@ -60,6 +68,7 @@ TypeOK ==
     /\ minNewerHolds \in MinNewerHoldsValues
     /\ dailyKeepDays \in DailyKeepDaysValues
     /\ lastVerdict \in {"n/a", "ok", "worry"}
+    /\ health \in {"starting", "healthy", "unhealthy"}
 
 (* ---- Question 1: is it safe to delete this snapshot right now? -------------------
    A pure function of the CURRENT snaps and CURRENT policy. Re-deriving this fresh
@@ -105,40 +114,66 @@ Init ==
     /\ minNewerHolds \in MinNewerHoldsValues
     /\ dailyKeepDays \in DailyKeepDaysValues
     /\ lastVerdict = "n/a"
+    /\ health = "starting"
 
 \* A new daily snapshot arrives (replication happened normally).
 AdvanceDay ==
     /\ now < MaxDay
     /\ now' = now + 1
     /\ snaps' = snaps \union {now'}
-    /\ UNCHANGED << prunedThrough, minNewerHolds, dailyKeepDays, lastVerdict >>
+    /\ UNCHANGED << prunedThrough, minNewerHolds, dailyKeepDays, lastVerdict, health >>
 
 \* A day is missed (genuine replication gap) -- included so the model can also check
 \* that a REAL gap still trips the guard, not just that legitimate pruning doesn't.
 MissDay ==
     /\ now < MaxDay
     /\ now' = now + 1
-    /\ UNCHANGED << snaps, prunedThrough, minNewerHolds, dailyKeepDays, lastVerdict >>
+    /\ UNCHANGED << snaps, prunedThrough, minNewerHolds, dailyKeepDays, lastVerdict, health >>
 
 \* The operator changes policy -- the exact real-world event that triggered the
 \* incident this model exists to prevent a recurrence of.
 ChangePolicy ==
     /\ minNewerHolds' \in MinNewerHoldsValues
     /\ dailyKeepDays' \in DailyKeepDaysValues
-    /\ UNCHANGED << now, snaps, prunedThrough, lastVerdict >>
+    /\ UNCHANGED << now, snaps, prunedThrough, lastVerdict, health >>
+
+\* Content shock (guard 4/5) detected on SOME dataset -- see the header comment on why
+\* this is modeled as an exogenous event rather than derived from this one dataset's
+\* own snaps. Can fire from "starting" or "healthy"; a no-op if already "unhealthy"
+\* (the latch doesn't need re-tripping, and re-tripping must never look like a fresh
+\* event that could confuse "when did this start").
+Shock ==
+    /\ health # "unhealthy"
+    /\ health' = "unhealthy"
+    /\ UNCHANGED << now, snaps, prunedThrough, minNewerHolds, dailyKeepDays, lastVerdict >>
+
+\* The ONLY transition back to healthy: an explicit, deliberate operator action
+\* (--reset-health in the real tool). Never fires automatically, never bundled with
+\* Prune or any other action -- see NoAutoRecoveryStep below.
+ResetHealth ==
+    /\ health = "unhealthy"
+    /\ health' = "healthy"
+    /\ UNCHANGED << now, snaps, prunedThrough, minNewerHolds, dailyKeepDays, lastVerdict >>
 
 \* A --prune run: computes the guard verdict from the PERSISTED watermark (never from
-\* policy) and, only on a healthy verdict, destroys the doomed set AND signs off
-\* through today. A WORRY run changes nothing (protection only ever increases).
+\* policy). Holds/tags would still be refreshed in the real tool even while frozen
+\* ("protection only ever increases"), but destroying anything and advancing
+\* prunedThrough both require mayMutate -- healthy AND not latched unhealthy. A global
+\* freeze must block mutation even on a run where THIS dataset's own feed looks
+\* perfectly clean; that's the whole point of the cross-dataset invariant. The first
+\* ever clean run also transitions health from "starting" to "healthy" -- it never
+\* transitions FROM "unhealthy": that's ResetHealth's job alone.
 Prune ==
-    LET healthy == FeedHealthy(snaps, prunedThrough, now, GuardRecentWindowDays)
-        doomed  == Doomed(snaps, now, minNewerHolds, dailyKeepDays)
+    LET healthy   == FeedHealthy(snaps, prunedThrough, now, GuardRecentWindowDays)
+        doomed    == Doomed(snaps, now, minNewerHolds, dailyKeepDays)
+        mayMutate == healthy /\ health # "unhealthy"
     IN /\ lastVerdict'    = IF healthy THEN "ok" ELSE "worry"
-       /\ snaps'          = IF healthy THEN snaps \ doomed ELSE snaps
-       /\ prunedThrough'  = IF healthy THEN now ELSE prunedThrough
+       /\ snaps'          = IF mayMutate THEN snaps \ doomed ELSE snaps
+       /\ prunedThrough'  = IF mayMutate THEN now ELSE prunedThrough
+       /\ health'         = IF health = "starting" /\ mayMutate THEN "healthy" ELSE health
        /\ UNCHANGED << now, minNewerHolds, dailyKeepDays >>
 
-Next == AdvanceDay \/ MissDay \/ ChangePolicy \/ Prune
+Next == AdvanceDay \/ MissDay \/ ChangePolicy \/ Prune \/ Shock \/ ResetHealth
 
 Spec == Init /\ [][Next]_vars
 
@@ -177,5 +212,30 @@ WatermarkNeverAheadOfNow == prunedThrough <= now
 \* is a bug in the invariant's phrasing, not in Doomed: caught by TLC on the very first
 \* run, exactly the kind of mistake this exercise exists to catch.
 BaseNeverDestroyedStep == [][ (snaps # {}) => (MaxOfSet(snaps) \in snaps') ]_vars
+
+\* ---- Cross-dataset health latch ----
+
+\* The core property the latch exists to guarantee: while health is unhealthy BEFORE a
+\* step and STILL unhealthy AFTER it (i.e. that step wasn't the ResetHealth that clears
+\* it), no PRUNE ACTION may mutate anything -- no destroy, no prunedThrough advance --
+\* no matter how healthy THIS dataset's own feed looks, while the fleet-wide latch is
+\* tripped. Deliberately NOT "snaps unchanged": AdvanceDay (replication delivering a new
+\* daily) is an EXOGENOUS event this tool doesn't control and shouldn't try to block --
+\* an earlier version of this property said snaps' = snaps and TLC immediately found the
+\* Shock-then-AdvanceDay counterexample, which is legitimate, expected behavior, not a
+\* bug: only DESTROY (snaps shrinking) and a prunedThrough advance are actually
+\* forbidden. Exhaustively checked across every interleaving of Shock/ResetHealth with
+\* AdvanceDay/MissDay/ChangePolicy/Prune, including sequences no one would hand-write.
+FrozenWhileUnhealthyStep ==
+    [][ (health = "unhealthy" /\ health' = "unhealthy") =>
+            (snaps \subseteq snaps' /\ prunedThrough' = prunedThrough) ]_vars
+
+\* No action other than the explicit ResetHealth ever clears the latch -- true by
+\* construction (Prune's health' formula only ever touches the "starting" case; Shock
+\* only ever sets "unhealthy"), same as PolicyIndependence above: the design goal is
+\* that no OTHER action even has a code path that could clear it, not merely that none
+\* currently does. Checked anyway as a cheap regression guard against a future edit
+\* accidentally adding one.
+NoAutoRecoveryStep == [][ (health = "unhealthy" /\ health' # "unhealthy") => (health' = "healthy") ]_vars
 
 ====

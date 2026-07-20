@@ -108,7 +108,8 @@ run as a user able to `zfs destroy`/`hold` the target datasets (usually root).
 | `--hold-adhoc <snap>` | Defensive manual `<ns>:adhoc` hold on one snapshot. |
 | `--hold-latest-tier <daily\|weekly\|monthly>` | Hold the newest snapshot of a tier. |
 | `--hold-latest` | Shorthand for `--hold-latest-tier daily`. |
-| `--dataset <name>` | Limit `--doctor`/`--summary`/`--fix`/`--prune` to one dataset. |
+| `--reset-health` | Clear the fleet-wide `<ns>:health` shock latch (`unhealthy` → `healthy`). The **only** way it clears — never `--force`, never automatically. No-op (exit 0) if not currently `unhealthy`. |
+| `--dataset <name>` | Limit `--doctor`/`--summary`/`--fix`/`--prune` to one dataset. Does **not** limit the fleet-wide shock pre-pass (see [Safety guards](#safety-guards)) — a shock on a dataset outside the filter still freezes the one(s) you asked for. |
 | `--no-hc` | Skip healthchecks pings for this run. |
 | `--version` | Print the tool version and exit. |
 
@@ -136,7 +137,7 @@ See [`zfs-hold-tight.example.json`](zfs-hold-tight.example.json). Top-level keys
 | `guardMaxDailyAgeHours` | `26` | `WORRY`+skip if the newest daily is older than this. |
 | `guardMaxDailyShrinkPct` | `33` | `WORRY`+skip if the newest daily references this % less data than the recent baseline (mass-**deletion** guard; `0` disables). |
 | `guardMaxDailyChurnPct` | `50` | `WORRY`+skip if the newest daily rewrites more than this % of the dataset's data in one day (mass-**rewrite / encryption** guard; `0` disables). |
-| `propertyNamespace` | `zht` | Prefix for the tool's ZFS user-properties + hold tags (`<ns>:keep_until`, `<ns>:tier`, `<ns>:monthly`, `<ns>:weekly`, `<ns>:adhoc`, `<ns>:worry`, `<ns>:pruned_through`). |
+| `propertyNamespace` | `zht` | Prefix for the tool's ZFS user-properties + hold tags (`<ns>:keep_until`, `<ns>:tier`, `<ns>:monthly`, `<ns>:weekly`, `<ns>:adhoc`, `<ns>:worry`, `<ns>:pruned_through`, `<ns>:health`). |
 | `zfsPath` | auto (`/usr/sbin/zfs`…) | Absolute path to the `zfs` binary. Resolved from standard locations; set explicitly to avoid trusting the (root cron's) `PATH`. |
 | `curlPath` | auto (`/usr/bin/curl`…) | Absolute path to `curl` (healthchecks only). |
 | `minNewerHolds` | `3` | Two-holds invariant (misnomer kept for compatibility — default is now 3): a plain daily drops only after this many newer held keepers (weekly/monthly grandfathers) exist. A held keeper only ever advances into the 2nd-newest slot at an ISO-week close, so at `minNewerHolds=2` a whole week's worth of plain dailies sit at "exactly 1 newer hold" and cross to "doomed" together the instant the next week's keeper appears; 3 buys a full extra week of buffer. |
@@ -165,8 +166,10 @@ effectively per-dataset thresholds when you need them.
 
 ## Safety guards
 
-Any failing guard HOLDs **that** dataset (healthy datasets still prune); a global fault
-HOLDs everything. See [docs/SAFETY.md](docs/SAFETY.md) for the full contract.
+Guards 1-3 and 6-8 HOLD only **that** dataset (healthy datasets still prune); a global
+fault HOLDs everything. Guards 4-5 are different: **any** dataset tripping them HOLDs
+the **entire fleet** — see [Cross-dataset shock](#cross-dataset-shock) below. See
+[docs/SAFETY.md](docs/SAFETY.md) for the full contract.
 
 1. **Clock sane** — no snapshot dated in the future.
 2. **Newest daily fresh** — ≤ `guardMaxDailyAgeHours` (26h) old.
@@ -174,13 +177,33 @@ HOLDs everything. See [docs/SAFETY.md](docs/SAFETY.md) for the full contract.
    than days already legitimately pruned per the two-holds invariant (those aren't gaps).
    Scoped to this tool's own pruning safety, not replication health in general — see
    docs/SAFETY.md guard 1.
-4. **No sudden data shrinkage** — newest daily references ≥ `guardMaxDailyShrinkPct` (33%) less than the recent baseline ⇒ HOLD (mass-**deletion** guard).
-5. **No excessive churn** — newest daily rewrites > `guardMaxDailyChurnPct` (50%) of the dataset in one day ⇒ HOLD (mass-**rewrite / encryption** guard).
+4. **No sudden data shrinkage** — newest daily references ≥ `guardMaxDailyShrinkPct` (33%) less than the recent baseline ⇒ HOLD (mass-**deletion** guard). Fleet-wide, not per-dataset — see below.
+5. **No excessive churn** — newest daily rewrites > `guardMaxDailyChurnPct` (50%) of the dataset in one day ⇒ HOLD (mass-**rewrite / encryption** guard). Fleet-wide, not per-dataset — see below.
 6. **Volume circuit-breaker** — never delete more than `guardMaxDeletePerRun` without `--force`.
 7. **Cold-start floor** — a dataset that has never been established requires `--force` for
    *any* nonzero doomed count, regardless of `guardMaxDeletePerRun`; it establishes on its
    first completed `--prune` (no `--force` needed if nothing was doomed yet).
 8. **Population floor** — fewer held keepers than the derived destroy depth ⇒ nothing to prune (noted).
+
+### Cross-dataset shock
+
+A ransomware or mass-deletion attack on the source machine plausibly touches every
+dataset, not just the one loud enough (or configured with a tight enough threshold) to
+trip its own guard 4/5. So instead of per-dataset isolation, **any** dataset showing
+content shock latches a fleet-wide `<ns>:health=unhealthy` state (stored on the pool
+dataset, e.g. `archive`, not any one managed leaf) that freezes **every** dataset — no
+destroys, no `pruned_through` advances anywhere — regardless of how clean any individual
+dataset's own feed looks that run. The dataset that actually tripped its own guard still
+gets its specific reason and `<ns>:worry` tag; others fall back to the generic fleet
+message.
+
+This latch does **not** self-heal: a later run whose numbers look clean again is not
+evidence of safety (a patient attacker may just be moving slower), so only the explicit
+`--reset-health` command clears it — never `--force`, never automatically. The
+fleet-wide pre-pass that checks this runs regardless of `--dataset` filtering, so a
+shock elsewhere still freezes whatever you asked to prune. See
+[docs/MODEL.md](docs/MODEL.md) "Cross-dataset shock" for the full design and
+`docs/model/ZfsHoldTight.tla` for the model-checked latch behavior.
 
 Per-snapshot, it never deletes the replication base (newest daily), a week/month keeper
 **while within its retention window**, a plain daily with fewer than `minNewerHolds`
