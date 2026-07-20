@@ -62,8 +62,10 @@ Each run, per dataset:
    Plain dailies stay untagged. Superseded keepers are demoted: tags inherited away, stale
    managed holds released.
 5. Destroy plain dailies only after at least `minNewerHolds` newer held keepers exist
-   (default `2`). Never delete the replication base, a keeper within retention, or a held
-   snapshot.
+   (default `3`) **and** the daily is itself older than `dailyKeepDays` (default `30`) — a
+   calendar floor that bounds how much daily-granularity history a single ISO-week close
+   can collapse in one run. Never delete the replication base, a keeper within retention,
+   or a held snapshot.
 
 ## Quick start
 
@@ -128,7 +130,7 @@ See [`zfs-hold-tight.example.json`](zfs-hold-tight.example.json). Top-level keys
 |---|---|---|
 | `logDir` | `/mnt/archive/tools/logs` | Daily log files (auto-created). |
 | `healthchecksUrl` | *(unset → pings disabled)* | healthchecks.io base ping URL. |
-| `guardMaxDeletePerRun` | `14` | Per-run delete cap (circuit-breaker; `--force` overrides). 2x the 7-day ISO-week cadence — a weekly keeper's dailies become doomed as a ~6-7 batch once a week, not smoothly, so the cap needs headroom for a routine week, not just a single day. |
+| `guardMaxDeletePerRun` | `14` | Per-run delete cap (circuit-breaker; `--force` overrides). 2x the 7-day ISO-week cadence — sized for the case where the coverage frontier binds and a weekly keeper's dailies become doomed as a ~6-7 batch once a week; when `dailyKeepDays` binds instead (the shipped `baseline` policy), destruction smooths to ~1/day and never comes close to this cap. |
 | `guardRecentWindowDays` | `7` | Require an unbroken daily window this many days back. |
 | `guardMaxDailyAgeHours` | `26` | `WORRY`+skip if the newest daily is older than this. |
 | `guardMaxDailyShrinkPct` | `33` | `WORRY`+skip if the newest daily references this % less data than the recent baseline (mass-**deletion** guard; `0` disables). |
@@ -136,8 +138,8 @@ See [`zfs-hold-tight.example.json`](zfs-hold-tight.example.json). Top-level keys
 | `propertyNamespace` | `zht` | Prefix for the tool's ZFS user-properties + hold tags (`<ns>:keep_until`, `<ns>:tier`, `<ns>:monthly`, `<ns>:weekly`, `<ns>:adhoc`, `<ns>:worry`). |
 | `zfsPath` | auto (`/usr/sbin/zfs`…) | Absolute path to the `zfs` binary. Resolved from standard locations; set explicitly to avoid trusting the (root cron's) `PATH`. |
 | `curlPath` | auto (`/usr/bin/curl`…) | Absolute path to `curl` (healthchecks only). |
-| `minNewerHolds` | `2` | Two-holds invariant: a plain daily drops only after this many newer held keepers (weekly/monthly grandfathers) exist. Governs the daily tail in place of a per-day window. |
-| `retentionPolicies` | — | Named `{dailyKeepDays, weeklyKeepDays, monthlyKeepDays}` profiles; policies may override `minNewerHolds`. **`dailyKeepDays` is parsed and validated but not otherwise used** — the daily tail is governed entirely by `minNewerHolds`, not a day count (see `zfs-hold-tight.example.json`'s comment on the same key). Kept in the schema for now; don't rely on it doing anything. |
+| `minNewerHolds` | `3` | Two-holds invariant (misnomer kept for compatibility — default is now 3): a plain daily drops only after this many newer held keepers (weekly/monthly grandfathers) exist. A held keeper only ever advances into the 2nd-newest slot at an ISO-week close, so at `minNewerHolds=2` a whole week's worth of plain dailies sit at "exactly 1 newer hold" and cross to "doomed" together the instant the next week's keeper appears; 3 buys a full extra week of buffer. |
+| `retentionPolicies` | — | Named `{dailyKeepDays, weeklyKeepDays, monthlyKeepDays}` profiles; policies may override `minNewerHolds`. **`dailyKeepDays` is a real calendar floor**: a plain daily is destroyed only once it clears *both* the two-holds coverage invariant above *and* is older than `dailyKeepDays` — the floor bounds how much daily-granularity history a single ISO-week close can collapse in one run (see [Safety guards](#safety-guards) and `docs/SAFETY.md`'s "Detection vs. recovery"). |
 | `datasets` | — | `dataset → policy` map. Datasets must start with `archive/`. |
 
 Environment overrides: `ZFS_HOLD_TIGHT_CONFIG`, `ZFS_HOLD_TIGHT_LOG_DIR`,
@@ -181,9 +183,9 @@ HOLDs everything. See [docs/SAFETY.md](docs/SAFETY.md) for the full contract.
 
 Per-snapshot, it never deletes the replication base (newest daily), a week/month keeper
 **while within its retention window**, a plain daily with fewer than `minNewerHolds`
-newer held keepers, or any foreign/defensive held snapshot. A keeper
-*past* its retention ages out (so your recovery window is bounded by `weeklyKeepDays` /
-`monthlyKeepDays`, not infinite).
+newer held keepers, a plain daily younger than `dailyKeepDays`, or any foreign/defensive
+held snapshot. A keeper *past* its retention ages out (so your recovery window is bounded
+by `weeklyKeepDays` / `monthlyKeepDays`, not infinite).
 
 > **On a worry, protection only ever increases.** When a guard HOLDs a dataset, the tool
 > still proactively `zfs hold`s every keeper (`<ns>:monthly` / `<ns>:weekly`, including
@@ -194,10 +196,13 @@ newer held keepers, or any foreign/defensive held snapshot. A keeper
 
 > **`--force` removes the per-run delete throttle entirely** — use it deliberately for a
 > reviewed bulk cleanup (e.g. a first run against a large backlog), then return to plain
-> `--prune`. Steady-state runs do a ~6-7 delete batch once every 7 days (when a weekly
-> keeper's ISO-week closes — not a smooth 0–1/day trickle) plus a handful of metadata
-> writes daily; a first run after introducing the tool (or after a long gap) does more —
-> it tags each keeper and clears tags off any previously-tagged dailies — but still one
+> `--prune`. Steady state does a ~6-7 delete batch once every 7 days (when a weekly
+> keeper's ISO-week closes) *if* `dailyKeepDays` is shorter than the coverage frontier's
+> reach; with the shipped `baseline` policy (`dailyKeepDays=30` vs. a ~3-week frontier at
+> the default `minNewerHolds=3`), the calendar floor binds instead and it's closer to a
+> smooth 0–1/day trickle — plus a handful of metadata writes daily either way. A first run
+> after introducing the tool (or after a long gap) does more — it tags each keeper and
+> clears tags off any previously-tagged dailies — but still one
 > `zfs list`/`holds` per dataset, not per snapshot.
 
 ## Reading the logs

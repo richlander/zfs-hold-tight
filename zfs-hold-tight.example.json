@@ -12,8 +12,8 @@
   "_comment_healthchecks": "Optional. A healthchecks.io (or compatible) base ping URL. Leave unset (or pass --no-hc) to disable pings entirely. zfs-hold-tight pings the base URL on a clean prune and <url>/fail with diagnostics on any HOLD or destroy failure.",
   "healthchecksUrl": "https://hc-ping.com/YOUR-UUID-HERE",
 
-  "_comment_min_newer_holds": "Two-holds INVARIANT: a plain daily is destroyed only once at least this many HELD keepers (weekly/monthly grandfathers) are strictly newer than it. Default 2. This governs the daily tail in place of a per-day window. GLOBAL DEFAULT; overridable per retention policy.",
-  "minNewerHolds": 2,
+  "_comment_min_newer_holds": "Two-holds INVARIANT: a plain daily is destroyed only once at least this many HELD keepers (weekly/monthly grandfathers) are strictly newer than it, AND it is older than dailyKeepDays (below). Default 3 (was 2): a held keeper only ever advances into the 2nd-newest slot when an ISO-week closes, so at minNewerHolds=2 a whole week's worth of plain dailies sit at 'exactly 1 newer hold' simultaneously and cross to 'doomed' together the instant the next week's keeper appears -- one more required hold buys a full extra week of buffer before that batch can trigger. GLOBAL DEFAULT; overridable per retention policy.",
+  "minNewerHolds": 3,
 
   "_comment_guards": "These are the GLOBAL DEFAULTS. Each guard is evaluated INDEPENDENTLY per dataset (a small dataset's deletion/encryption is flagged on its own scale). Any guard key may also be set inside a retention policy to override the default for that group of datasets.",
   "guardMaxDeletePerRun": 14,
@@ -26,17 +26,16 @@
 
   "retentionPolicies": {
     "baseline": {
-      "_comment": "general datasets - two-holds daily tail, 5 years of weeklies/monthlies. dailyKeepDays is vestigial (retained for back-compat, ignored by the invariant).",
+      "_comment": "general datasets - two-holds daily tail, 5 years of weeklies/monthlies. dailyKeepDays is a real calendar FLOOR: a plain daily survives at least this long regardless of hold coverage, bounding how much daily-granularity history one ISO-week close can collapse in a single run.",
       "dailyKeepDays": 30,
       "weeklyKeepDays": 1825,
       "monthlyKeepDays": 1825
     },
     "low": {
-      "_comment": "bulk/media - write-once, so tighten the content guards (any change is suspicious). Keep a longer daily tail here with minNewerHolds=3.",
+      "_comment": "bulk/media - write-once, so tighten the content guards (any change is suspicious). A shorter daily floor here (7d) than baseline (30d), since media churns less and the size makes long daily retention costlier.",
       "dailyKeepDays": 7,
       "weeklyKeepDays": 1825,
       "monthlyKeepDays": 1825,
-      "minNewerHolds": 3,
       "guardMaxDailyShrinkPct": 15,
       "guardMaxDailyChurnPct": 10
     },

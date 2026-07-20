@@ -61,15 +61,19 @@ inv_day() { date -u -d "$INV_N -$1 days" +%Y-%m-%d; }   # $1 = days before INV_N
 
 # inv_config <minNewerHolds|-> : write an invariant-test config.
 # Relaxes freshness + window guards so a mid-week INV_N can be "newest", and lifts the
-# delete cap so the tiny doomed set is not circuit-broken. Default minNewerHolds is 2, so
-# a plain daily drops once 2 held keepers are strictly newer than it.
+# delete cap so the tiny doomed set is not circuit-broken. "-" omits the key (compiled
+# default). dailyKeepDays is pinned to 1 (not the real default of 30): these fixtures are
+# only a few days old, so a realistic dailyKeepDays would make the calendar floor (see
+# zfs-hold-tight.cs's doomed-daily loop) protect everything regardless of hold coverage,
+# masking the two-holds mechanic these tests exist to isolate. The floor itself has its
+# own dedicated tests (T55+) against the long-lived $WORK/healthy fixture instead.
 inv_config() {
   local mnh="$1" line=""
   [ "$mnh" != "-" ] && line="$line \"minNewerHolds\": $mnh,"
   cat > "$WORK/cfg_inv.json" <<EOF
 { "logDir": "$WORK/logs", "zfsPath": "$WORK/bin/zfs", $line
   "guardMaxDeletePerRun": 50, "guardRecentWindowDays": 3, "guardMaxDailyAgeHours": 720,
-  "retentionPolicies": { "baseline": { "dailyKeepDays": 30, "weeklyKeepDays": 1825, "monthlyKeepDays": 1825 } },
+  "retentionPolicies": { "baseline": { "dailyKeepDays": 1, "weeklyKeepDays": 1825, "monthlyKeepDays": 1825 } },
   "datasets": { "archive/home/rich": "baseline" } }
 EOF
 }
@@ -85,8 +89,14 @@ run_inv() {
   RC=$?; OPS="$WORK/fz/ops.log"
 }
 
+# minNewerHolds is pinned to 2 here (not left to the compiled default) so every
+# frontier-dependent date computation below (T4/T4b's gap-boundary math, T45-51's
+# Continuity scope, etc. — all independently derived and calendar-verified for N=2) stays
+# valid regardless of what the compiled default is. T-default below covers the default
+# itself; T36/T36b cover tuning it.
 cat > "$WORK/config.json" <<EOF
 { "logDir": "$WORK/logs", "zfsPath": "$WORK/bin/zfs", "guardMaxDeletePerRun": 5, "guardRecentWindowDays": 7,
+  "minNewerHolds": 2,
   "retentionPolicies": { "baseline": { "dailyKeepDays": 30, "weeklyKeepDays": 1825, "monthlyKeepDays": 1825 } },
   "datasets": { "archive/home/rich": "baseline" } }
 EOF
@@ -156,6 +166,35 @@ sets=$(grep -c 'zht:tier=' "$OPS"); sets=${sets:-0}
 # finding 2: doomed plain dailies (no monthly hold) must NOT each get a redundant release
 rels=$(grep -c '^release' "$OPS"); rels=${rels:-0}
 [ "$rels" = 0 ] && ok "T2d no redundant release before destroying unheld dailies" || bad "T2d $rels redundant releases"
+
+# ---- T56: dailyKeepDays calendar floor — even with full two-holds coverage (T2 already
+#      proved 321 dailies clear that bar), nothing destroyed is younger than the configured
+#      30-day floor. Reuses T2's own $WORK/destroyed rather than re-running the tool. ----
+floor_boundary56=$(date -u -d "$ADATE -30 days" +%Y-%m-%d)
+violating56=$(sed -E 's/.*autosnap_([0-9-]+)_.*/\1/' "$WORK/destroyed" | awk -v b="$floor_boundary56" '$1>b')
+[ -z "$violating56" ] \
+  && ok "T56 dailyKeepDays floor: no destroyed daily is younger than the configured 30-day floor" \
+  || bad "T56 floor violated: $(echo "$violating56" | tr '\n' ';')"
+
+# ---- T57: dailyKeepDays is genuinely load-bearing, not coincidental — lowering it from 30
+#      to 5 must destroy dailies in the 6-30-day-back band that T56 just proved survive at
+#      30, while still respecting its own (lower) 5-day cutoff. ----
+cat > "$WORK/cfg_floor5.json" <<EOF
+{ "logDir": "$WORK/logs", "zfsPath": "$WORK/bin/zfs", "guardMaxDeletePerRun": 500, "guardRecentWindowDays": 7,
+  "minNewerHolds": 2,
+  "retentionPolicies": { "baseline": { "dailyKeepDays": 5, "weeklyKeepDays": 1825, "monthlyKeepDays": 1825 } },
+  "datasets": { "archive/home/rich": "baseline" } }
+EOF
+rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"; cp "$WORK/healthy" "$WORK/fz/snaps"; : > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
+OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/cfg_floor5.json" \
+       ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --prune --force 2>/dev/null)"
+floor5_boundary=$(date -u -d "$ADATE -5 days" +%Y-%m-%d)
+destroyed57=$(grep '^destroy' "$WORK/fz/ops.log" | awk '{print $2}' | sed -E 's/.*autosnap_([0-9-]+)_.*/\1/')
+newly_destroyed57=$(echo "$destroyed57" | awk -v lo="$floor_boundary56" -v hi="$floor5_boundary" '$1>lo && $1<=hi')
+still_protected57=$(echo "$destroyed57" | awk -v hi="$floor5_boundary" '$1>hi')
+{ [ -n "$newly_destroyed57" ] && [ -z "$still_protected57" ]; } \
+  && ok "T57 dailyKeepDays is tunable: floor=5 destroys the 6-30-day band floor=30 protects, its own 5-day window still respected" \
+  || bad "T57 (newly=$(echo "$newly_destroyed57"|tr '\n' ';'); still_protected_violations=$(echo "$still_protected57"|tr '\n' ';'))"
 
 # ---- T3a: newest 30h old (>26h) -> HOLD on freshness ----
 gen_window $((NOW-108000)) > "$WORK/stale"
@@ -286,7 +325,8 @@ run_tool "$WORK/lowchurn" --force
 # ---- T18: per-dataset isolation — a small (100MiB) dataset wiped 80% is flagged on its
 #          own, while a healthy large dataset prunes normally (only the small one SKIPped) ----
 cat > "$WORK/cfg2.json" <<EOF
-{ "logDir": "$WORK/logs", "zfsPath": "$WORK/bin/zfs", "retentionPolicies": { "baseline": { "dailyKeepDays": 30, "weeklyKeepDays": 1825, "monthlyKeepDays": 1825 } },
+{ "logDir": "$WORK/logs", "zfsPath": "$WORK/bin/zfs", "minNewerHolds": 2,
+  "retentionPolicies": { "baseline": { "dailyKeepDays": 30, "weeklyKeepDays": 1825, "monthlyKeepDays": 1825 } },
   "datasets": { "archive/home/rich": "baseline", "archive/scratch": "baseline" } }
 EOF
 n2="$(gen_window $((NOW-7200)) | wc -l)"
@@ -455,12 +495,13 @@ OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
 # ==== two-holds INVARIANT tests ====
 # Fixture: INV_N-4(Sat) INV_N-3(Sun) INV_N-2(Mon) INV_N-1(Tue) INV_N(Wed).
 #   ISO weeks: {N-2,N-1,N}->keeper N ; {N-4,N-3}->keeper N-3.  Month keeper: N.
-#   Held keepers newest-first: [N, N-3].  With the default minNewerHolds=2, frontier = N-3.
+#   Held keepers newest-first: [N, N-3].  With minNewerHolds=2 (fixed here, independent of
+#   whatever the compiled default is — see T-default below for that), frontier = N-3.
 #   => N-4 has TWO newer held keepers (N, N-3) -> DROPPED.
 #      N-2/N-1 have ONE newer held keeper (N)  -> KEPT.
 
 # ---- T34: core invariant — exactly ONE newer held keeper keeps a daily, TWO drops it ----
-inv_config -                                   # default minNewerHolds=2
+inv_config 2                                   # pinned N=2, not the compiled default
 inv_feed "$WORK/inv"
 run_inv "$WORK/inv" --prune --force
 d4="$(snapname "$(inv_day 4)")"; d3="$(snapname "$(inv_day 3)")"
@@ -491,13 +532,28 @@ run_inv "$WORK/inv" --prune --force
 cat > "$WORK/cfg_inv.json" <<EOF
 { "logDir": "$WORK/logs", "zfsPath": "$WORK/bin/zfs", "minNewerHolds": 2,
   "guardMaxDeletePerRun": 50, "guardRecentWindowDays": 3, "guardMaxDailyAgeHours": 720,
-  "retentionPolicies": { "baseline": { "dailyKeepDays": 30, "weeklyKeepDays": 1825, "monthlyKeepDays": 1825, "minNewerHolds": 1 } },
+  "retentionPolicies": { "baseline": { "dailyKeepDays": 1, "weeklyKeepDays": 1825, "monthlyKeepDays": 1825, "minNewerHolds": 1 } },
   "datasets": { "archive/home/rich": "baseline" } }
 EOF
 run_inv "$WORK/inv" --prune --force
 { grep -qx "destroy $d4" "$OPS" && grep -qx "destroy $d2" "$OPS" && grep -qx "destroy $d1" "$OPS"; } \
   && ok "T36b per-policy minNewerHolds override (policy=1 drops tail despite global=2)" \
   || bad "T36b (destroys: $(grep '^destroy' "$OPS" | tr '\n' ';'))"
+
+# ---- T55: the COMPILED DEFAULT of minNewerHolds is 3, not 2 — a config that OMITS the key
+#      entirely, against the SAME 5-day invariant fixture T34/T36 use, must behave like
+#      T36's explicit `inv_config 3` (0 destroys: only ONE newer held keeper (N) exists
+#      relative to N-4/N-2/N-1, one short of three). Bumped from 2 because the two-holds
+#      invariant alone lets a whole ISO-week's worth of plain dailies sit at "exactly 1
+#      newer hold" simultaneously and cross to "doomed" together the instant the next
+#      week's keeper appears (see the "week-long cliff" note above the destroy loop in
+#      zfs-hold-tight.cs) — one more required hold buys a full extra week of buffer. ----
+inv_config -                                   # omit the key entirely -> compiled default
+run_inv "$WORK/inv" --prune --force
+defaultdrops=$(grep -c '^destroy' "$OPS"); defaultdrops=${defaultdrops:-0}
+[ "$defaultdrops" = 0 ] \
+  && ok "T55 compiled default minNewerHolds is 3 (0 destroys on the invariant fixture, matching inv_config 3)" \
+  || bad "T55 (destroys=$defaultdrops: $(grep '^destroy' "$OPS" | tr '\n' ';'))"
 
 # ---- T37: on the healthy feed, EVERY destroyed non-keeper has >=2 surviving newer keepers
 #          (the tool never violates the two-holds invariant) ----
@@ -541,9 +597,14 @@ relln=$(grep -n "^release zht:weekly $newestsnap" "$WORK/fz/ops.log" | head -1 |
 #      hold frontier can land up to 6 days back depending on which day "today" is, and a
 #      7-day window doesn't always reach that far, making the check pass vacuously on
 #      Sat/Sun anchors regardless of whether the guard-1 fix is actually working. ----
+# dailyKeepDays pinned to 1 (not the real default of 30): this whole T39-T44 block uses
+# ~13-21 day fixtures well inside a realistic floor, which would zero out the doomed count
+# these tests exist to produce. minNewerHolds pinned to 2 for the same reason as
+# config.json above (these tests aren't about tuning either knob).
 cat > "$WORK/cfg_cold.json" <<EOF
 { "logDir": "$WORK/logs", "zfsPath": "$WORK/bin/zfs", "guardMaxDeletePerRun": 14, "guardRecentWindowDays": 10,
-  "retentionPolicies": { "baseline": { "dailyKeepDays": 30, "weeklyKeepDays": 1825, "monthlyKeepDays": 1825 } },
+  "minNewerHolds": 2,
+  "retentionPolicies": { "baseline": { "dailyKeepDays": 1, "weeklyKeepDays": 1825, "monthlyKeepDays": 1825 } },
   "datasets": { "archive/home/rich": "baseline" } }
 EOF
 gen_feed "$(date -u -d "$ADATE -20 days" +%Y-%m-%d)" > "$WORK/cold"   # ~21 raw days, all tier=-
@@ -615,8 +676,8 @@ OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/cfg_cold.json" \
 #      value (the no-cap-trip branch only proves >5, not =14). ----
 establish_oldest "$WORK/cold" "$WORK/cold_established"
 cat > "$WORK/cfg_nocap.json" <<EOF
-{ "logDir": "$WORK/logs", "zfsPath": "$WORK/bin/zfs", "guardRecentWindowDays": 10,
-  "retentionPolicies": { "baseline": { "dailyKeepDays": 30, "weeklyKeepDays": 1825, "monthlyKeepDays": 1825 } },
+{ "logDir": "$WORK/logs", "zfsPath": "$WORK/bin/zfs", "guardRecentWindowDays": 10, "minNewerHolds": 2,
+  "retentionPolicies": { "baseline": { "dailyKeepDays": 1, "weeklyKeepDays": 1825, "monthlyKeepDays": 1825 } },
   "datasets": { "archive/home/rich": "baseline" } }
 EOF
 rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"; cp "$WORK/cold_established" "$WORK/fz/snaps"; : > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"

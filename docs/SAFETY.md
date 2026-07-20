@@ -17,9 +17,12 @@ terms, in one place, before the detail:
 
 - **Delete only when the system is provably healthy.** Anything ambiguous ⇒ keep
   everything, alert, do nothing destructive. (Guards 1–5.)
-- **A plain daily survives until at least 2 newer held keepers exist.** That's the entire
-  retention invariant — no day-count window, just "is it covered by something newer that
-  will survive." (`minNewerHolds`, see Context below.)
+- **A plain daily survives until at least 3 newer held keepers exist AND it is itself older
+  than `dailyKeepDays`.** Coverage ("is it covered by something newer that will survive")
+  is the primary invariant (`minNewerHolds`, see Context below); the calendar floor
+  (`dailyKeepDays`) is a second, independent requirement layered on top, so recent
+  daily-granularity history can't collapse to near-zero in a single run just because a held
+  keeper happened to advance (see "Detection vs. recovery" below).
 - **Never delete more than 2x the weekly cadence (14) in one run without `--force`.** A
   routine week's batch is only ~6-7; an extra week of slack is cheap, and a flat cap beats
   trying to time it precisely. (Guard 6.)
@@ -111,9 +114,17 @@ content guards while a churny scratch policy relaxes them).
    `guardMaxDeletePerRun` (default 14 — 2x the 7-day ISO-week cadence) snapshots for one
    dataset without `--force`. A weekly keeper only becomes permanent when its ISO-week
    closes, so the dailies it stops covering become doomed together, once a week, not
-   smoothly day by day — steady state is a ~6-7 batch every 7 days, not 0–1/day. The 2x
-   multiplier gives one full extra week of slack (e.g. a missed run) before a batch is
-   treated as abnormal rather than routine.
+   smoothly day by day — steady state is a ~6-7 batch every 7 days, not 0–1/day, **whenever
+   the two-holds coverage frontier is the binding constraint** (i.e. `dailyKeepDays` is
+   shorter than the frontier's typical reach, roughly `minNewerHolds` ISO-weeks back). When
+   `dailyKeepDays` is the *longer* of the two — true of the shipped `baseline` policy
+   (30 days vs. a ~3-week frontier at the default `minNewerHolds=3`) — the calendar floor
+   binds instead and steady state smooths to a ~1/day trickle well under this cap, since
+   each daily ages past the floor on its own individual date rather than all at once at a
+   week boundary. Either way, 14 is a safe upper bound: it was sized for the batchier case,
+   so the smoother case never comes close to tripping it. The 2x multiplier over the batchy
+   case gives one full extra week of slack (e.g. a missed run) before a batch is treated as
+   abnormal rather than routine.
    **Considered and rejected: deriving the default from `minNewerHolds` (× 7 per policy),**
    on the theory that a deep-tail policy's (e.g. `archive/memories`, `minNewerHolds=24`)
    first-ever hold-frontier activation releases a backlog proportional to `minNewerHolds`.
@@ -185,12 +196,22 @@ and healthchecks `/fail` ping instead, not a snapshot property.
 > day) evades both. The actual protection for deletion *and* encryption is **retention**:
 > pre-incident keepers survive defender-side for years (independent of the source), so you
 > recover by rolling back to one as long as you notice within the retention window.
+>
+> That fallback has a sharp edge worth naming: the weekly keeper for a week that's still
+> being actively attacked is, by construction, the *newest* day of that week — plausibly
+> the most-corrupted point in it. Before `dailyKeepDays` existed, the two-holds invariant
+> alone let a whole week's worth of intervening daily granularity (which might still hold a
+> clean copy from earlier in the week) disappear in the same run the week closed, leaving
+> that worst-case survivor as the only representative of the entire week. `dailyKeepDays`
+> guarantees a smoother floor of daily-granularity history regardless of hold cadence, so
+> noticing mid-week no longer depends on catching it before the next Monday's batch.
 
 ## Per-snapshot protections — never delete a snapshot that is…
 
 9. **The newest daily** — the replication incremental base. Absolute, always.
 10. **Within the daily tail** — a plain daily survives until at least `minNewerHolds`
-    newer held keepers exist (default `2`).
+    newer held keepers exist (default `3`) **and** it is itself older than `dailyKeepDays`
+    (default `30`) — both conditions must hold before it's eligible.
 11. **A week keeper** — newest daily in its ISO-week, within weekly retention.
 12. **A month keeper** — newest daily in its month, within monthly retention.
 13. **Not yet covered** — a daily is deleted only once the derived destroy depth of

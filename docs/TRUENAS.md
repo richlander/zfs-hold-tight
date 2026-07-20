@@ -93,30 +93,38 @@ On the **first** real prune against a pre-existing backlog of untagged dailies, 
 **cold-start floor** guarantees a reviewed `--force` for any nonzero backlog, not just a
 large one: `guardMaxDeletePerRun` (default 14) is sized for a *routine* weekly batch on a
 dataset this tool already manages, so on its own it wouldn't reliably gate a first prune.
-Keepers are *computed*, not held — `minNewerHolds` (default 2) counts candidate
+Keepers are *computed*, not held — `minNewerHolds` (default 3) counts candidate
 weekly/monthly keepers derived from the snapshot dates themselves (no `zfs hold` needs to
-have ever been placed), so a cold backlog can have `doomed.Count > 0` from its very first
-run, well before any hold exists. Whether that count clears 14 on its own depends on how
-the backlog's dates land against ISO-week/month boundaries, not on a fixed day count —
-comfortably under 14 for roughly 2 weeks of backlog, but it's been observed to exceed 14
-in as little as ~18 days depending on alignment, so don't rely on any specific day count
-as a safe cutoff. Either way, a backlog short enough to stay under 14 would otherwise
-clear on the very first `--prune` with no confirmation. The cold-start floor closes that
-gap unconditionally: a dataset that has never been
-established requires `--force` for *any* nonzero doomed count — so the very first real
-`--prune` against this backlog will `WORRY`+`SKIP` with `cold start: would delete N` for
-any pre-existing backlog with something to destroy, regardless of how it compares to 14.
+have ever been placed) — but a plain daily also needs to be older than `dailyKeepDays`
+(default 30) before it's doomed at all, so a cold backlog entirely younger than
+`dailyKeepDays` establishes cleanly on its very first `--prune` with `doomed.Count == 0`
+and **no `--force` needed** (nothing destructive to review yet — Promote still tags and
+holds the backlog's keepers on that same run). The cold-start floor only actually engages
+once some part of the backlog is older than `dailyKeepDays`: from that point, whether the
+doomed count clears 14 on its own depends on how much of the backlog sits past *both* bars
+(coverage frontier and calendar floor), not on a fixed day count — don't rely on any
+specific day-count threshold as a safe cutoff either way. A backlog short enough to stay
+under 14 once both bars are cleared would otherwise silently clear on the very first
+`--prune` with no confirmation. The cold-start floor closes that gap unconditionally: a
+dataset that has never been established requires `--force` for *any* nonzero doomed count
+— so the first real `--prune` against a backlog with something already past both bars will
+`WORRY`+`SKIP` with `cold start: would delete N`, regardless of how N compares to 14.
 That's the circuit-breaker doing its job, not an error — review the dry-run output, then
 do the one-time backlog cleanup with `--prune --force`. A dataset establishes the first time
 `--prune` completes for it — with no `--force` needed if there was nothing doomed yet
 (nothing destructive to review), or via `--force` the first time there was. Every unforced
 run after that is governed by the routine `guardMaxDeletePerRun` (14) instead.
 
-Once running continuously (not a cold start), steady state is different: a weekly keeper
+Once running continuously (not a cold start), steady state depends on which of the two
+requirements binds. If `dailyKeepDays` is shorter than the coverage frontier's typical
+reach (roughly `minNewerHolds` ISO-weeks back), the frontier still binds: a weekly keeper
 only becomes permanent when its ISO-week closes, so the dailies it stops covering become
 doomed together — a ~6-7 snapshot batch once every 7 days, not a smooth 0–1/day trickle.
-`--prune` alone is enough; the 14 cap has headroom for one routine week's batch plus one
-missed run before it needs attention.
+With the shipped `baseline` policy (`dailyKeepDays=30` vs. a ~3-week frontier at the
+default `minNewerHolds=3`), the calendar floor is the longer of the two and binds instead,
+so destruction smooths to roughly 0–1/day. Either way `--prune` alone is enough; the 14 cap
+has headroom for one routine week's batch (the batchier case) plus one missed run before it
+needs attention, and the smoother case never comes close to it.
 
 ## 4. Schedule it
 

@@ -101,7 +101,7 @@ if (!cfg.TryGetProperty("datasets", out var datasetsElem) || datasetsElem.ValueK
 
 // Validate and load numeric config with bounds
 int MaxDeletePerRun = 14, RecentWindowDays = 7, MaxDailyAgeHours = 26, MaxDailyShrinkPct = 33, MaxDailyChurnPct = 50;
-int MinNewerHolds = 2;          // a non-keeper daily drops once this many held keepers are newer than it
+int MinNewerHolds = 3;          // a non-keeper daily drops once this many held keepers are newer than it
 try
 {
     if (cfg.TryGetProperty("minNewerHolds", out var mnh))
@@ -439,8 +439,14 @@ foreach (var (ds, ret) in retention)
     // held keepers are strictly NEWER than it. Equivalent clean cutoff: sort keeper dates DESC;
     // holdFrontier = the Nth-newest keeper's date; a non-keeper daily s is doomed iff
     // s.Date < holdFrontier. Fewer than N keepers ⇒ nothing droppable yet (frontier = MinValue).
-    // The daily's own week+month grandfathers are strictly newer, so the default of 2 subsumes
-    // the old week/month coverage test plus a buffer.
+    // The daily's own week+month grandfathers are strictly newer, so the default of 3 subsumes
+    // the old week/month coverage test plus a buffer. A held keeper only ever advances into the
+    // 2nd-newest slot at an ISO-week close, so with minNewerHolds=2 a whole week's worth of plain
+    // dailies sit at "exactly 1 newer hold" simultaneously and cross to "doomed" together the
+    // instant the next week's keeper appears — a one-run cliff, not a smooth trickle. minNewerHolds
+    // additionally requires the daily to be older than dailyKeepDays (the calendar floor applied
+    // below) before it's actually eligible, which is what keeps that cliff from ever reaching all
+    // the way down to "0 dailies" — see docs/SAFETY.md "Detection vs. recovery".
     int destroyDepth = ret.MinNewerHolds;
     // Desired (a keeper's date-based expiry) comes from ComputeKeepersAndFrontier itself
     // now — the exact function it already uses internally to decide the frontier, not a
@@ -548,6 +554,15 @@ foreach (var (ds, ret) in retention)
             // The frontier subsumes the old week+month coverage test (its own grandfathers are
             // strictly newer) plus a buffer, so no coverage hole can open early.
             if (s.Date >= holdFrontier) continue;
+            // Calendar floor: even once covered, a plain daily survives until it is itself
+            // at least dailyKeepDays old. Coverage alone only guarantees a daily outlives
+            // SOMETHING newer — it says nothing about how much daily-granularity history
+            // exists at any given moment, which without this floor can swing from ~2 weeks
+            // down to a single day the instant an ISO-week closes (an entire week's plain
+            // dailies go from "1 newer hold, all kept" to "2 newer holds, all doomed" in the
+            // same run — see docs/SAFETY.md "Detection vs. recovery"). This floor bounds that
+            // swing to a guaranteed minimum, independent of hold cadence.
+            if (now <= s.Date.AddDays(ret.DailyKeepDays)) continue;
         }
         doomed.Add(s.Name);
     }
