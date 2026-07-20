@@ -182,6 +182,12 @@ string ns = (cfg.TryGetProperty("propertyNamespace", out var pnEl) ? pnEl.GetStr
 if (!Regex.IsMatch(ns, @"^[A-Za-z0-9_.-]+$"))
 { Console.Error.WriteLine($"FATAL: propertyNamespace '{ns}' must be letters/digits/._- (no colon)"); configDoc?.Dispose(); return 2; }
 string tagMonthly = $"{ns}:monthly", tagWeekly = $"{ns}:weekly", tagAdhoc = $"{ns}:adhoc", propKeep = $"{ns}:keep_until", propTier = $"{ns}:tier";
+// Dataset-level (not snapshot) watermark: "as of the last successful, non-WORRY --prune,
+// everything up to and including this date was already correctly evaluated by this
+// tool." See docs/MODEL.md -- this is what decouples guard 1's gap detection from the
+// CURRENT retention policy, so raising minNewerHolds/dailyKeepDays can never retroactively
+// make already-legitimately-pruned history look like an unexplained gap.
+string propPrunedThrough = $"{ns}:pruned_through";
 
 // Resolve zfs/curl to absolute trusted paths rather than trusting the (root) cron's PATH —
 // a writable earlier PATH element would otherwise be root code execution. Override with
@@ -467,6 +473,10 @@ foreach (var (ds, ret) in retention)
     bool IsForeignHeld(string name) =>
         holdMap.TryGetValue(name, out var tags) && tags.Any(t => t != tagMonthly && t != tagWeekly);
 
+    // Persisted watermark for guard 1 (see propPrunedThrough / LoadPrunedThrough above).
+    // Never-set or unreadable both default to MinValue, the safe/conservative direction.
+    var prunedThrough = LoadPrunedThrough(ds) ?? DateTime.MinValue;
+
     // Keeper/hold summary — hoisted above the worry paths so the WORRY lines and the normal
     // line all report the same numbers. keepersHeld counts computed keepers that ALREADY carry
     // a real <ns>:weekly / <ns>:monthly hold on disk; on a dry-run before the first prune the
@@ -518,7 +528,7 @@ foreach (var (ds, ret) in retention)
     //      monthly keepers (even the suspect newest — a false positive costs nothing, and
     //      we don't want to skip the hold and lose the chance later) and record a worry
     //      breadcrumb on the tip — but never release a hold or delete anything. ----
-    string? guard = HealthGuard(snaps, ret, gd, holdFrontier);
+    string? guard = HealthGuard(snaps, ret, gd, prunedThrough);
     if (guard is not null)
     {
         Log($"{ds}: WORRY - {guard} ({keepersHeld}/{keeperNames.Count} keepers held)");
@@ -532,6 +542,18 @@ foreach (var (ds, ret) in retention)
         Log($"{ds}: SKIP - guard tripped (keepers protected, no deletions)");
         held.Add($"{ds}: {guard}");
         continue;
+    }
+
+    // Guards 1-5 all passed: certify today as accounted-for, independent of whatever the
+    // cold-start floor / volume cap / metadata writes below decide -- this is purely "was
+    // the feed healthy," not "did we destroy anything" (see docs/MODEL.md). Only in --prune
+    // mode; a dry-run must never mutate state. A write failure here is logged but doesn't
+    // SKIP the dataset -- worst case, guard 1 stays exactly as cautious as it is today.
+    if (prune)
+    {
+        var (pwc, _, pwe) = Exec("zfs", "set", $"{propPrunedThrough}={((DateTimeOffset)now).ToUnixTimeSeconds()}", ds);
+        if (pwc != 0) Log($"    META:UPDATE {ds} {propPrunedThrough} FAILED: {pwe.Trim()}");
+        else Log($"  META:UPDATE {ds} {propPrunedThrough}={now:yyyy-MM-dd}");
     }
 
     // ---- PLAN (read-only): compute the doomed set; mutate nothing yet ----
@@ -811,20 +833,34 @@ int Summary(string? datasetFilter, DateTime? since)
             continue;
         }
 
-        var (weekKeeper, monthKeeper, keeperNames, holdFrontier, _) = ComputeKeepersAndFrontier(snaps, ret, now);
+        var (weekKeeper, monthKeeper, keeperNames, _, _) = ComputeKeepersAndFrontier(snaps, ret, now);
+        var prunedThrough = LoadPrunedThrough(ds) ?? DateTime.MinValue;
 
         var windowed = snaps.Where(s => s.Date.Date >= effectiveSince).ToList();
         int monthlies = windowed.Count(s => monthKeeper.Contains(s.Name));
         int weeklies  = windowed.Count(s => weekKeeper.Contains(s.Name) && !monthKeeper.Contains(s.Name));
         int dailies   = windowed.Count - monthlies - weeklies;
 
-        // Continuity: scan the DAILY TAIL from max(effectiveSince, holdFrontier) to newest —
-        // the same frontier-aware scope guard 1 uses (docs/SAFETY.md guard 1), just extended
+        // Continuity: scan the DAILY TAIL from max(effectiveSince, prunedThrough) to newest —
+        // the same persisted-watermark scope guard 1 uses (see docs/MODEL.md), just extended
         // across the whole requested window instead of a fixed recent-window cap, so a day
-        // this tool legitimately pruned is never reported as a break. Older than the frontier,
-        // only keeper cadence exists (by GFS design) — this report doesn't attempt to detect
-        // a missing week/month there; that's a materially different check.
-        var scanStart = holdFrontier == DateTime.MinValue ? effectiveSince : Later(effectiveSince, holdFrontier.Date);
+        // this tool legitimately pruned is never reported as a break. Deliberately NOT the
+        // hold frontier: that's re-derived from the CURRENT retention policy, so it would
+        // flag already-legitimately-pruned history as a gap the instant minNewerHolds or
+        // dailyKeepDays changes -- the same bug guard 1 had, in the same place. Older than the
+        // watermark, only keeper cadence exists (by GFS design) — this report doesn't attempt
+        // to detect a missing week/month there; that's a materially different check.
+        //
+        // No watermark yet (this dataset hasn't completed a --prune under a binary that
+        // writes one) -- fall back to the same bounded window guard 1 itself uses
+        // (guardRecentWindowDays), NOT the full effectiveSince: unlike guard 1's own scan,
+        // which is always bounded to that window, effectiveSince here defaults to the
+        // dataset's ENTIRE history, and scanning all of it with nothing excused would flag
+        // every day GFS has ever legitimately thinned away as a "gap" on the very first run.
+        // Self-resolving: the real watermark starts advancing after that first healthy prune.
+        var scanStart = prunedThrough == DateTime.MinValue
+            ? Later(effectiveSince, newest.AddDays(-guardsByDataset[ds].RecentWindowDays))
+            : Later(effectiveSince, prunedThrough.Date);
         var existingDays = snaps.Select(s => s.Date.Date).ToHashSet();
         var missing = new List<DateTime>();
         for (var d = scanStart; d <= newest; d = d.AddDays(1))
@@ -1045,7 +1081,7 @@ int HoldLatestTier(string tier, string? datasetFilter, bool noHc)
 }
 
 // ---- guards (evaluated independently per dataset; thresholds from that dataset's policy) ----
-string? HealthGuard(List<Snap> snaps, Retention ret, Guards gd, DateTime holdFrontier)
+string? HealthGuard(List<Snap> snaps, Retention ret, Guards gd, DateTime prunedThrough)
 {
     var newest = snaps.Max(s => s.Date);
     var newestSnap = snaps.MaxBy(s => s.Date)!;
@@ -1058,15 +1094,21 @@ string? HealthGuard(List<Snap> snaps, Retention ret, Guards gd, DateTime holdFro
     for (int d = 0; d < gd.RecentWindowDays; d++)
     {
         var day = newest.Date.AddDays(-d);
-        // A day older than the hold frontier is covered by sufficient newer keepers — it was
-        // legitimately pruned by this tool's own retention policy, not a feed gap. Only flag a
-        // day that's neither present NOR already accounted for by coverage; this is the
-        // "coverage" question (is it safe that this day is gone), kept distinct from the
-        // "scale" question (is the amount of change unusual), which is guard 6's job alone.
-        if (day < holdFrontier.Date) continue;
+        // A day at or before the persisted pruned_through watermark was already certified
+        // healthy by a past successful, non-WORRY --prune -- a FACT about history, never
+        // re-derived from today's retention policy. Deliberately NOT the hold frontier:
+        // re-deriving "was this gap legitimate" from the CURRENT frontier breaks the instant
+        // minNewerHolds or dailyKeepDays changes, because legitimacy of a past decision was
+        // determined under whatever policy was in effect then, not today's (see
+        // docs/MODEL.md -- this is the fix for the guard/retention coupling bug class).
+        if (day <= prunedThrough.Date) continue;
         if (!days.Contains(day)) missing.Add(day.ToString("MM-dd"));
     }
-    if (missing.Count > 0) return $"gap in last {gd.RecentWindowDays}d: missing {string.Join(",", missing)}";
+    if (missing.Count > 0)
+    {
+        string pt = prunedThrough == DateTime.MinValue ? "never" : prunedThrough.ToString("yyyy-MM-dd");
+        return $"gap in last {gd.RecentWindowDays}d: missing {string.Join(",", missing)} (pruned_through={pt})";
+    }
 
     // baseline = recent dailies of THIS dataset (so a small dataset is judged on its own scale)
     var baseline = snaps.Where(s => s.Name != newestSnap.Name && s.Date >= newest.AddDays(-gd.RecentWindowDays))
@@ -1135,6 +1177,19 @@ string? HealthGuard(List<Snap> snaps, Retention ret, Guards gd, DateTime holdFro
         list.Add(new Snap(cols[0], date, ku, tier, refb, wrb));
     }
     return (0, list, warnings);
+}
+
+// Reads the dataset-level pruned_through watermark (see propPrunedThrough above).
+// Never-set and read-failure both return null (caller defaults to DateTime.MinValue,
+// i.e. nothing excused) -- the safe direction: worst case guard 1 is more likely to
+// flag a real gap, never silently excuses one it shouldn't just because this read
+// had a hiccup.
+DateTime? LoadPrunedThrough(string ds)
+{
+    var (code, outp, _) = Exec("zfs", "get", "-Hp", "-o", "value", propPrunedThrough, ds);
+    if (code != 0) return null;
+    var v = outp.Trim();
+    return long.TryParse(v, out var secs) ? DateTimeOffset.FromUnixTimeSeconds(secs).UtcDateTime : (DateTime?)null;
 }
 
 // Annotate one snapshot for its current tier. Returns false if any write failed.

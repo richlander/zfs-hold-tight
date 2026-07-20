@@ -217,33 +217,87 @@ grep -v "$gap" "$WORK/healthy" > "$WORK/gap"
 run_tool "$WORK/gap" --force
 { echo "$OUT" | grep -qi "gap"; } && ok "T4 gap in window -> WORRY+SKIP" || bad "T4 (out: $(echo "$OUT"|tail -1))"
 
-# ---- T4b: gap deeper in the window, closer to the frontier boundary — T4 only ever
-#      exercises "yesterday" (trivially always on the checked side), so a bug that
-#      mis-scopes the frontier itself (an off-by-one, or holdFrontier computed a day too
-#      old) could ship undetected, since nothing else tests a gap that's real but sits
-#      nearer the boundary. Computed dynamically, mirroring nonkeeper_date()'s approach —
-#      the "checked, not yet excused" range shifts with which weekday "today" is, so no
-#      fixed offset works every day. The true frontier (2nd-newest keeper, minNewerHolds=2)
-#      is the more recent of the last CLOSED Sunday (weekly) and the last day of the
-#      PREVIOUS month (monthly) — near a month boundary the monthly keeper can be nearer
-#      to today than the last closed Sunday, so both must be considered or this degenerates
-#      to a gap the tool legitimately excuses (found by an independent review; a fixed
-#      day-of-week-only formula fails on ~53/730 calendar dates, clustered in the first few
-#      days of a month). Degenerates to the same day T4 already covers on a Monday anchor
-#      (the checked range is only 1 day wide that day); every other day it exercises
-#      meaningfully deeper, distinct coverage. ----
-dow=$(date -u -d "$ADATE" +%u)                       # 1=Mon .. 7=Sun
-back_to_frontier=$(( dow == 7 ? 7 : dow ))            # days back to the last CLOSED Sunday
-last_sunday=$(date -u -d "$ADATE -$back_to_frontier days" +%Y-%m-%d)
-prev_month_end=$(date -u -d "$(date -u -d "$ADATE" +%Y-%m-01) -1 day" +%Y-%m-%d)
-frontier_date="$last_sunday"
-[[ "$prev_month_end" > "$frontier_date" ]] && frontier_date="$prev_month_end"
-deep_gap=$(date -u -d "$frontier_date +1 day" +%Y-%m-%d)   # just inside the checked range
-yesterday=$(date -u -d "$ADATE -1 days" +%Y-%m-%d)
-[[ "$deep_gap" > "$yesterday" ]] && deep_gap="$yesterday"  # never target "today" itself
-grep -v "$deep_gap" "$WORK/healthy" > "$WORK/gap2"
-run_tool "$WORK/gap2" --force
-{ echo "$OUT" | grep -qi "gap"; } && ok "T4b gap deeper in window, near the frontier boundary -> WORRY+SKIP" || bad "T4b (gap day=$deep_gap, out: $(echo "$OUT"|tail -1))"
+# ---- T4b: the pruned_through boundary is exact, not off-by-one in either direction.
+#      Guard 1 no longer derives its exclusion from the (policy-dependent) hold frontier
+#      at all -- see docs/MODEL.md: re-deriving "was this gap legitimate" from the CURRENT
+#      minNewerHolds/dailyKeepDays broke the instant either changed, because legitimacy of
+#      a past decision was determined under whatever policy was in effect then, not today's.
+#      Guard 1 now excuses a missing day iff it is at-or-before the persisted
+#      <ns>:pruned_through watermark, a fact recorded by a past successful prune -- never
+#      re-derived. This replaces the old frontier-boundary test with the new mechanism's
+#      own boundary: a day AT the watermark is excused; the very next day is not. ----
+pt_date=$(date -u -d "$ADATE -3 days" +%Y-%m-%d)      # well inside guardRecentWindowDays (7)
+pt_epoch=$(date -u -d "$pt_date" +%s)
+pt_next=$(date -u -d "$pt_date +1 day" +%Y-%m-%d)
+
+rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"
+grep -v "$pt_date" "$WORK/healthy" > "$WORK/fz/snaps"; : > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
+printf 'archive/home/rich\tzht:pruned_through\t%s\n' "$pt_epoch" > "$WORK/fz/dsprops"
+OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
+       ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --force 2>/dev/null)"
+{ ! echo "$OUT" | grep -qi "gap"; } \
+  && ok "T4b pruned_through boundary: a missing day AT the watermark is excused, not flagged" \
+  || bad "T4b-at (pt=$pt_date, out: $(echo "$OUT"|tail -1))"
+
+rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"
+grep -v "$pt_next" "$WORK/healthy" > "$WORK/fz/snaps"; : > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
+printf 'archive/home/rich\tzht:pruned_through\t%s\n' "$pt_epoch" > "$WORK/fz/dsprops"
+OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
+       ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --force 2>/dev/null)"
+{ echo "$OUT" | grep -qi "gap"; } \
+  && ok "T4b pruned_through boundary: the day AFTER the watermark is still a genuine gap" \
+  || bad "T4b-after (pt_next=$pt_next, out: $(echo "$OUT"|tail -1))"
+
+# ---- T58: regression test for the exact incident this session found — raising
+#      minNewerHolds after some history is already legitimately pruned must NEVER
+#      retroactively turn an already-certified gap into a guard-1 WORRY. Missing the
+#      last 5 days before newest (simulating dailies a PRIOR healthy run already
+#      destroyed), with pruned_through already certified through newest: guard 1 must
+#      stay clean no matter what minNewerHolds is configured to NOW, including the real
+#      production spread (2, 3, 24) -- this is exactly the PolicyIndependence property
+#      docs/model/ZfsHoldTight.tla checks in the model, verified here against the real
+#      implementation instead. ----
+cp "$WORK/healthy" "$WORK/t58base"
+for i in 1 2 3 4 5; do
+  d=$(date -u -d "$ADATE -$i days" +%Y-%m-%d)
+  grep -v "$d" "$WORK/t58base" > "$WORK/t58base.tmp"; mv "$WORK/t58base.tmp" "$WORK/t58base"
+done
+pt58_epoch=$(date -u -d "$ADATE" +%s)
+for mnh in 2 3 24; do
+  cat > "$WORK/cfg_t58.json" <<EOF
+{ "logDir": "$WORK/logs", "zfsPath": "$WORK/bin/zfs", "minNewerHolds": $mnh,
+  "retentionPolicies": { "baseline": { "dailyKeepDays": 30, "weeklyKeepDays": 1825, "monthlyKeepDays": 1825 } },
+  "datasets": { "archive/home/rich": "baseline" } }
+EOF
+  rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"
+  cp "$WORK/t58base" "$WORK/fz/snaps"; : > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
+  printf 'archive/home/rich\tzht:pruned_through\t%s\n' "$pt58_epoch" > "$WORK/fz/dsprops"
+  OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/cfg_t58.json" \
+         ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --force 2>/dev/null)"
+  { ! echo "$OUT" | grep -qi "gap"; } \
+    && ok "T58 minNewerHolds=$mnh: already-certified gap stays excused (no retroactive WORRY)" \
+    || bad "T58 minNewerHolds=$mnh (out: $(echo "$OUT"|tail -1))"
+done
+
+# ---- T59: a healthy --prune actually advances pruned_through to today (the mechanism
+#      itself, not just its downstream effect on guard 1) ----
+rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"; cp "$WORK/healthy" "$WORK/fz/snaps"; : > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
+OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
+       ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --prune --force 2>/dev/null)"
+pt_written=$(awk -F'\t' -v d="archive/home/rich" -v p="zht:pruned_through" '$1==d && $2==p{print $3}' "$WORK/fz/dsprops" 2>/dev/null)
+pt_written_date=$(date -u -d "@${pt_written:-0}" +%Y-%m-%d 2>/dev/null)
+{ [ "$pt_written_date" = "$ADATE" ]; } \
+  && ok "T59 healthy --prune advances pruned_through to today ($ADATE)" \
+  || bad "T59 (pt_written date=$pt_written_date, expected=$ADATE)"
+
+# ---- T59b: a WORRY (guard-tripped) run must NOT advance pruned_through — protection
+#      only ever increases, and a run we didn't trust must never get certified. ----
+rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"; cp "$WORK/gap" "$WORK/fz/snaps"; : > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
+OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
+       ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --prune --force 2>/dev/null)"
+{ [ ! -s "$WORK/fz/dsprops" ] || ! grep -q "zht:pruned_through" "$WORK/fz/dsprops" 2>/dev/null; } \
+  && ok "T59b a WORRY run does not advance pruned_through" \
+  || bad "T59b (dsprops: $(cat "$WORK/fz/dsprops" 2>/dev/null | tr '\n' ';'))"
 
 # ---- T5: future-dated snapshot -> HOLD ----
 cp "$WORK/healthy" "$WORK/future"
@@ -712,9 +766,10 @@ echo "$OUT" | grep -q "$gap46" \
   && ok "T46 --summary: gap in daily tail shown in Continuity" \
   || bad "T46 (gap=$gap46, out: $(echo "$OUT" | tail -3 | tr '\n' '|'))"
 
-# T47: a gap 100 days back sits well beyond the frontier (holdFrontier is always <=7 days
-# back — see T4b's frontier derivation above — so 100 gives a wide safety margin) ->
-# excused, same "✓" as a genuinely gap-free feed. Same narrow scope as guard 1.
+# T47: a gap 100 days back sits well beyond Summary's bounded fallback scan (no
+# pruned_through fixture is set here, so it falls back to guardRecentWindowDays=7 back
+# from newest — see the scanStart comment in Summary() — so 100 gives a wide safety
+# margin) -> excused, same "✓" as a genuinely gap-free feed. Same narrow scope as guard 1.
 gap47=$(date -u -d "$ADATE -100 days" +%Y-%m-%d)
 grep -v "$gap47" "$WORK/healthy" > "$WORK/gap47"
 run_tool "$WORK/gap47" --summary

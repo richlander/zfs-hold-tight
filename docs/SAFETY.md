@@ -62,37 +62,54 @@ default that a retention policy may override (so a write-once media policy can t
 content guards while a churny scratch policy relaxes them).
 
 1. **Recent window complete.** The `guardRecentWindowDays` (default 7) days ending at the
-   newest daily must each have a daily snapshot, *or be older than the current hold
-   frontier* — a day this tool already legitimately pruned (per the two-holds invariant)
-   isn't a gap, it's expected coverage, and doesn't count as missing.
+   newest daily must each have a daily snapshot, *or be at or before the persisted
+   `<ns>:pruned_through` watermark* — a day this tool already certified as accounted-for,
+   on some past successful, non-`WORRY` `--prune`, isn't a gap, it's expected coverage, and
+   doesn't count as missing.
+
+   **This is deliberately NOT the current hold frontier.** An earlier version of this guard
+   excused a missing day by re-deriving legitimacy from the frontier computed under
+   *today's* retention policy (`minNewerHolds`/`dailyKeepDays`). That breaks the moment
+   either changes: legitimacy of a *past* pruning decision was determined under whatever
+   policy was in effect *then*, not today's, so raising `minNewerHolds` (or extending
+   `dailyKeepDays`) could retroactively make already-correctly-pruned history look like an
+   unexplained gap — a real incident, not a hypothetical: it's what happens when a dataset
+   already thinned down to keepers-only under `minNewerHolds=2` is then re-evaluated under
+   `minNewerHolds=3` before the watermark has had a chance to catch up. `pruned_through` is
+   a persisted **fact about history** — set to `now` only on a run that itself passed every
+   guard — and is never recomputed from current config, so no future policy change can ever
+   reopen a question about the past again. Full writeup: `docs/MODEL.md` (the design
+   rationale, including a TLA+ model checked against exactly this scenario) and
+   `tests/run-tests.sh` T58 (the reproduction, checked against the real implementation
+   across the actual production `minNewerHolds` spread of 2/3/24).
 
    **Scope, explicitly: this guard protects only this tool's own pruning decision — it is
    not a replication/feed-health monitor, and isn't meant to be one.** Its question is
    narrow: "is the feed healthy enough that my retention math (which assumes continuous
-   recent coverage) is trustworthy right now?" Once 2 newer keepers genuinely cover a day,
-   that guarantee holds regardless of *why* the day itself is gone — pruned by this tool,
-   or never replicated in the first place — because the guarantee is about the keepers
-   that exist, not about whether every intervening daily was ever captured. Detecting
-   *replication* health specifically — did last night's pull actually happen — is a
-   separate, better-suited job already done elsewhere: `orientation/health-check.md` step
+   recent coverage) is trustworthy right now?" Once a past healthy run genuinely certified a
+   day, that guarantee holds regardless of *why* the day itself is gone — pruned by this
+   tool, or never replicated in the first place — because the guarantee is about what this
+   tool already verified, not about whether every intervening daily was ever captured.
+   Detecting *replication* health specifically — did last night's pull actually happen — is
+   a separate, better-suited job already done elsewhere: `orientation/health-check.md` step
    1 checks `replication.query` state directly (every task `FINISHED`, `last_snapshot` is
    today's), which sees the replication task itself rather than inferring backward from
-   snapshot presence. A transient replication gap that self-heals before it ages past the
-   frontier could, in principle, go unflagged by this guard specifically — that's fine;
-   it's not this guard's job, and the dedicated check would have already caught it.
+   snapshot presence. A transient replication gap that self-heals before the watermark
+   catches up to it could, in principle, go unflagged by this guard specifically — that's
+   fine; it's not this guard's job, and the dedicated check would have already caught it.
 
-   Without the frontier exclusion, this guard would fight its own tool's retention: a
-   routine weekly batch destroys several of the days inside this window, and the very next
-   run(s) would see those days "missing" and false-trip a feed-gap alert on data the tool
-   itself correctly removed — this was a real, once-shipped bug (found by an independent
+   Without the exclusion at all, this guard would fight its own tool's retention: a routine
+   weekly batch destroys several of the days inside this window, and the very next run(s)
+   would see those days "missing" and false-trip a feed-gap alert on data the tool itself
+   correctly removed — this was a real, once-shipped bug (found by an independent
    second-model review after 10 rounds of the first reviewer missing it, since the old
    `guardMaxDeletePerRun: 5` never let a batch complete far enough to expose it) — see
-   `tests/run-tests.sh` T42 for the reproduction. This is deliberately the *coverage*
+   `tests/run-tests.sh` T42 for that reproduction. This is deliberately the *coverage*
    question ("is it safe that this day is gone") — kept distinct from the *scale* question
-   ("is the amount of change unusual"), which is guard 6's job alone; a day still inside
-   the window that's neither present nor past the frontier is a real gap. *(Load-bearing
-   guard: the canonical trap is stale data plus freshly re-stamped weekly/monthly
-   snapshots fooling a naive "keep newest N" into pruning real coverage.)*
+   ("is the amount of change unusual"), which is guard 6's job alone; a day still inside the
+   window that's neither present nor already certified is a real gap. *(Load-bearing guard:
+   the canonical trap is stale data plus freshly re-stamped weekly/monthly snapshots fooling
+   a naive "keep newest N" into pruning real coverage.)*
 2. **Newest daily fresh.** The most recent daily must be ≤ `guardMaxDailyAgeHours`
    (default 26h) old. A stale newest means replication isn't delivering.
 3. **Clock sane.** No snapshot may be dated in the future, and `now` must be after the

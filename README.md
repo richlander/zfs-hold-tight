@@ -114,10 +114,11 @@ run as a user able to `zfs destroy`/`hold` the target datasets (usually root).
 
 `--summary`'s Continuity column uses the same narrow scope as guard 1 (see
 [Safety guards](#safety-guards) below): it flags a missing day only within the current
-daily tail (back to the hold frontier), and never flags a day that's older than the
-frontier and therefore legitimately gone through normal GFS thinning. It's a feed-health
-signal scoped to this tool's own pruning decision, not a replication-health check — see
-`orientation/health-check.md`'s replication query for that.
+daily tail (back to the persisted `<ns>:pruned_through` watermark — a fact about past
+`--prune` runs, not a recomputation from current policy; see `docs/MODEL.md`), and never
+flags a day already certified there or gone through normal GFS thinning. It's a
+feed-health signal scoped to this tool's own pruning decision, not a replication-health
+check — see `orientation/health-check.md`'s replication query for that.
 
 Exit codes: `0` ok · `1` trouble (a dataset `SKIP`ped or a destroy failed) · `2` bad
 config/arguments · `3` another run holds the lock.
@@ -135,7 +136,7 @@ See [`zfs-hold-tight.example.json`](zfs-hold-tight.example.json). Top-level keys
 | `guardMaxDailyAgeHours` | `26` | `WORRY`+skip if the newest daily is older than this. |
 | `guardMaxDailyShrinkPct` | `33` | `WORRY`+skip if the newest daily references this % less data than the recent baseline (mass-**deletion** guard; `0` disables). |
 | `guardMaxDailyChurnPct` | `50` | `WORRY`+skip if the newest daily rewrites more than this % of the dataset's data in one day (mass-**rewrite / encryption** guard; `0` disables). |
-| `propertyNamespace` | `zht` | Prefix for the tool's ZFS user-properties + hold tags (`<ns>:keep_until`, `<ns>:tier`, `<ns>:monthly`, `<ns>:weekly`, `<ns>:adhoc`, `<ns>:worry`). |
+| `propertyNamespace` | `zht` | Prefix for the tool's ZFS user-properties + hold tags (`<ns>:keep_until`, `<ns>:tier`, `<ns>:monthly`, `<ns>:weekly`, `<ns>:adhoc`, `<ns>:worry`, `<ns>:pruned_through`). |
 | `zfsPath` | auto (`/usr/sbin/zfs`…) | Absolute path to the `zfs` binary. Resolved from standard locations; set explicitly to avoid trusting the (root cron's) `PATH`. |
 | `curlPath` | auto (`/usr/bin/curl`…) | Absolute path to `curl` (healthchecks only). |
 | `minNewerHolds` | `3` | Two-holds invariant (misnomer kept for compatibility — default is now 3): a plain daily drops only after this many newer held keepers (weekly/monthly grandfathers) exist. A held keeper only ever advances into the 2nd-newest slot at an ISO-week close, so at `minNewerHolds=2` a whole week's worth of plain dailies sit at "exactly 1 newer hold" and cross to "doomed" together the instant the next week's keeper appears; 3 buys a full extra week of buffer. |
@@ -221,7 +222,7 @@ snapshot's full name follows the token.
 | `HOLD:ADD` | a `zfs hold` was placed (monthly keeper protected) | `grep HOLD:ADD` |
 | `HOLD:REMOVE` | a hold was released (demotion / weekly-downgrade / before destroy) | `grep HOLD:REMOVE` |
 | `META:ADD` | tier/keep_until tags written on a newly-tagged keeper | `grep META:ADD` |
-| `META:UPDATE` | an existing keeper's tag changed (e.g. weekly→monthly promotion) | `grep META:UPDATE` |
+| `META:UPDATE` | an existing keeper's tag changed (e.g. weekly→monthly promotion), or the dataset's `<ns>:pruned_through` watermark advanced | `grep META:UPDATE` |
 | `META:REMOVE` | tags inherited away on demotion | `grep META:REMOVE` |
 | `SNAP:DESTROY` | a snapshot was **pruned** (irreversible) | `grep SNAP:DESTROY` |
 

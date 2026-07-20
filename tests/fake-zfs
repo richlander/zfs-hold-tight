@@ -3,6 +3,9 @@
 # Driven by fixture files under $FAKE_ZFS_DIR:
 #   snaps    one per line: name<TAB>keep_until<TAB>tier   (use - for empty)
 #   holds    one per line: name<TAB>tag<TAB>timestamp
+#   dsprops  one per line: dataset<TAB>property<TAB>value -- dataset-LEVEL properties
+#            (e.g. <ns>:pruned_through), keyed by dataset since one FAKE_ZFS_DIR can
+#            hold fixtures for more than one dataset (see T18's per-dataset isolation).
 #   ops.log  appended: every mutating op (set/hold/release/destroy/inherit)
 # $FAKE_ZFS_FAIL may name a subcommand to force-fail (e.g. "set").
 set -u
@@ -36,7 +39,8 @@ case "$sub" in
     # `set <prop=val>... <target>` — persist keep_until/tier writes on a snapshot target
     # back into $D/snaps (via update_snap_field above), so a later invocation's `list`
     # sees them (needed to test multi-run transitions, e.g. cold-start establishment
-    # carrying into a later run).
+    # carrying into a later run). A DATASET target (no `@`) persists into $D/dsprops
+    # instead, keyed by (dataset, property) -- this is how pruned_through round-trips.
     args=("$@"); n=${#args[@]}
     if [ "$n" -gt 0 ]; then
       target="${args[$((n-1))]}"
@@ -48,8 +52,41 @@ case "$sub" in
               *:tier=*)       update_snap_field "$target" 3 "${args[$i]#*:tier=}" ;;
             esac
           done ;;
+        *)
+          for ((i=0; i<n-1; i++)); do
+            case "${args[$i]}" in
+              *=*)
+                p="${args[$i]%%=*}"; v="${args[$i]#*=}"
+                esc_t=$(printf '%s' "$target" | sed 's/[.[\*^$]/\\&/g')
+                esc_p=$(printf '%s' "$p" | sed 's/[.[\*^$]/\\&/g')
+                [ -f "$D/dsprops" ] && grep -vP "^${esc_t}\t${esc_p}\t" "$D/dsprops" > "$D/dsprops.tmp" 2>/dev/null \
+                  && mv "$D/dsprops.tmp" "$D/dsprops"
+                printf '%s\t%s\t%s\n' "$target" "$p" "$v" >> "$D/dsprops"
+                ;;
+            esac
+          done ;;
       esac
     fi
+    exit 0 ;;
+  get)
+    # `get -Hp -o value <prop> <target>` — dataset-level property read, single value only
+    # (the only form zfs-hold-tight.cs actually uses). Never-set -> "-", matching real zfs.
+    args=("$@"); n=${#args[@]}
+    target="${args[$((n-1))]}"; prop=""; skip_next=0
+    for ((i=0; i<n-1; i++)); do
+      a="${args[$i]}"
+      if [ "$skip_next" = 1 ]; then skip_next=0; continue; fi
+      case "$a" in
+        -o) skip_next=1 ;;
+        -*) ;;
+        *) prop="$a" ;;
+      esac
+    done
+    val="-"
+    if [ -f "$D/dsprops" ]; then
+      val="$(awk -F'\t' -v d="$target" -v p="$prop" '$1==d && $2==p{print $3; f=1} END{if(!f) print "-"}' "$D/dsprops")"
+    fi
+    echo "$val"
     exit 0 ;;
   inherit)
     log "inherit $1 $2"
