@@ -64,6 +64,27 @@ This fully decouples question 2 from question 1. Deepening retention (raising
 about days that were already correctly handled — there's nothing left in guard 1 that
 references policy at all.
 
+**The bootstrap case, found the hard way.** A dataset that was already established
+under a binary that predates this property has no `pruned_through` at all on its first
+run under a new one — defaulting that to `MinValue` (nothing trusted yet) would flag
+its entire pre-existing, already-legitimate daily tail as an unexplained gap. This is
+not hypothetical: it happened deploying this exact feature. The fix reuses the
+cold-start floor's own `everEstablished` signal (real `<ns>:tier` history already
+exists): an established dataset with no recorded watermark defaults to `now` instead of
+`MinValue`, once, self-limiting (a real run persists a value immediately afterward, so
+this branch never applies again), and only ever extends trust to a dataset this tool
+was already successfully managing — never to a genuinely fresh one, which still gets
+`MinValue`.
+
+Worth naming plainly: on that one bootstrap run, defaulting to `now` doesn't just excuse
+the *historical* gap — every day up to and including the newest snapshot is `<= now`,
+so guard 1's entire recent-window check is effectively a no-op for that single run (a
+brand-new gap appearing to coincide exactly with the bootstrap moment would also go
+unflagged by guard 1 specifically). Guards 2/4/5 (staleness, shrink, churn) don't depend
+on `pruned_through` at all and still catch anything currently wrong regardless. Judged
+an acceptable, narrow, one-time trade-off given the alternative — a real, repeated false
+alarm on every established dataset on this session's own deployment.
+
 ## State model
 
 - `Snapshots` — the set of `(date, tier)` pairs that currently exist for a dataset, as

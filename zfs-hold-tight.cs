@@ -544,8 +544,21 @@ foreach (var (ds, ret) in retention)
         holdMap.TryGetValue(name, out var tags) && tags.Any(t => t != tagMonthly && t != tagWeekly);
 
     // Persisted watermark for guard 1 (see propPrunedThrough / LoadPrunedThrough above).
-    // Never-set or unreadable both default to MinValue, the safe/conservative direction.
-    var prunedThrough = LoadPrunedThrough(ds) ?? DateTime.MinValue;
+    // Unreadable always defaults to MinValue (the safe/conservative direction -- can't
+    // verify, so trust nothing). Never-set is more nuanced: for a dataset this tool has
+    // never established (no real <ns>:tier anywhere -- same signal the cold-start floor
+    // below already uses), MinValue is still correct -- there's no history to trust yet.
+    // But for a dataset that's ALREADY established and simply predates this property
+    // (the first run after upgrading to a binary that tracks it), defaulting to MinValue
+    // would flag its entire pre-existing, already-legitimate daily tail as an unexplained
+    // gap -- a real incident, not hypothetical: this is exactly what happened deploying
+    // this feature. Bootstrap those to `now` instead: a one-time, self-limiting default
+    // (once a real run persists a value, this branch never applies again) that only ever
+    // extends trust to a dataset this tool was already successfully managing, never to a
+    // genuinely fresh one. Applied identically in dry-run and --prune so a dry-run's
+    // guard-1 preview isn't needlessly alarming either; only --prune actually persists it.
+    bool everEstablished = snaps.Any(s => s.Tier is not null);
+    var prunedThrough = LoadPrunedThrough(ds) ?? (everEstablished ? now.Date : DateTime.MinValue);
 
     // Keeper/hold summary — hoisted above the worry paths so the WORRY lines and the normal
     // line all report the same numbers. keepersHeld counts computed keepers that ALREADY carry
@@ -684,7 +697,7 @@ foreach (var (ds, ret) in retention)
     //      --force ever being used. A dataset with zero doomed snapshots (nothing
     //      destructive to decide on yet) establishes on its first plain --prune — Promote
     //      only ever tags/holds keepers, never destroys, so there is nothing to review.
-    bool everEstablished = snaps.Any(s => s.Tier is not null);
+    //      (everEstablished computed above, alongside prunedThrough's own bootstrap.)
     if (!everEstablished && doomed.Count > 0 && !force)
     {
         Log($"{ds}: WORRY - cold start: would delete {doomed.Count} (dataset not yet established — no snapshot carries a real {propTier} value; if --force was already used and this persists, Promote's metadata/hold writes may be failing rather than never having run); {keeperTailSuffix}");
@@ -957,7 +970,11 @@ int Summary(string? datasetFilter, DateTime? since)
         }
 
         var (weekKeeper, monthKeeper, keeperNames, _, _) = ComputeKeepersAndFrontier(snaps, ret, now);
-        var prunedThrough = LoadPrunedThrough(ds) ?? DateTime.MinValue;
+        // Same bootstrap default as the main loop (see its comment): an established
+        // dataset predating this property shouldn't have its whole pre-existing daily
+        // tail reported as a Continuity break just because the watermark is new.
+        bool everEstablished = snaps.Any(s => s.Tier is not null);
+        var prunedThrough = LoadPrunedThrough(ds) ?? (everEstablished ? now.Date : DateTime.MinValue);
 
         var windowed = snaps.Where(s => s.Date.Date >= effectiveSince).ToList();
         int monthlies = windowed.Count(s => monthKeeper.Contains(s.Name));

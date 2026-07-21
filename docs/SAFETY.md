@@ -83,6 +83,20 @@ content guards while a churny scratch policy relaxes them).
    `tests/run-tests.sh` T58 (the reproduction, checked against the real implementation
    across the actual production `minNewerHolds` spread of 2/3/24).
 
+   **Bootstrap for an already-established dataset.** A dataset managed before this
+   property existed has no `pruned_through` on its first run under a binary that tracks
+   it — also a real incident, not a hypothetical, hit deploying this same feature.
+   Defaulting to `MinValue` there would flag the dataset's entire pre-existing daily tail
+   as an unexplained gap. Instead, an already-established dataset (real `<ns>:tier`
+   history — the same signal guard 7's cold-start floor already uses) with no recorded
+   watermark defaults to `now`, once (self-limiting: a real run persists a value
+   immediately after, so this never applies twice) — extending trust only to a dataset
+   already being successfully managed, never to a genuinely fresh one. Worth naming
+   plainly: on that one run, this makes guard 1's entire recent-window check a no-op (every
+   day up to the newest snapshot is `<= now`), not just the historical gap — guards 2/4/5
+   don't depend on `pruned_through` and still catch anything currently wrong regardless.
+   Full rationale: `docs/MODEL.md`; `tests/run-tests.sh` T66-T69.
+
    **Scope, explicitly: this guard protects only this tool's own pruning decision — it is
    not a replication/feed-health monitor, and isn't meant to be one.** Its question is
    narrow: "is the feed healthy enough that my retention math (which assumes continuous

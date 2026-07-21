@@ -286,9 +286,16 @@ OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
        ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --prune --force 2>/dev/null)"
 pt_written=$(awk -F'\t' -v d="archive/home/rich" -v p="zht:pruned_through" '$1==d && $2==p{print $3}' "$WORK/fz/dsprops" 2>/dev/null)
 pt_written_date=$(date -u -d "@${pt_written:-0}" +%Y-%m-%d 2>/dev/null)
-{ [ "$pt_written_date" = "$ADATE" ]; } \
-  && ok "T59 healthy --prune advances pruned_through to today ($ADATE)" \
-  || bad "T59 (pt_written date=$pt_written_date, expected=$ADATE)"
+# Compare against a date captured fresh right here, NOT the script-start $ADATE: the
+# tool stamps pruned_through with its OWN DateTime.UtcNow at whatever moment this
+# specific test happens to run (potentially minutes into a long suite), so within the
+# ~2-hour window after UTC midnight, a bash `date` call at script start and one made
+# now can legitimately disagree by a day even though nothing is wrong (same class of
+# flakiness T24b's comment already documents for log filenames). Accept either.
+real_today=$(date -u +%Y-%m-%d)
+{ [ "$pt_written_date" = "$ADATE" ] || [ "$pt_written_date" = "$real_today" ]; } \
+  && ok "T59 healthy --prune advances pruned_through to today ($pt_written_date)" \
+  || bad "T59 (pt_written date=$pt_written_date, expected=$ADATE or $real_today)"
 
 # ---- T59b: a WORRY (guard-tripped) run must NOT advance pruned_through — protection
 #      only ever increases, and a run we didn't trust must never get certified. ----
@@ -388,6 +395,57 @@ health65="$(health_of "$WORK/fz/dsprops")"
 [ "$health65" = "healthy" ] \
   && ok "T65 a clean --prune with no prior health state explicitly writes health=healthy" \
   || bad "T65 (health=$health65)"
+
+# ==== pruned_through bootstrap for an already-established dataset (docs/MODEL.md /
+#      zfs-hold-tight.cs's prunedThrough comment): a dataset already managed before this
+#      property existed must not have its entire pre-existing daily tail reported as an
+#      unexplained gap just because the watermark is new -- the real incident this
+#      session hit deploying the feature. Bootstrap only applies when everEstablished
+#      (real prior <ns>:tier history); a genuinely fresh dataset gets no such pass. ====
+gap66=$(date -u -d "$ADATE -1 days" +%Y-%m-%d)
+grep -v "$gap66" "$WORK/healthy" > "$WORK/gap66"
+establish_oldest "$WORK/gap66" "$WORK/gap66_established"
+
+# ---- T66: established + never-set pruned_through + a real historical gap -> bootstrap
+#      excuses it, no false WORRY (contrast with T67 below: same gap, NOT established). ----
+rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"; cp "$WORK/gap66_established" "$WORK/fz/snaps"; : > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
+OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
+       ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --force 2>/dev/null)"
+{ ! echo "$OUT" | grep -qi "gap"; } \
+  && ok "T66 established dataset, never-set pruned_through: bootstrap excuses the pre-existing gap (no false WORRY)" \
+  || bad "T66 (out: $(echo "$OUT" | tail -3 | tr '\n' '|'))"
+
+# ---- T67: same gap, NOT established (no prior <ns>:tier anywhere) -> bootstrap must
+#      NOT apply; still a real, flagged gap. Proves T66's silence is the bootstrap
+#      specifically, not the guard becoming permissive in general. ----
+rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"; cp "$WORK/gap66" "$WORK/fz/snaps"; : > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
+OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
+       ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --force 2>/dev/null)"
+{ echo "$OUT" | grep -qi "gap"; } \
+  && ok "T67 NOT established, never-set pruned_through: the same gap is still flagged (no bootstrap)" \
+  || bad "T67 (out: $(echo "$OUT" | tail -3 | tr '\n' '|'))"
+
+# ---- T68: the bootstrap value actually gets PERSISTED as today's date on a healthy
+#      --prune (not just a transient in-memory pass for this one run's guard check). ----
+rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"; cp "$WORK/gap66_established" "$WORK/fz/snaps"; : > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
+FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
+  ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --prune --force >/dev/null 2>&1
+pt68=$(awk -F'\t' -v d="archive/home/rich" -v p="zht:pruned_through" '$1==d && $2==p{print $3}' "$WORK/fz/dsprops" 2>/dev/null)
+pt68_date=$(date -u -d "@${pt68:-0}" +%Y-%m-%d 2>/dev/null)
+real_today68=$(date -u +%Y-%m-%d)
+{ [ "$pt68_date" = "$ADATE" ] || [ "$pt68_date" = "$real_today68" ]; } \
+  && ok "T68 the bootstrap value is actually persisted as today's pruned_through ($pt68_date)" \
+  || bad "T68 (pt68_date=$pt68_date, expected=$ADATE or $real_today68)"
+
+# ---- T69: --summary shows the same bootstrap behavior -- Continuity is clean ("✓"),
+#      not a break, for the same established+never-set-pruned_through+historical-gap
+#      case as T66. ----
+rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"; cp "$WORK/gap66_established" "$WORK/fz/snaps"; : > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
+OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
+       ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --summary 2>/dev/null)"
+{ echo "$OUT" | grep "archive/home/rich" | grep -q '✓'; } \
+  && ok "T69 --summary: established dataset with never-set pruned_through shows clean Continuity" \
+  || bad "T69 (out: $(echo "$OUT" | grep 'archive/home/rich'))"
 
 # ---- T5: future-dated snapshot -> HOLD ----
 cp "$WORK/healthy" "$WORK/future"
