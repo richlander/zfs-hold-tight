@@ -47,20 +47,21 @@
 // Every run appends to /mnt/archive/tools/zfs-hold-tight.log and (on --prune) pings
 // healthchecks.io: the base URL on a clean run, /fail with diagnostics on trouble.
 //
-// Build (native, glibc-matched to the target - NOT a cross-compile). The dotnet AOT SDK
-// image is Debian 12-based (glibc 2.36, matching TrueNAS) with clang+zlib already present:
-//   docker run --rm -v "$PWD:/src" -w /src mcr.microsoft.com/dotnet/sdk:10.0-aot \
-//     dotnet publish zfs-hold-tight.cs -r linux-x64 -c Release -o out
+// Build (native, glibc-matched to the target - NOT a cross-compile), from the repo root.
+// The dotnet AOT SDK image is Debian 12-based (glibc 2.36, matching TrueNAS) with
+// clang+zlib already present:
+//   docker run --rm -v "$PWD:/repo" -w /repo mcr.microsoft.com/dotnet/sdk:10.0-aot \
+//     dotnet publish src/zfs-hold-tight.cs -r linux-x64 -c Release -o out
 //   # verify it will run on the target: highest symbol must be <= the target's glibc
 //   objdump -T out/zfs-hold-tight | grep -oE 'GLIBC_[0-9.]+' | sort -V | tail -1
 //
 // This is a file-based app split across multiple .cs files via #:include (see the
-// directives above) -- zfs-hold-tight.cs stays the one entry point (arg parsing, config
-// loading, dispatch); Types/Utils/Zfs/Guards hold shared state and helpers, and each
-// command (Prune/Doctor/Summary/Fix/Holds) lives in its own file as a method on the
-// partial `Commands` class. `dotnet run`/`dotnet publish` both still just target this
-// file — the included files compile into the SAME single AOT binary, not a separate
-// assembly (unlike `#:ref`, which would).
+// directives above) -- this file (src/zfs-hold-tight.cs) stays the one entry point (arg
+// parsing, config loading, dispatch); Types/Utils/Zfs/Guards hold shared state and
+// helpers, and each command (Prune/Doctor/Summary/Fix/Holds) lives in its own file as a
+// method on the partial `Commands` class. `dotnet run`/`dotnet publish` both still just
+// target this file — the included files compile into the SAME single AOT binary, not a
+// separate assembly (unlike `#:ref`, which would).
 //
 // Usage: zfs-hold-tight [--prune] [--force] [--dataset archive/<name>] [-v] [--no-hc]
 //        zfs-hold-tight --doctor [--dataset archive/<name>]

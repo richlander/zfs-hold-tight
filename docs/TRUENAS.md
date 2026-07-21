@@ -39,8 +39,8 @@ SDK image is itself Debian 12-based with clang + zlib already installed, so it i
 natural build environment — no cross-compile, no toolchain setup:
 
 ```bash
-docker run --rm -v "$PWD:/src" -w /src mcr.microsoft.com/dotnet/sdk:10.0-aot \
-  dotnet publish zfs-hold-tight.cs -r linux-x64 -c Release -o out
+docker run --rm -v "$PWD:/repo" -w /repo mcr.microsoft.com/dotnet/sdk:10.0-aot \
+  dotnet publish src/zfs-hold-tight.cs -r linux-x64 -c Release -o out
 ```
 
 Confirm the binary's highest required symbol is ≤ the target's glibc (2.36 on Debian 12):

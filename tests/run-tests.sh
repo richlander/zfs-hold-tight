@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Integration tests for zfs-hold-tight using a fake `zfs` (no real pool needed).
-# Usage: ./run-tests.sh [path-to-zfs-hold-tight.cs]
+# Usage: ./run-tests.sh [path-to-src/zfs-hold-tight.cs]
 #
 # All fixtures are anchored relative to `now` so the suite is deterministic at any
 # wall-clock hour: the freshest snapshot is NOW-2h, and every snapshot shares one
 # time-of-day (subtracting whole days preserves it), so names are reconstructable.
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
-TARGET="${1:-$HERE/../zfs-hold-tight.cs}"
+TARGET="${1:-$HERE/../src/zfs-hold-tight.cs}"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$WORK/bin"; ln -sf "$HERE/fake-zfs" "$WORK/bin/zfs"

@@ -85,7 +85,7 @@ cp zfs-hold-tight.example.json zfs-hold-tight.json   # then edit datasets + rete
 
 # 2. Build a native-AOT single binary (see "Building" — deploying to TrueNAS needs a
 #    glibc-matched container build)
-dotnet publish zfs-hold-tight.cs -r linux-x64 -c Release -o bin/
+dotnet publish src/zfs-hold-tight.cs -r linux-x64 -c Release -o bin/
 
 # 3. Dry-run (default: shows what would be pruned, deletes nothing)
 ./bin/zfs-hold-tight
@@ -112,7 +112,7 @@ run as a user able to `zfs destroy`/`hold` the target datasets (usually root).
 | `--prune --force` | Bypass the per-run delete cap (for a reviewed bulk cleanup). |
 | `-v`, `--verbose` | Log each snapshot decision. |
 | `--doctor` | Report keeper hold status: protected ✓ / missing ✗ / unexpected. |
-| `--summary [--since YYYY-MM-DD]` | Two-section markdown report — for pasting into a gist/PR/chat, not a replacement for `--doctor`'s per-keeper detail. **Snapshots**: one-line-per-dataset table (monthlies/weeklies/dailies retained, date range, feed continuity); `--since` narrows the window, omitted defaults to the oldest snapshot actually retained. **Health**: the pool-wide state (`starting`/`healthy`/`unhealthy`), always shown explicitly (unlike the console log's silent-when-healthy convention — this file is read directly by a human, not grepped), plus the persisted reason when unhealthy. |
+| `--summary [--since YYYY-MM-DD]` | Two-section markdown report ([sample output](docs/SUMMARY.example.md)) — for pasting into a gist/PR/chat, not a replacement for `--doctor`'s per-keeper detail. **Snapshots**: one-line-per-dataset table (monthlies/weeklies/dailies retained, date range, feed continuity); `--since` narrows the window, omitted defaults to the oldest snapshot actually retained. **Health**: the pool-wide state (`starting`/`healthy`/`unhealthy`), always shown explicitly (unlike the console log's silent-when-healthy convention — this file is read directly by a human, not grepped), plus the persisted reason when unhealthy. |
 | `--check-holds` | Flag holds on snapshots older than their dataset's own retention. |
 | `--fix` | Create missing managed holds on monthly and weekly keepers. |
 | `--hold-adhoc <snap>` | Defensive manual `<ns>:adhoc` hold on one snapshot. |
@@ -165,7 +165,7 @@ media, or disable churn for a scratch dataset). Per-policy + a one-dataset polic
 effectively per-dataset thresholds when you need them.
 
 > **Note:** the property/hold namespace is set by `propertyNamespace` (default `zht`). The
-> pool prefix (`archive/`) is still a compiled-in constant in `zfs-hold-tight.cs` — edit it
+> pool prefix (`archive/`) is still a compiled-in constant in `src/zfs-hold-tight.cs` — edit it
 > to match your pool.
 
 > **Hardening:** the tool runs `zfs` from an absolute path (resolved, or `zfsPath`) rather
@@ -292,7 +292,7 @@ A native-AOT build produces a single self-contained binary with instant startup 
 runtime dependency. It needs the **.NET 10+ SDK** plus **clang** and zlib headers.
 
 ```bash
-dotnet publish zfs-hold-tight.cs -r linux-x64 -c Release -o bin/    # -> bin/zfs-hold-tight
+dotnet publish src/zfs-hold-tight.cs -r linux-x64 -c Release -o bin/    # -> bin/zfs-hold-tight
 ```
 
 `--version` reports `1.0.0+<git-sha>` — the SDK reads the committed `HEAD` from `.git`
@@ -306,8 +306,8 @@ older system. Build inside Microsoft's AOT SDK image (Debian 12-based, glibc 2.3
 clang preinstalled) so the result runs on any glibc ≥ 2.36:
 
 ```bash
-docker run --rm -v "$PWD:/src" -w /src mcr.microsoft.com/dotnet/sdk:10.0-aot \
-  dotnet publish zfs-hold-tight.cs -r linux-x64 -c Release -o out
+docker run --rm -v "$PWD:/repo" -w /repo mcr.microsoft.com/dotnet/sdk:10.0-aot \
+  dotnet publish src/zfs-hold-tight.cs -r linux-x64 -c Release -o out
 objdump -T out/zfs-hold-tight | grep -oE 'GLIBC_[0-9.]+' | sort -V | tail -1   # must be ≤ target glibc
 ```
 
@@ -322,7 +322,7 @@ window: **[docs/TRUENAS.md](docs/TRUENAS.md)**.
 ## Testing
 
 ```bash
-tests/run-tests.sh                       # or: tests/run-tests.sh path/to/zfs-hold-tight.cs
+tests/run-tests.sh                       # or: tests/run-tests.sh path/to/src/zfs-hold-tight.cs
 ```
 
 The suite drives the tool against a fake `zfs` (`tests/fake-zfs`) — no real pool needed —
