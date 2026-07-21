@@ -309,6 +309,8 @@ OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
 # ==== pool-wide health latch (docs/MODEL.md "Cross-dataset shock") ====
 # health_of <dsprops-file>: reads the pool-level zht:health value (or empty if unset).
 health_of() { awk -F'\t' -v d="archive" -v p="zht:health" '$1==d && $2==p{print $3}' "$1" 2>/dev/null; }
+# health_reason_of <dsprops-file>: reads the persisted zht:health_reason value (or empty).
+health_reason_of() { awk -F'\t' -v d="archive" -v p="zht:health_reason" '$1==d && $2==p{print $3}' "$1" 2>/dev/null; }
 
 # ---- T60: the latch does NOT auto-heal. A dataset shocks (guard 4/5), latching
 #      health=unhealthy; a SECOND run against a completely clean feed for the SAME
@@ -395,6 +397,61 @@ health65="$(health_of "$WORK/fz/dsprops")"
 [ "$health65" = "healthy" ] \
   && ok "T65 a clean --prune with no prior health state explicitly writes health=healthy" \
   || bad "T65 (health=$health65)"
+
+# ---- T70: a content shock persists a free-text reason (<ns>:health_reason) -- not just
+#      the healthy/unhealthy enum -- so an operator reviewing later (via --summary or
+#      --doctor) can see WHAT tripped it without needing to log into the machine and grep
+#      the day's log. ----
+nlines70="$(gen_window $((NOW-7200)) | wc -l)"
+gen_window $((NOW-7200)) | awk -F'\t' -v n="$nlines70" \
+  'BEGIN{OFS="\t"} {print $1,$2,$3,(NR==n?104857600:1073741824)}' > "$WORK/t70shock"   # newest shrinks 90%
+rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"; cp "$WORK/t70shock" "$WORK/fz/snaps"; : > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
+FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
+  ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --prune --force >/dev/null 2>&1
+reason70="$(health_reason_of "$WORK/fz/dsprops")"
+OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
+       ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --summary 2>/dev/null)"
+OUT2="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
+       ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --doctor 2>/dev/null)"
+{ echo "$reason70" | grep -qi "shrank" \
+  && echo "$OUT" | grep -q "archive: WORRY -.*shrank" \
+  && echo "$OUT2" | grep -q "archive: WORRY -.*shrank"; } \
+  && ok "T70 content shock persists a reason, surfaced by --summary and --doctor without reading the log" \
+  || bad "T70 (reason=$reason70, summary: $(echo "$OUT"|tail -3|tr '\n' '|'), doctor: $(echo "$OUT2"|head -3|tr '\n' '|'))"
+
+# ---- T71: --reset-health prints the persisted reason before clearing it, and the
+#      reason property is actually gone afterward (not left as a stale explanation for a
+#      now-resolved incident). ----
+OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
+       ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --reset-health 2>/dev/null)"
+reason71="$(health_reason_of "$WORK/fz/dsprops")"
+{ echo "$OUT" | grep -qi "Reason for the latch:.*shrank" && [ -z "$reason71" ]; } \
+  && ok "T71 --reset-health shows the reason before clearing it" \
+  || bad "T71 (out: $(echo "$OUT"|head -2|tr '\n' '|'), reason_after=$reason71)"
+
+# ---- T72: --summary's two sections -- "## Snapshots" / "## Health" headers always
+#      present, and the Health line always states the pool's state explicitly (unlike
+#      the console log's silent-when-healthy WORRY convention -- this file is read
+#      directly by a human, not grepped). ----
+rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"; cp "$WORK/healthy" "$WORK/fz/snaps"; : > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
+FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
+  ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --prune --force >/dev/null 2>&1
+OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
+       ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --summary 2>/dev/null)"
+{ echo "$OUT" | grep -qx "## Snapshots" \
+  && echo "$OUT" | grep -qx "## Health" \
+  && echo "$OUT" | grep -qx "archive: healthy"; } \
+  && ok "T72 --summary always shows Snapshots + Health sections, explicit 'healthy' state" \
+  || bad "T72 (out: $(echo "$OUT" | tr '\n' '|'))"
+
+# ---- T73: before any --prune has ever run (health never set), --summary reports the
+#      pool as "starting", not silently omitted or misreported as "healthy". ----
+rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"; cp "$WORK/healthy" "$WORK/fz/snaps"; : > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
+OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
+       ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --summary 2>/dev/null)"
+echo "$OUT" | grep -qx "archive: starting" \
+  && ok "T73 --summary reports pool state \"starting\" before any --prune has run" \
+  || bad "T73 (out: $(echo "$OUT" | tr '\n' '|'))"
 
 # ==== pruned_through bootstrap for an already-established dataset (docs/MODEL.md /
 #      zfs-hold-tight.cs's prunedThrough comment): a dataset already managed before this

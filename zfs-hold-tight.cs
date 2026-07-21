@@ -188,7 +188,7 @@ string tagMonthly = $"{ns}:monthly", tagWeekly = $"{ns}:weekly", tagAdhoc = $"{n
 // CURRENT retention policy, so raising minNewerHolds/dailyKeepDays can never retroactively
 // make already-legitimately-pruned history look like an unexplained gap.
 string propPrunedThrough = $"{ns}:pruned_through";
-// Fleet-wide (NOT per-dataset) latch: "starting" (never set) | "healthy" | "unhealthy".
+// Pool-wide (NOT per-dataset) latch: "starting" (never set) | "healthy" | "unhealthy".
 // Lives on the pool/prefix parent dataset (e.g. "archive"), not any one managed leaf --
 // there's one of these for the whole tool, not one per dataset. Set to "unhealthy" the
 // moment ANY dataset shows a content shock (guard 4/5); once set, EVERY dataset freezes
@@ -196,6 +196,13 @@ string propPrunedThrough = $"{ns}:pruned_through";
 // run's own guard results, until an operator runs --reset-health. See docs/MODEL.md
 // "Cross-dataset shock".
 string propHealth = $"{ns}:health";
+// Free-text companion to propHealth: WHY the pool is unhealthy, e.g. "archive/scratch:
+// referenced dropped 41% (...)". Persisted so --doctor/--summary/--reset-health can show
+// an operator what tripped it without needing to SSH in and grep the day's log -- the
+// pool-wide latch itself doesn't carry that detail. Only ever written alongside a
+// transition TO unhealthy (see WriteHealth); cleared the moment health goes healthy
+// again, so it never lingers as a stale explanation for a since-resolved incident.
+string propHealthReason = $"{ns}:health_reason";
 
 // Resolve zfs/curl to absolute trusted paths rather than trusting the (root) cron's PATH —
 // a writable earlier PATH element would otherwise be root code execution. Override with
@@ -860,6 +867,13 @@ int ResetHealth(bool noHc)
         return 0;
     }
 
+    // The one place this tool explains what it was worried about -- an operator running
+    // --reset-health is, by definition, in the middle of reviewing the incident (see the
+    // guarantee this command exists at all: only an explicit, reviewed reset clears the
+    // latch), so show the persisted reason before it's cleared below.
+    var (reasonOk, reasonBefore) = LoadHealthReason();
+    Log($"Reason for the latch: {(reasonOk && reasonBefore != "" ? reasonBefore : "not recorded")}");
+
     var (wok, msg) = WriteHealth("healthy", "reset via --reset-health");
     Log(msg);
     FlushLog(lines);
@@ -935,20 +949,12 @@ int Summary(string? datasetFilter, DateTime? since)
     // markdown table.
     void LogFile(string m) { lines.Add(m); }
 
-    // Pool-wide health banner (docs/MODEL.md "Cross-dataset shock") -- prepended so it's
-    // unmissable at the top of exactly the artifact an operator actually reads (this
-    // Console output is what nightly.sh pushes verbatim). A plain bold markdown line, not
-    // part of the table, so a strict markdown-table parser downstream still sees a
-    // well-formed table starting at the next line either way. Uses the same
-    // "{resource}: WORRY - {reason}" grammar as a per-dataset line, with the pool itself
-    // as the resource -- silent here (no line at all) when healthy, exactly like a
-    // healthy dataset never gets a WORRY line of its own.
-    var (healthOk, health) = LoadHealth();
-    if (!healthOk)
-        Log($"**{poolDataset}: WORRY - cannot verify pool health (zfs get failed); treat as unhealthy until confirmed otherwise**\n");
-    else if (health == "unhealthy")
-        Log($"**{poolDataset}: WORRY - frozen (no dataset prunes, no pruned_through advances) until `--reset-health` runs after review**\n");
-
+    // Two sections (docs/MODEL.md "Cross-dataset shock"): keeper/snapshot status is its
+    // own concern from pool health, so they get separate headings rather than a banner
+    // spliced above one shared table. This is a human-read dashboard (pushed to a repo
+    // and read directly), not something grepped like the console log -- so unlike the
+    // log's WORRY convention, the Health section always states its line, healthy or not.
+    Log("## Snapshots\n");
     Log("| Dataset | Monthlies | Weeklies | Dailies | Start | End | Continuity |");
     Log("|---|---|---|---|---|---|---|");
 
@@ -1023,6 +1029,26 @@ int Summary(string? datasetFilter, DateTime? since)
         Log($"| {ds} | {monthlies} | {weeklies} | {dailies} | {effectiveSince:yyyy-MM-dd} | {newest:yyyy-MM-dd} | {continuity} |");
     }
 
+    // Second section: the pool-wide latch (docs/MODEL.md "Cross-dataset shock"). Same
+    // "{resource}: WORRY - {reason}" grammar as any per-dataset line -- but unlike the
+    // console log's grep-WORRY convention, this always states its line, healthy or not:
+    // this file is read directly by a human, not grepped, so an explicit "healthy" beats
+    // making them infer it from an absence. When unhealthy, includes the persisted
+    // reason (see propHealthReason) -- the one place this tool explains what it was
+    // worried about without requiring a login to read the day's log.
+    Log("\n## Health\n");
+    var (healthOk, health) = LoadHealth();
+    if (!healthOk)
+        Log($"{poolDataset}: WORRY - cannot verify pool health (zfs get failed); treat as unhealthy until confirmed otherwise");
+    else if (health == "unhealthy")
+    {
+        var (reasonOk, reason) = LoadHealthReason();
+        var reasonText = reasonOk && reason != "" ? reason : "no recorded reason";
+        Log($"{poolDataset}: WORRY - {reasonText} (run `--reset-health` after review)");
+    }
+    else
+        Log($"{poolDataset}: {(health == "" ? "starting" : "healthy")}");
+
     FlushLog(lines);
     return errors > 0 ? 1 : 0;
 }
@@ -1059,7 +1085,11 @@ int Doctor(string? datasetFilter)
     if (!healthOk)
         Log($"{poolDataset}: WORRY - cannot verify pool health (zfs get failed); treat as unhealthy until confirmed otherwise");
     else if (health == "unhealthy")
-        Log($"{poolDataset}: WORRY - latched unhealthy — run --reset-health after review");
+    {
+        var (reasonOk, reason) = LoadHealthReason();
+        var reasonText = reasonOk && reason != "" ? reason : "no recorded reason";
+        Log($"{poolDataset}: WORRY - {reasonText} (run --reset-health after review)");
+    }
 
     int missing = 0, protected_ = 0, adhoc_ = 0, orphaned = 0, errors = 0;
     foreach (var (ds, _) in retention)
@@ -1381,6 +1411,19 @@ DateTime? LoadPrunedThrough(string ds)
     return (true, v == "-" ? "" : v);
 }
 
+// Reads the persisted WHY behind the current/most-recent unhealthy latch (see
+// propHealthReason above). Returns (true, "") if never set (nothing to report) or
+// (false, _) on a read failure -- callers fall back to a generic message either way,
+// so this is advisory detail, not something worth blocking on the way pool health itself
+// does.
+(bool ok, string reason) LoadHealthReason()
+{
+    var (code, outp, _) = Exec("zfs", "get", "-H", "-o", "value", propHealthReason, poolDataset);
+    if (code != 0) return (false, "");
+    var v = outp.Trim();
+    return (true, v == "-" ? "" : v);
+}
+
 // Writes the pool-wide health latch. Does NOT log itself -- unlike most write helpers
 // in this file, this one is called both from the main top-level prune loop (whose Log()
 // it could safely close over) AND from the standalone --reset-health command (which has
@@ -1388,10 +1431,20 @@ DateTime? LoadPrunedThrough(string ds)
 // resolve to the main loop's `lines` regardless of which caller invoked it, silently
 // never reaching --reset-health's own log file (the exact bug class ListDailies's own
 // comment already documents once). Caller logs the returned message with its own Log().
+//
+// `reason` is used for the returned log message either way, but is only PERSISTED to
+// propHealthReason when going unhealthy -- when going healthy it's inherited away
+// instead (best-effort; a failure here doesn't fail the health write itself, since a
+// stale reason next to a healthy latch is a cosmetic wart, not a safety concern), so a
+// resolved incident's explanation never lingers as if it still applied.
 (bool ok, string message) WriteHealth(string value, string? reason)
 {
     var (c, _, e) = Exec("zfs", "set", $"{propHealth}={value}", poolDataset);
     if (c != 0) return (false, $"    META:UPDATE {poolDataset} {propHealth} FAILED: {e.Trim()}");
+    if (value == "unhealthy" && reason is not null)
+        Exec("zfs", "set", $"{propHealthReason}={reason}", poolDataset);
+    else if (value == "healthy")
+        Exec("zfs", "inherit", propHealthReason, poolDataset);
     return (true, $"  META:UPDATE {poolDataset} {propHealth}={value}" + (reason is null ? "" : $" ({reason})"));
 }
 

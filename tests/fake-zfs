@@ -96,13 +96,25 @@ case "$sub" in
     exit 0 ;;
   inherit)
     log "inherit $1 $2"
-    # `inherit <prop> <snap>` — mirror of the `set` persistence above: clear the matching
-    # column back to "-" in $D/snaps, so a later invocation's `list` sees the demotion
-    # (needed to let a multi-run test actually catch a broken demotion/inherit path,
-    # instead of `list` keeping stale keep_until/tier from before the inherit).
-    case "$1" in
-      *:keep_until) update_snap_field "$2" 2 "-" ;;
-      *:tier)       update_snap_field "$2" 3 "-" ;;
+    # `inherit <prop> <target>` — mirror of the `set` persistence above. A SNAPSHOT
+    # target (has `@`) clears the matching column back to "-" in $D/snaps, so a later
+    # invocation's `list` sees the demotion (needed to let a multi-run test actually
+    # catch a broken demotion/inherit path). A DATASET target (no `@`) removes the
+    # matching row from $D/dsprops instead — the same distinction `set` makes — needed
+    # to test a dataset-level property (e.g. <ns>:health_reason) actually clearing.
+    case "$2" in
+      *@*)
+        case "$1" in
+          *:keep_until) update_snap_field "$2" 2 "-" ;;
+          *:tier)       update_snap_field "$2" 3 "-" ;;
+        esac ;;
+      *)
+        if [ -f "$D/dsprops" ]; then
+          esc_t=$(printf '%s' "$2" | sed 's/[.[\*^$]/\\&/g')
+          esc_p=$(printf '%s' "$1" | sed 's/[.[\*^$]/\\&/g')
+          grep -vP "^${esc_t}\t${esc_p}\t" "$D/dsprops" > "$D/dsprops.tmp" 2>/dev/null
+          mv "$D/dsprops.tmp" "$D/dsprops"
+        fi ;;
     esac
     exit 0 ;;
   hold)

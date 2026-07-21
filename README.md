@@ -112,7 +112,7 @@ run as a user able to `zfs destroy`/`hold` the target datasets (usually root).
 | `--prune --force` | Bypass the per-run delete cap (for a reviewed bulk cleanup). |
 | `-v`, `--verbose` | Log each snapshot decision. |
 | `--doctor` | Report keeper hold status: protected ✓ / missing ✗ / unexpected. |
-| `--summary [--since YYYY-MM-DD]` | One-line-per-dataset markdown table (monthlies/weeklies/dailies retained, date range, feed continuity) — for pasting into a gist/PR/chat, not a replacement for `--doctor`'s per-keeper detail. `--since` narrows the window; omitted, it defaults to the oldest snapshot actually retained. |
+| `--summary [--since YYYY-MM-DD]` | Two-section markdown report — for pasting into a gist/PR/chat, not a replacement for `--doctor`'s per-keeper detail. **Snapshots**: one-line-per-dataset table (monthlies/weeklies/dailies retained, date range, feed continuity); `--since` narrows the window, omitted defaults to the oldest snapshot actually retained. **Health**: the pool-wide state (`starting`/`healthy`/`unhealthy`), always shown explicitly (unlike the console log's silent-when-healthy convention — this file is read directly by a human, not grepped), plus the persisted reason when unhealthy. |
 | `--check-holds` | Flag holds on snapshots older than their dataset's own retention. |
 | `--fix` | Create missing managed holds on monthly and weekly keepers. |
 | `--hold-adhoc <snap>` | Defensive manual `<ns>:adhoc` hold on one snapshot. |
@@ -213,7 +213,13 @@ This latch does **not** self-heal: a later run whose numbers look clean again is
 evidence of safety (a patient attacker may just be moving slower), so only the explicit
 `--reset-health` command clears it — never `--force`, never automatically. The
 pool-wide pre-pass that checks this runs regardless of `--dataset` filtering, so a
-shock elsewhere still freezes whatever you asked to prune. See
+shock elsewhere still freezes whatever you asked to prune.
+
+The free-text reason (which dataset, which guard) is also persisted, in `<ns>:health_reason`
+alongside the `<ns>:health` enum, so an operator can see WHAT tripped it via `--summary` or
+`--doctor` without needing to log in and grep the day's log. `--reset-health` prints it one
+last time before clearing it, since reviewing that reason is the whole point of the command.
+See
 [docs/MODEL.md](docs/MODEL.md) "Cross-dataset shock" for the full design and
 `docs/model/ZfsHoldTight.tla` for the model-checked latch behavior.
 

@@ -258,3 +258,16 @@ clears it and a subsequent prune proceeds normally), T62 (`--reset-health` is a 
 no-op when not latched), T63 (`--force` does not clear it), T64 (`--dataset` filtering
 doesn't blind the pre-pass to a shock on a different dataset), T65 (a clean first run
 explicitly writes `health=healthy`, not left implicit).
+
+**Health reason + two-section `--summary`: implemented.** Not part of the TLA+ model
+(the reason is advisory free text, not something the latch's own correctness depends on
+— see docs/SAFETY.md guard 20). A shock persists WHAT tripped it in `<ns>:health_reason`
+alongside the `<ns>:health` enum, so `--summary`/`--doctor` can surface it and an operator
+never has to log into the machine to see what happened; `--reset-health` prints it once
+more before clearing it. `--summary` also split into two headed sections — Snapshots
+(the existing per-dataset table) and Health (the pool state, always stated explicitly,
+unlike the console log's silent-when-healthy convention, since this file is read
+directly by a human rather than grepped). `tests/run-tests.sh` T70 (a shock persists a
+reason surfaced by both `--summary` and `--doctor`), T71 (`--reset-health` shows it, then
+clears it), T72 (both section headers always present; explicit `healthy` line), T73
+(`starting` shown before any `--prune` has ever run).

@@ -141,7 +141,7 @@ content guards while a churny scratch policy relaxes them).
    size, HOLD — a likely mass rewrite / **in-place encryption** (which guard 4 misses,
    since encryption preserves size while scrambling contents). Heuristic: legitimately
    churny datasets will trip it, so relax/disable it per policy. Set to 0 to disable.
-   **Fleet-wide, not per-dataset** — see guard 20.
+   **Pool-wide, not per-dataset** — see guard 20.
 6. **Volume circuit-breaker.** A single run may not delete more than
    `guardMaxDeletePerRun` (default 14 — 2x the 7-day ISO-week cadence) snapshots for one
    dataset without `--force`. A weekly keeper only becomes permanent when its ISO-week
@@ -298,11 +298,19 @@ and healthchecks `/fail` ping instead, not a snapshot property.
     automatically. A read failure on the health property itself fails toward frozen,
     the same direction as a `zfs holds` failure already SKIPs a dataset elsewhere in
     this tool — not being able to verify the pool isn't already latched must never be
-    silently treated as "fine." Modeled and
+    silently treated as "fine." A free-text companion property, `<ns>:health_reason`,
+    persists WHAT tripped it (dataset + guard detail) alongside the enum — surfaced by
+    `--summary` and `--doctor` (both otherwise read-only), and printed one last time by
+    `--reset-health` before it clears both, since reviewing that reason is the entire
+    point of the command. It never lingers past a resolved incident: cleared (`zfs
+    inherit`) the moment health goes back to `healthy`, whichever path got it there.
+    Modeled and
     model-checked in `docs/model/ZfsHoldTight.tla` (`Shock`/`ResetHealth` actions,
-    `FrozenWhileUnhealthyStep`/`NoAutoRecoveryStep` properties); full design rationale in
-    `docs/MODEL.md` "Cross-dataset shock"; reproduced against the real implementation in
-    `tests/run-tests.sh` T18/T60-T65.
+    `FrozenWhileUnhealthyStep`/`NoAutoRecoveryStep` properties — the reason property
+    itself isn't modeled, being advisory text rather than something the latch's
+    correctness depends on); full design rationale in `docs/MODEL.md` "Cross-dataset
+    shock"; reproduced against the real implementation in `tests/run-tests.sh`
+    T18/T60-T65/T70-T73.
 
 ## Worked example (the trap guards 1–2 prevent)
 
