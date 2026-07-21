@@ -465,26 +465,26 @@ foreach (var (dsP, retP) in retention)
 // pool is ALREADY latched unhealthy must not be silently treated as "fine" (same
 // reasoning a `zfs holds` failure already SKIPs a dataset elsewhere in this tool).
 var (healthOk, health) = LoadHealth();
-bool globalFreeze; string healthLabel; string freezeReason;
+bool globalFreeze; string freezeReason;
 if (!healthOk)
 {
-    globalFreeze = true; healthLabel = "unknown";
+    globalFreeze = true;
     freezeReason = "cannot verify pool health (zfs get failed) — failing toward frozen";
 }
 else if (health == "unhealthy")
 {
-    globalFreeze = true; healthLabel = "unhealthy";
+    globalFreeze = true;
     freezeReason = "already latched unhealthy — run --reset-health after review";
 }
 else if (shockReason is not null)
 {
-    globalFreeze = true; healthLabel = "unhealthy";
+    globalFreeze = true;
     freezeReason = $"content shock detected — {shockReason}";
     if (prune) { var (_, whMsg) = WriteHealth("unhealthy", shockReason); Log(whMsg); }
 }
 else
 {
-    globalFreeze = false; healthLabel = "healthy"; freezeReason = "";
+    globalFreeze = false; freezeReason = "";
     // First-ever clean pass: "starting" -> "healthy". Never the reverse direction of
     // "unhealthy" -> anything -- that's --reset-health's job alone (see ResetHealth).
     if (prune && health == "") { var (_, whMsg) = WriteHealth("healthy", null); Log(whMsg); }
