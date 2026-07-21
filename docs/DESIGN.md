@@ -1,6 +1,28 @@
-# A real model for the retention/guard interaction
+# Protecting against attack, and against this tool's own bugs
 
-## Why this exists
+This tool's safety design answers three questions:
+
+1. **Is it safe to delete this snapshot right now, under current policy?** — the
+   retention decision itself.
+2. **Are there missing snapshots that suggest something is wrong?** — feed/guard
+   health, decoupled from current policy via a persisted watermark.
+3. **Could a bug in this tool's own retention math itself become a mass-deletion
+   event, independent of any attacker?**
+
+Questions 1 and 2 together are how this tool protects against **attack**: a real
+intrusion (mass deletion, in-place encryption, a stalled or tampered feed) should trip
+`WORRY`, not slip through as a false negative — see
+[Protecting against attack](#protecting-against-attack), which also covers the
+cross-dataset shock latch. Question 3 is a separate, third concern — protecting against
+**this tool's own bugs**, independent of whether anything malicious is happening at
+all — see [Protecting against tool bugs](#protecting-against-tool-bugs-overmass-deleting).
+
+Both are implemented in `zfs-hold-tight.cs`; the attack-facing model is additionally
+checked exhaustively with TLA+/TLC (see [Status](#status)).
+
+## Protecting against attack
+
+### Why the watermark exists
 
 Guard 1 ("recent window complete") has needed a correctness patch twice now, for the
 same underlying reason each time:
@@ -8,7 +30,7 @@ same underlying reason each time:
 1. Originally, a naive version of guard 1 flagged the tool's own routine pruning as a
    feed gap — fixed by excusing any missing day that's covered by the current hold
    frontier (documented in `docs/SAFETY.md` guard 1 as "a real, once-shipped bug").
-2. This session: raising `minNewerHolds` (a legitimate, desirable retention change)
+2. Later, raising `minNewerHolds` (a legitimate, desirable retention change)
    retroactively made that same exclusion logic flag *already-correctly-pruned*
    history as a gap, because the exclusion re-derives "was this legitimate?" from
    *today's* policy, and today's policy differs from whatever was in effect when the
@@ -18,7 +40,7 @@ Patching the exclusion logic a third time would repeat the pattern instead of fi
 it. The fix is to stop conflating two genuinely different questions that happen to
 share one computation today.
 
-## The two questions
+### The two questions
 
 **1. Is it safe to delete this snapshot, right now, under our current policy?**
 
@@ -44,7 +66,7 @@ to excuse). That coupling is the root cause: every time the retention policy cha
 question 2's answer changes even though nothing about the actual health of the feed
 changed.
 
-## The fix: a persisted watermark
+### The fix: a persisted watermark
 
 Introduce a new piece of state that doesn't exist in the tool today: a per-dataset,
 monotonically-increasing watermark — e.g. a `<ns>:pruned_through` property on the
@@ -64,11 +86,12 @@ This fully decouples question 2 from question 1. Deepening retention (raising
 about days that were already correctly handled — there's nothing left in guard 1 that
 references policy at all.
 
-**The bootstrap case, found the hard way.** A dataset that was already established
+**The bootstrap case.** A dataset that was already established
 under a binary that predates this property has no `pruned_through` at all on its first
 run under a new one — defaulting that to `MinValue` (nothing trusted yet) would flag
 its entire pre-existing, already-legitimate daily tail as an unexplained gap. This is
-not hypothetical: it happened deploying this exact feature. The fix reuses the
+not hypothetical: any dataset already established before this property existed hits
+exactly this case the first time it runs under a binary that tracks one. The fix reuses the
 cold-start floor's own `everEstablished` signal (real `<ns>:tier` history already
 exists): an established dataset with no recorded watermark defaults to `now` instead of
 `MinValue`, once, self-limiting (a real run persists a value immediately afterward, so
@@ -83,9 +106,9 @@ brand-new gap appearing to coincide exactly with the bootstrap moment would also
 unflagged by guard 1 specifically). Guards 2/4/5 (staleness, shrink, churn) don't depend
 on `pruned_through` at all and still catch anything currently wrong regardless. Judged
 an acceptable, narrow, one-time trade-off given the alternative — a real, repeated false
-alarm on every established dataset on this session's own deployment.
+alarm on every already-established dataset the first time this property is introduced.
 
-## State model
+### State model
 
 - `Snapshots` — the set of `(date, tier)` pairs that currently exist for a dataset, as
   read from `zfs list` (`tier ∈ {none, weekly, monthly}`).
@@ -95,7 +118,7 @@ alarm on every established dataset on this session's own deployment.
 - `PrunedThrough` — the new persisted watermark described above.
 - `Now` — the current day.
 
-## RetentionDecision(Snapshots, Policy, Now) — question 1, restated formally
+### RetentionDecision(Snapshots, Policy, Now) — question 1, restated formally
 
 Pins down what `ComputeKeepersAndFrontier` + the destroy loop in `zfs-hold-tight.cs`
 already do, so the invariants below can be stated unambiguously against it:
@@ -110,7 +133,12 @@ already do, so the invariants below can be stated unambiguously against it:
   window.
 - Otherwise: kept.
 
-## FeedHealthy(Snapshots, PrunedThrough, Now, GuardRecentWindowDays) — question 2
+This definition of *doomed* is shared ground: it's what question 2 excuses gaps
+against, and it's also what the Safety invariant in
+[Protecting against tool bugs](#protecting-against-tool-bugs-overmass-deleting) below
+constrains directly.
+
+### FeedHealthy(Snapshots, PrunedThrough, Now, GuardRecentWindowDays) — question 2
 
 - For each day `d` in the last `GuardRecentWindowDays` days ending at `Now`:
   - a snapshot dated `d` exists → fine.
@@ -120,33 +148,22 @@ already do, so the invariants below can be stated unambiguously against it:
 Notice `Policy` does not appear in this signature at all. That absence *is* the fix —
 there's nothing left to accidentally recouple.
 
-## Invariants
+### Feed-health invariants
 
-1. **Safety** — a keeper within its own retention window is never doomed; the newest
-   daily (replication base) is never doomed; a foreign/defensive held snapshot is
-   never doomed. (Existing per-snapshot protections list in `docs/SAFETY.md`, restated
-   as a property to check exhaustively rather than reason about by hand.)
-2. **Policy independence** — `FeedHealthy`'s verdict never depends on `Policy`. In the
-   model below this holds *by construction* (the signature has no `Policy` parameter
-   to depend on) — it isn't something to search for, it's a design constraint the
-   types enforce. That's deliberate: the goal is to make the original bug class
-   *inexpressible*, not merely absent from the cases we thought to test.
-3. **No genuine gap goes unnoticed** — the flip side of #2: a real missing day (never
-   replicated, not excused by `PrunedThrough`) must still trip the guard. A change that
-   satisfied #2 by making `FeedHealthy` unconditionally `TRUE` would be worthless; this
-   invariant rules that out.
-4. **Watermark monotonicity** — `PrunedThrough` never decreases, and only ever advances
-   to `Now` on a run that actually completed healthily — never adjusted retroactively,
-   never advanced speculatively.
+- **Policy independence** — `FeedHealthy`'s verdict never depends on `Policy`. In the
+  model this holds *by construction* (the signature has no `Policy` parameter to
+  depend on) — it isn't something to search for, it's a design constraint the types
+  enforce. That's deliberate: the goal is to make the original bug class
+  *inexpressible*, not merely absent from the cases we thought to test.
+- **No genuine gap goes unnoticed** — the flip side of the above: a real missing day
+  (never replicated, not excused by `PrunedThrough`) must still trip the guard. A
+  change that satisfied policy-independence by making `FeedHealthy` unconditionally
+  `TRUE` would be worthless; this invariant rules that out.
+- **Watermark monotonicity** — `PrunedThrough` never decreases, and only ever advances
+  to `Now` on a run that actually completed healthily — never adjusted retroactively,
+  never advanced speculatively.
 
-Where I'd actually point TLC's exhaustive search: not at #2 (true by construction), but
-at #1 (Safety) across *arbitrary* sequences of day-advances and policy changes —
-including sequences no one would hand-write as a test fixture (`minNewerHolds`
-oscillating, `dailyKeepDays` dropping right after being raised, a policy change
-mid-backlog). That's precisely the class of scenario that let both real incidents in
-this history slip past 63 hand-written test cases.
-
-## Cross-dataset shock
+### Cross-dataset shock
 
 Everything above is about a *single* dataset's own timeline. That's not the whole
 threat model. The invariant to protect is different in kind:
@@ -210,27 +227,61 @@ counterexample — correctly: replication delivering a new daily is an exogenous
 this tool doesn't control and shouldn't try to block. Only destroy (snaps *shrinking*)
 and a `pruned_through` advance are actually forbidden; fixed to say exactly that.
 
+## Protecting against tool bugs (over/mass-deleting)
+
+Everything above assumes the tool's own retention math is correct, and asks whether an
+*external* event (a source-side attack, a stalled feed) should override it. This
+question is different: independent of any attacker, could a **bug in this tool's own
+logic** — a miscalculated frontier, a bad backlog on first deploy, a mis-tuned config —
+itself become a mass-deletion event? Three layers, each catching a different shape of
+that failure:
+
+- **Safety invariant.** A keeper within its own retention window is never doomed; the
+  newest daily (replication base) is never doomed; a foreign/defensive held snapshot is
+  never doomed — stated directly against `RetentionDecision`'s notion of *doomed*
+  above. (Existing per-snapshot protections list in `docs/SAFETY.md`, restated here as
+  a property to check exhaustively rather than reason about by hand.)
+- **Volume circuit-breaker** (`docs/SAFETY.md` guard 6). Even if Safety itself were
+  violated by an undiscovered bug, a single run still can't destroy more than
+  `guardMaxDeletePerRun` snapshots for one dataset without `--force` — a backstop that
+  doesn't depend on the retention math being right, only on counting how much it wants
+  to destroy.
+- **Cold-start floor** (`docs/SAFETY.md` guard 7). A dataset's first-ever destructive
+  prune always needs `--force`, regardless of backlog size — the first run against a
+  dataset's real history is exactly the moment an untested edge case or a
+  misconfiguration is most likely to bite, so it's the one moment guard 6's routine cap
+  isn't trusted to gate alone.
+
+Where TLC's exhaustive search actually matters for this pillar: not at the feed-health
+invariants above (true by construction, or a straightforward flip-side check), but at
+**Safety**, across *arbitrary* sequences of day-advances and policy changes —
+including sequences no one would hand-write as a test fixture (`minNewerHolds`
+oscillating, `dailyKeepDays` dropping right after being raised, a policy change
+mid-backlog). That's precisely the class of scenario that lets a real bug slip past a
+hand-written test suite — no one thinks to write the fixture for a sequence they
+haven't hit yet.
+
 ## Status
 
 **Modeled and validated.** `docs/model/ZfsHoldTight.tla` is a TLA+ encoding of the
-above, scoped deliberately: days are abstract integers and week/month grouping is
-simplified periodic arithmetic rather than real ISO-8601 semantics, because calendar
-edge cases are irrelevant to *this* bug class (it's a pure state-machine/coupling
-problem, not a calendar one). Parsed clean with SANY; TLC model-checked it exhaustively
-(`ZfsHoldTight.cfg`) at `MaxDay=18`, `minNewerHolds ∈ {1,2,3,8}`,
-`dailyKeepDays ∈ {0,2,6}` — 719,579,604 states generated, 51,442,416 distinct states
-found, search depth 24, zero invariant/property violations, including every
-interleaving of `ChangePolicy` with `Prune`/`MissDay` (the exact "raise `minNewerHolds`
-after some history is already pruned" scenario). TLC's own fingerprint-collision
-estimate at that scale was ~0.2% — worth naming honestly, not "100% exhaustive," but a
-strong result. One real mistake in the model itself was caught and fixed in the
-process: an initial `BaseNeverDestroyed == now \in snaps` invariant was wrong (a
-genuine `MissDay` legitimately makes that false; the invariant needed to compare
-against the newest snapshot that actually exists, not the day-counter) — exactly the
-kind of error this exercise exists to catch, caught within seconds of the first run.
-Keeper expiry via `weeklyKeepDays`/`monthlyKeepDays` is still not modeled (needs
-tracking *when* a day became a keeper, not just whether it currently is one) — flagged
-as the next iteration, not hidden.
+attack-facing model above, scoped deliberately: days are abstract integers and
+week/month grouping is simplified periodic arithmetic rather than real ISO-8601
+semantics, because calendar edge cases are irrelevant to *this* bug class (it's a pure
+state-machine/coupling problem, not a calendar one). Parsed clean with SANY; TLC
+model-checked it exhaustively (`ZfsHoldTight.cfg`) at `MaxDay=18`,
+`minNewerHolds ∈ {1,2,3,8}`, `dailyKeepDays ∈ {0,2,6}` — 719,579,604 states generated,
+51,442,416 distinct states found, search depth 24, zero invariant/property violations,
+including every interleaving of `ChangePolicy` with `Prune`/`MissDay` (the exact "raise
+`minNewerHolds` after some history is already pruned" scenario). TLC's own
+fingerprint-collision estimate at that scale was ~0.2% — worth naming honestly, not
+"100% exhaustive," but a strong result. One real mistake in the model itself was caught
+and fixed in the process: an initial `BaseNeverDestroyed == now \in snaps` invariant
+was wrong (a genuine `MissDay` legitimately makes that false; the invariant needed to
+compare against the newest snapshot that actually exists, not the day-counter) —
+exactly the kind of error this exercise exists to catch, caught within seconds of the
+first run. Keeper expiry via `weeklyKeepDays`/`monthlyKeepDays` is still not modeled
+(needs tracking *when* a day became a keeper, not just whether it currently is one) —
+flagged as the next iteration, not hidden.
 
 **Implemented and tested against the real code.** `zfs-hold-tight.cs` now persists
 `<ns>:pruned_through` on the dataset, advances it to `now` only on a run that clears
@@ -271,3 +322,12 @@ directly by a human rather than grepped). `tests/run-tests.sh` T70 (a shock pers
 reason surfaced by both `--summary` and `--doctor`), T71 (`--reset-health` shows it, then
 clears it), T72 (both section headers always present; explicit `healthy` line), T73
 (`starting` shown before any `--prune` has ever run).
+
+**Tool-bug protections (guards 6-7): implemented, not separately modeled.** These are
+existing, already-shipped guards (`docs/SAFETY.md` 6-7), reframed here as their own
+pillar rather than newly built. Not part of the TLA+ model: the model exists to catch
+*coupling* bugs across sequences of events (exactly the guard-1/watermark bug class),
+whereas guards 6-7 are simple, direct counting/state checks whose correctness doesn't
+depend on event-sequence interleaving in the same way — covered instead by
+`tests/run-tests.sh`'s guard-6/7-specific cases (see `docs/SAFETY.md` for the full
+list).

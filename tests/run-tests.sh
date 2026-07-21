@@ -219,7 +219,7 @@ run_tool "$WORK/gap" --force
 
 # ---- T4b: the pruned_through boundary is exact, not off-by-one in either direction.
 #      Guard 1 no longer derives its exclusion from the (policy-dependent) hold frontier
-#      at all -- see docs/MODEL.md: re-deriving "was this gap legitimate" from the CURRENT
+#      at all -- see docs/DESIGN.md: re-deriving "was this gap legitimate" from the CURRENT
 #      minNewerHolds/dailyKeepDays broke the instant either changed, because legitimacy of
 #      a past decision was determined under whatever policy was in effect then, not today's.
 #      Guard 1 now excuses a missing day iff it is at-or-before the persisted
@@ -306,7 +306,7 @@ OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
   && ok "T59b a WORRY run does not advance pruned_through" \
   || bad "T59b (dsprops: $(cat "$WORK/fz/dsprops" 2>/dev/null | tr '\n' ';'))"
 
-# ==== pool-wide health latch (docs/MODEL.md "Cross-dataset shock") ====
+# ==== pool-wide health latch (docs/DESIGN.md "Cross-dataset shock") ====
 # health_of <dsprops-file>: reads the pool-level zht:health value (or empty if unset).
 health_of() { awk -F'\t' -v d="archive" -v p="zht:health" '$1==d && $2==p{print $3}' "$1" 2>/dev/null; }
 # health_reason_of <dsprops-file>: reads the persisted zht:health_reason value (or empty).
@@ -453,7 +453,7 @@ echo "$OUT" | grep -qx "archive: starting" \
   && ok "T73 --summary reports pool state \"starting\" before any --prune has run" \
   || bad "T73 (out: $(echo "$OUT" | tr '\n' '|'))"
 
-# ==== pruned_through bootstrap for an already-established dataset (docs/MODEL.md /
+# ==== pruned_through bootstrap for an already-established dataset (docs/DESIGN.md /
 #      zfs-hold-tight.cs's prunedThrough comment): a dataset already managed before this
 #      property existed must not have its entire pre-existing daily tail reported as an
 #      unexplained gap just because the watermark is new -- the real incident this
@@ -583,7 +583,7 @@ run_tool "$WORK/lowchurn" --force
 
 # ---- T18: cross-dataset freeze — a small (100MiB) dataset wiped 80% freezes the ENTIRE
 #      pool, not just itself. This reverses what this test used to check ("per-dataset
-#      isolation," the old default): docs/MODEL.md "Cross-dataset shock" argues isolation
+#      isolation," the old default): docs/DESIGN.md "Cross-dataset shock" argues isolation
 #      is the wrong default for a ransomware threat model -- an attacker on the source
 #      machine plausibly hit every dataset, not just the one loud enough to trip its own
 #      threshold, so any single shock must distrust the WHOLE pool, including an

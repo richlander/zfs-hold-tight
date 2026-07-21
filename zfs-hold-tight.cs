@@ -184,7 +184,7 @@ if (!Regex.IsMatch(ns, @"^[A-Za-z0-9_.-]+$"))
 string tagMonthly = $"{ns}:monthly", tagWeekly = $"{ns}:weekly", tagAdhoc = $"{ns}:adhoc", propKeep = $"{ns}:keep_until", propTier = $"{ns}:tier";
 // Dataset-level (not snapshot) watermark: "as of the last successful, non-WORRY --prune,
 // everything up to and including this date was already correctly evaluated by this
-// tool." See docs/MODEL.md -- this is what decouples guard 1's gap detection from the
+// tool." See docs/DESIGN.md -- this is what decouples guard 1's gap detection from the
 // CURRENT retention policy, so raising minNewerHolds/dailyKeepDays can never retroactively
 // make already-legitimately-pruned history look like an unexplained gap.
 string propPrunedThrough = $"{ns}:pruned_through";
@@ -193,7 +193,7 @@ string propPrunedThrough = $"{ns}:pruned_through";
 // there's one of these for the whole tool, not one per dataset. Set to "unhealthy" the
 // moment ANY dataset shows a content shock (guard 4/5); once set, EVERY dataset freezes
 // (no destroy, no pruned_through advance) on every subsequent run regardless of that
-// run's own guard results, until an operator runs --reset-health. See docs/MODEL.md
+// run's own guard results, until an operator runs --reset-health. See docs/DESIGN.md
 // "Cross-dataset shock".
 string propHealth = $"{ns}:health";
 // Free-text companion to propHealth: WHY the pool is unhealthy, e.g. "archive/scratch:
@@ -446,7 +446,7 @@ int totalKeep = 0, totalDoom = 0, destroyAttempted = 0, destroySucceeded = 0, de
 var held = new List<string>();   // datasets held by a guard
 var metadataErrors = new List<string>();  // metadata/hold failures
 
-// ---- PRE-PASS: pool-wide health check (docs/MODEL.md "Cross-dataset shock"). Lists
+// ---- PRE-PASS: pool-wide health check (docs/DESIGN.md "Cross-dataset shock"). Lists
 //      EVERY dataset once — ignoring --dataset, a filtered run must not blind the
 //      pool-wide latch to a shock on a dataset it isn't touching this run — and checks
 //      guards 4/5 (content shock: mass deletion / mass rewrite-encryption) on each. If
@@ -624,7 +624,7 @@ foreach (var (ds, ret) in retention)
     //      monthly keepers (even the suspect newest — a false positive costs nothing, and
     //      we don't want to skip the hold and lose the chance later) and record a worry
     //      breadcrumb on the tip — but never release a hold or delete anything. Combined
-    //      with the pool-wide health latch (docs/MODEL.md "Cross-dataset shock"): EITHER
+    //      with the pool-wide health latch (docs/DESIGN.md "Cross-dataset shock"): EITHER
     //      this dataset's own guard tripping OR the pool latch alone is enough to
     //      withhold it, and a dataset that tripped its OWN guard still gets its specific
     //      reason rather than just the generic pool message — only a dataset that's
@@ -653,7 +653,7 @@ foreach (var (ds, ret) in retention)
 
     // Guards 1-5 all passed: certify today as accounted-for, independent of whatever the
     // cold-start floor / volume cap / metadata writes below decide -- this is purely "was
-    // the feed healthy," not "did we destroy anything" (see docs/MODEL.md). Only in --prune
+    // the feed healthy," not "did we destroy anything" (see docs/DESIGN.md). Only in --prune
     // mode; a dry-run must never mutate state. A write failure here is logged but doesn't
     // SKIP the dataset -- worst case, guard 1 stays exactly as cautious as it is today.
     if (prune)
@@ -949,7 +949,7 @@ int Summary(string? datasetFilter, DateTime? since)
     // markdown table.
     void LogFile(string m) { lines.Add(m); }
 
-    // Two sections (docs/MODEL.md "Cross-dataset shock"): keeper/snapshot status is its
+    // Two sections (docs/DESIGN.md "Cross-dataset shock"): keeper/snapshot status is its
     // own concern from pool health, so they get separate headings rather than a banner
     // spliced above one shared table. This is a human-read dashboard (pushed to a repo
     // and read directly), not something grepped like the console log -- so unlike the
@@ -997,7 +997,7 @@ int Summary(string? datasetFilter, DateTime? since)
         int dailies   = windowed.Count - monthlies - weeklies;
 
         // Continuity: scan the DAILY TAIL from max(effectiveSince, prunedThrough) to newest —
-        // the same persisted-watermark scope guard 1 uses (see docs/MODEL.md), just extended
+        // the same persisted-watermark scope guard 1 uses (see docs/DESIGN.md), just extended
         // across the whole requested window instead of a fixed recent-window cap, so a day
         // this tool legitimately pruned is never reported as a break. Deliberately NOT the
         // hold frontier: that's re-derived from the CURRENT retention policy, so it would
@@ -1029,7 +1029,7 @@ int Summary(string? datasetFilter, DateTime? since)
         Log($"| {ds} | {monthlies} | {weeklies} | {dailies} | {effectiveSince:yyyy-MM-dd} | {newest:yyyy-MM-dd} | {continuity} |");
     }
 
-    // Second section: the pool-wide latch (docs/MODEL.md "Cross-dataset shock"). Same
+    // Second section: the pool-wide latch (docs/DESIGN.md "Cross-dataset shock"). Same
     // "{resource}: WORRY - {reason}" grammar as any per-dataset line -- but unlike the
     // console log's grep-WORRY convention, this always states its line, healthy or not:
     // this file is read directly by a human, not grepped, so an explicit "healthy" beats
@@ -1076,7 +1076,7 @@ int Doctor(string? datasetFilter)
     void Log(string m) { Console.WriteLine(m); lines.Add(m); }
     Log($"=== zfs-hold-tight {Version} {now:yyyy-MM-dd HH:mm:ss}Z  mode=doctor ===");
 
-    // Pool-wide health latch (docs/MODEL.md "Cross-dataset shock") -- surfaced first so
+    // Pool-wide health latch (docs/DESIGN.md "Cross-dataset shock") -- surfaced first so
     // it's the first thing an operator running --doctor sees. Same WORRY grammar as
     // everything else in this tool, so silent here too when healthy/starting -- there's
     // nothing to worry about, and staying silent keeps a clean --doctor run matching the
@@ -1290,7 +1290,7 @@ string? HealthGuard(List<Snap> snaps, Retention ret, Guards gd, DateTime prunedT
         // re-deriving "was this gap legitimate" from the CURRENT frontier breaks the instant
         // minNewerHolds or dailyKeepDays changes, because legitimacy of a past decision was
         // determined under whatever policy was in effect then, not today's (see
-        // docs/MODEL.md -- this is the fix for the guard/retention coupling bug class).
+        // docs/DESIGN.md -- this is the fix for the guard/retention coupling bug class).
         if (day <= prunedThrough.Date) continue;
         if (!days.Contains(day)) missing.Add(day.ToString("MM-dd"));
     }
@@ -1314,7 +1314,7 @@ string? HealthGuard(List<Snap> snaps, Retention ret, Guards gd, DateTime prunedT
 
 // Guards 4-5 only: content-level "shock" (mass deletion / mass rewrite-encryption),
 // extracted from HealthGuard so the cross-dataset pre-pass (see the pool-wide
-// <ns>:health latch, docs/MODEL.md "Cross-dataset shock") can check it for every
+// <ns>:health latch, docs/DESIGN.md "Cross-dataset shock") can check it for every
 // dataset BEFORE any dataset commits to destroying anything, without duplicating the
 // threshold logic. A dataset's own per-run HealthGuard call still goes through this
 // same function, so the two can never drift apart.

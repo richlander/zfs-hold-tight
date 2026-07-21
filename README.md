@@ -31,11 +31,11 @@ That design hits a hard constraint:
 > its own weekly/monthly snapshots" (e.g. TrueNAS Periodic Snapshot Tasks) doesn't survive
 > the next pull — the replication engine's pre-retention step deletes them.
 
-And replicating *multiple* snapshot families to get long-term coverage is fragile:
-snapshot tools like Sanoid stamp every snapshot from one run with a single identical
-timestamp (to the second), and a replication engine that orders by that timestamp can
-mis-order same-second snapshots and **wedge replication**. The robust choice is to
-replicate **one family — the dailies.**
+And replicating multiple snapshot families — daily, weekly, monthly — to get long-term
+coverage is fragile: snapshot tools like Sanoid stamp every snapshot from one run with a
+single identical timestamp (to the second), and a replication engine that orders by that
+timestamp can mis-order same-second snapshots and **wedge replication**. The robust
+choice is to replicate **one family — the dailies.**
 
 That leaves a gap: the backup machine has a short window of dailies and **no long-term
 retention**, with no safe way to create one. `zfs-hold-tight` fills it by thinning the
@@ -75,7 +75,7 @@ Then, per dataset:
 6. On a clean pass (steps 2-5 all healthy), advance `<ns>:pruned_through` to today — a
    persisted fact later runs use to tell "already legitimately pruned" from "a genuine
    feed gap," instead of re-deriving that from whatever the retention policy happens to
-   be at the time (see [docs/MODEL.md](docs/MODEL.md)).
+   be at the time (see [docs/DESIGN.md](docs/DESIGN.md)).
 
 ## Quick start
 
@@ -126,7 +126,7 @@ run as a user able to `zfs destroy`/`hold` the target datasets (usually root).
 `--summary`'s Continuity column uses the same narrow scope as guard 1 (see
 [Safety guards](#safety-guards) below): it flags a missing day only within the current
 daily tail (back to the persisted `<ns>:pruned_through` watermark — a fact about past
-`--prune` runs, not a recomputation from current policy; see `docs/MODEL.md`), and never
+`--prune` runs, not a recomputation from current policy; see `docs/DESIGN.md`), and never
 flags a day already certified there or gone through normal GFS thinning. It's a
 feed-health signal scoped to this tool's own pruning decision, not a replication-health
 check — see `orientation/health-check.md`'s replication query for that.
@@ -220,7 +220,7 @@ alongside the `<ns>:health` enum, so an operator can see WHAT tripped it via `--
 `--doctor` without needing to log in and grep the day's log. `--reset-health` prints it one
 last time before clearing it, since reviewing that reason is the whole point of the command.
 See
-[docs/MODEL.md](docs/MODEL.md) "Cross-dataset shock" for the full design and
+[docs/DESIGN.md](docs/DESIGN.md) "Cross-dataset shock" for the full design and
 `docs/model/ZfsHoldTight.tla` for the model-checked latch behavior.
 
 Per-snapshot, it never deletes the replication base (newest daily), a week/month keeper
@@ -329,13 +329,13 @@ The suite drives the tool against a fake `zfs` (`tests/fake-zfs`) — no real po
 and asserts the core invariant (*no week/month keeper is destroyed while within retention*)
 plus every guard, the `pruned_through` watermark (including its exact boundary and a
 direct reproduction of the incident that motivated it — see
-[docs/MODEL.md](docs/MODEL.md)), the pool-wide health latch, the hold lifecycle, the
+[docs/DESIGN.md](docs/DESIGN.md)), the pool-wide health latch, the hold lifecycle, the
 run-lock, and input validation. Requires the .NET SDK.
 
 The `pruned_through` watermark and the pool-wide health latch are also modeled in TLA+
 and machine-checked (SANY + TLC) across billions of states, not just the hand-written
 fixtures above: [`docs/model/ZfsHoldTight.tla`](docs/model/ZfsHoldTight.tla) — see
-[docs/MODEL.md](docs/MODEL.md) for the design rationale and results.
+[docs/DESIGN.md](docs/DESIGN.md) for the design rationale and results.
 
 ## License
 

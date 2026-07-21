@@ -1,6 +1,6 @@
 ---- MODULE ZfsHoldTight ----
 (* First-draft model of the retention/guard coupling bug class described in
-   docs/MODEL.md: raising minNewerHolds (or dailyKeepDays) retroactively made guard 1
+   docs/DESIGN.md: raising minNewerHolds (or dailyKeepDays) retroactively made guard 1
    flag already-legitimately-pruned history as a gap, because it re-derived "was this
    gap legitimate" from *today's* policy instead of consulting a persisted record of
    what this tool had actually already decided.
@@ -14,11 +14,11 @@
    a keeper, not just whether it currently is one) -- left for a second iteration.
 
    Parsed with SANY and model-checked with TLC against ZfsHoldTight.cfg: zero
-   violations across 51.4M distinct states (see docs/MODEL.md Status section for the
+   violations across 51.4M distinct states (see docs/DESIGN.md Status section for the
    full run parameters and result). Implemented in zfs-hold-tight.cs and covered by
    tests/run-tests.sh T58/T4b/T59/T59b against the real code, not just this model.
 
-   Extended with the cross-dataset health latch (docs/MODEL.md "Cross-dataset shock"
+   Extended with the cross-dataset health latch (docs/DESIGN.md "Cross-dataset shock"
    section): `health` is deliberately modeled as a variable shared by the whole pool,
    not scoped to the one dataset the rest of this model already tracks in detail --
    `Shock` is an exogenous, nondeterministic action standing in for "guard 4/5 tripped
