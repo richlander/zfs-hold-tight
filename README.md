@@ -51,16 +51,16 @@ for a pull-replication backup target where creating snapshots is impossible.
 
 ## How it works
 
-First, once per run, **before** touching any individual dataset: a fleet-wide pre-pass
+First, once per run, **before** touching any individual dataset: a pool-wide pre-pass
 lists every configured dataset (ignoring `--dataset`) and checks each for content shock
 (guards 4/5 — mass deletion / mass rewrite-encryption). If any dataset shows shock, or
-the fleet is already latched from a past run, every dataset below is frozen for this
+the pool is already latched from a past run, every dataset below is frozen for this
 entire run regardless of its own result — see [Cross-dataset shock](#cross-dataset-shock).
 
 Then, per dataset:
 
 1. List the daily snapshots (`autosnap_<ts>_daily`).
-2. Run the [health guards](#safety-guards). If any fails — including the fleet-wide
+2. Run the [health guards](#safety-guards). If any fails — including the pool-wide
    latch from the pre-pass above — **HOLD** the dataset (no deletions) and alert.
 3. Identify keepers: newest-per-ISO-week (weekly) and newest-per-month (monthly).
 4. Tag keepers with `<ns>:tier` + `<ns>:keep_until`; `zfs hold <ns>:monthly` the monthlies
@@ -118,8 +118,8 @@ run as a user able to `zfs destroy`/`hold` the target datasets (usually root).
 | `--hold-adhoc <snap>` | Defensive manual `<ns>:adhoc` hold on one snapshot. |
 | `--hold-latest-tier <daily\|weekly\|monthly>` | Hold the newest snapshot of a tier. |
 | `--hold-latest` | Shorthand for `--hold-latest-tier daily`. |
-| `--reset-health` | Clear the fleet-wide `<ns>:health` shock latch (`unhealthy` → `healthy`). The **only** way it clears — never `--force`, never automatically. No-op (exit 0) if not currently `unhealthy`. |
-| `--dataset <name>` | Limit `--doctor`/`--summary`/`--fix`/`--prune` to one dataset. Does **not** limit the fleet-wide shock pre-pass (see [Safety guards](#safety-guards)) — a shock on a dataset outside the filter still freezes the one(s) you asked for. |
+| `--reset-health` | Clear the pool-wide `<ns>:health` shock latch (`unhealthy` → `healthy`). The **only** way it clears — never `--force`, never automatically. No-op (exit 0) if not currently `unhealthy`. |
+| `--dataset <name>` | Limit `--doctor`/`--summary`/`--fix`/`--prune` to one dataset. Does **not** limit the pool-wide shock pre-pass (see [Safety guards](#safety-guards)) — a shock on a dataset outside the filter still freezes the one(s) you asked for. |
 | `--no-hc` | Skip healthchecks pings for this run. |
 | `--version` | Print the tool version and exit. |
 
@@ -178,7 +178,7 @@ effectively per-dataset thresholds when you need them.
 
 Guards 1-3 and 6-8 HOLD only **that** dataset (healthy datasets still prune); a global
 fault HOLDs everything. Guards 4-5 are different: **any** dataset tripping them HOLDs
-the **entire fleet** — see [Cross-dataset shock](#cross-dataset-shock) below. See
+**the whole pool** — see [Cross-dataset shock](#cross-dataset-shock) below. See
 [docs/SAFETY.md](docs/SAFETY.md) for the full contract.
 
 1. **Clock sane** — no snapshot dated in the future.
@@ -187,8 +187,8 @@ the **entire fleet** — see [Cross-dataset shock](#cross-dataset-shock) below. 
    than days already legitimately pruned per the two-holds invariant (those aren't gaps).
    Scoped to this tool's own pruning safety, not replication health in general — see
    docs/SAFETY.md guard 1.
-4. **No sudden data shrinkage** — newest daily references ≥ `guardMaxDailyShrinkPct` (33%) less than the recent baseline ⇒ HOLD (mass-**deletion** guard). Fleet-wide, not per-dataset — see below.
-5. **No excessive churn** — newest daily rewrites > `guardMaxDailyChurnPct` (50%) of the dataset in one day ⇒ HOLD (mass-**rewrite / encryption** guard). Fleet-wide, not per-dataset — see below.
+4. **No sudden data shrinkage** — newest daily references ≥ `guardMaxDailyShrinkPct` (33%) less than the recent baseline ⇒ HOLD (mass-**deletion** guard). Pool-wide, not per-dataset — see below.
+5. **No excessive churn** — newest daily rewrites > `guardMaxDailyChurnPct` (50%) of the dataset in one day ⇒ HOLD (mass-**rewrite / encryption** guard). Pool-wide, not per-dataset — see below.
 6. **Volume circuit-breaker** — never delete more than `guardMaxDeletePerRun` without `--force`.
 7. **Cold-start floor** — a dataset that has never been established requires `--force` for
    *any* nonzero doomed count, regardless of `guardMaxDeletePerRun`; it establishes on its
@@ -200,17 +200,19 @@ the **entire fleet** — see [Cross-dataset shock](#cross-dataset-shock) below. 
 A ransomware or mass-deletion attack on the source machine plausibly touches every
 dataset, not just the one loud enough (or configured with a tight enough threshold) to
 trip its own guard 4/5. So instead of per-dataset isolation, **any** dataset showing
-content shock latches a fleet-wide `<ns>:health=unhealthy` state (stored on the pool
+content shock latches a pool-wide `<ns>:health=unhealthy` state (stored on the pool
 dataset, e.g. `archive`, not any one managed leaf) that freezes **every** dataset — no
 destroys, no `pruned_through` advances anywhere — regardless of how clean any individual
 dataset's own feed looks that run. The dataset that actually tripped its own guard still
-gets its specific reason and `<ns>:worry` tag; others fall back to the generic fleet
-message.
+gets its specific reason and `<ns>:worry` tag; others fall back to a `pool: ...` reason,
+logged with the same `{resource}: WORRY - {reason}` grammar as every other WORRY line —
+the pool dataset is just another resource that can WORRY (see
+[Reading the logs](#reading-the-logs)), so the usual `grep WORRY` habit catches it too.
 
 This latch does **not** self-heal: a later run whose numbers look clean again is not
 evidence of safety (a patient attacker may just be moving slower), so only the explicit
 `--reset-health` command clears it — never `--force`, never automatically. The
-fleet-wide pre-pass that checks this runs regardless of `--dataset` filtering, so a
+pool-wide pre-pass that checks this runs regardless of `--dataset` filtering, so a
 shock elsewhere still freezes whatever you asked to prune. See
 [docs/MODEL.md](docs/MODEL.md) "Cross-dataset shock" for the full design and
 `docs/model/ZfsHoldTight.tla` for the model-checked latch behavior.
@@ -255,7 +257,7 @@ snapshot's full name follows the token.
 | `HOLD:ADD` | a `zfs hold` was placed (monthly keeper protected) | `grep HOLD:ADD` |
 | `HOLD:REMOVE` | a hold was released (demotion / weekly-downgrade / before destroy) | `grep HOLD:REMOVE` |
 | `META:ADD` | tier/keep_until tags written on a newly-tagged keeper | `grep META:ADD` |
-| `META:UPDATE` | an existing keeper's tag changed (e.g. weekly→monthly promotion), a dataset's `<ns>:pruned_through` watermark advanced, or the fleet-wide `<ns>:health` latch changed | `grep META:UPDATE` |
+| `META:UPDATE` | an existing keeper's tag changed (e.g. weekly→monthly promotion), a dataset's `<ns>:pruned_through` watermark advanced, or the pool-wide `<ns>:health` latch changed | `grep META:UPDATE` |
 | `META:REMOVE` | tags inherited away on demotion | `grep META:REMOVE` |
 | `SNAP:DESTROY` | a snapshot was **pruned** (irreversible) | `grep SNAP:DESTROY` |
 
@@ -264,7 +266,7 @@ reason (`WORRY` or `ERROR`), and a failed individual op carries a `FAILED` suffi
 
 | token | meaning | grep |
 |---|---|---|
-| `WORRY` | a guard tripped (stale/gap/clock/shrink/churn/over-cap), or the fleet-wide health latch is unhealthy — keepers protected, nothing deleted | `grep WORRY` |
+| `WORRY` | a guard tripped (stale/gap/clock/shrink/churn/over-cap), or the pool-wide health latch is unhealthy (the pool dataset itself gets a `{pool}: WORRY - ...` line, same grammar as any dataset) — keepers protected, nothing deleted | `grep WORRY` |
 | `ERROR` | a `zfs` verification call (list/holds) failed — cannot proceed safely | `grep ERROR` |
 | `FAILED` | an individual op (hold/set/inherit/destroy) returned nonzero | `grep FAILED` |
 | `SKIP` | the dataset was withheld this run (verdict; see the `WORRY`/`ERROR` above it) | `grep SKIP` |
@@ -274,7 +276,7 @@ wrong?" → `grep -E 'WORRY|ERROR|FAILED|SKIP' logs/*.log` (**empty = all clear*
 ran?" → `grep '^===' logs/*.log`. Invariants worth knowing: `HOLD:ADD == META:ADD/UPDATE` on
 monthlies, `HOLD:REMOVE == META:REMOVE` on demotions, and `SNAP:DESTROY` count matches the
 `PRUNED: kept N, destroyed X/Y` summary. A raw `grep -c META:UPDATE` won't line up with
-`HOLD:ADD` 1:1 fleet-wide, though — `pruned_through` and `<ns>:health` writes also use the
+`HOLD:ADD` 1:1 pool-wide, though — `pruned_through` and `<ns>:health` writes also use the
 `META:UPDATE` token (they're metadata changes too, just not keeper-tag ones); scope the
 comparison to a single dataset's keeper lines if you need the strict count.
 
@@ -321,10 +323,10 @@ The suite drives the tool against a fake `zfs` (`tests/fake-zfs`) — no real po
 and asserts the core invariant (*no week/month keeper is destroyed while within retention*)
 plus every guard, the `pruned_through` watermark (including its exact boundary and a
 direct reproduction of the incident that motivated it — see
-[docs/MODEL.md](docs/MODEL.md)), the fleet-wide health latch, the hold lifecycle, the
+[docs/MODEL.md](docs/MODEL.md)), the pool-wide health latch, the hold lifecycle, the
 run-lock, and input validation. Requires the .NET SDK.
 
-The `pruned_through` watermark and the fleet-wide health latch are also modeled in TLA+
+The `pruned_through` watermark and the pool-wide health latch are also modeled in TLA+
 and machine-checked (SANY + TLC) across billions of states, not just the hand-written
 fixtures above: [`docs/model/ZfsHoldTight.tla`](docs/model/ZfsHoldTight.tla) — see
 [docs/MODEL.md](docs/MODEL.md) for the design rationale and results.

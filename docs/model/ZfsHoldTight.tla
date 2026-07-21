@@ -19,7 +19,7 @@
    tests/run-tests.sh T58/T4b/T59/T59b against the real code, not just this model.
 
    Extended with the cross-dataset health latch (docs/MODEL.md "Cross-dataset shock"
-   section): `health` is deliberately modeled as a variable shared by the whole fleet,
+   section): `health` is deliberately modeled as a variable shared by the whole pool,
    not scoped to the one dataset the rest of this model already tracks in detail --
    `Shock` is an exogenous, nondeterministic action standing in for "guard 4/5 tripped
    on SOME dataset" (which one, and the shrink/churn byte-threshold arithmetic itself,
@@ -57,7 +57,7 @@ VARIABLES
     minNewerHolds,   \* current policy value -- CAN change mid-run, that's the point
     dailyKeepDays,   \* current policy value -- CAN change mid-run
     lastVerdict,     \* "n/a" | "ok" | "worry" -- last guard verdict, for inspection
-    health           \* "starting" | "healthy" | "unhealthy" -- fleet-wide, not per-dataset
+    health           \* "starting" | "healthy" | "unhealthy" -- pool-wide, not per-dataset
 
 vars == << now, snaps, prunedThrough, minNewerHolds, dailyKeepDays, lastVerdict, health >>
 
@@ -218,7 +218,7 @@ BaseNeverDestroyedStep == [][ (snaps # {}) => (MaxOfSet(snaps) \in snaps') ]_var
 \* The core property the latch exists to guarantee: while health is unhealthy BEFORE a
 \* step and STILL unhealthy AFTER it (i.e. that step wasn't the ResetHealth that clears
 \* it), no PRUNE ACTION may mutate anything -- no destroy, no prunedThrough advance --
-\* no matter how healthy THIS dataset's own feed looks, while the fleet-wide latch is
+\* no matter how healthy THIS dataset's own feed looks, while the pool-wide latch is
 \* tripped. Deliberately NOT "snaps unchanged": AdvanceDay (replication delivering a new
 \* daily) is an EXOGENOUS event this tool doesn't control and shouldn't try to block --
 \* an earlier version of this property said snaps' = snaps and TLC immediately found the

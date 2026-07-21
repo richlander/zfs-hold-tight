@@ -306,7 +306,7 @@ OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
   && ok "T59b a WORRY run does not advance pruned_through" \
   || bad "T59b (dsprops: $(cat "$WORK/fz/dsprops" 2>/dev/null | tr '\n' ';'))"
 
-# ==== fleet-wide health latch (docs/MODEL.md "Cross-dataset shock") ====
+# ==== pool-wide health latch (docs/MODEL.md "Cross-dataset shock") ====
 # health_of <dsprops-file>: reads the pool-level zht:health value (or empty if unset).
 health_of() { awk -F'\t' -v d="archive" -v p="zht:health" '$1==d && $2==p{print $3}' "$1" 2>/dev/null; }
 
@@ -325,10 +325,10 @@ health60a="$(health_of "$WORK/fz/dsprops")"
 : > "$WORK/fz/ops.log"; cp "$WORK/healthy" "$WORK/fz/snaps"   # now a clean, dense feed -- same dataset
 OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
        ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --prune --force 2>/dev/null)"
-{ [ "$health60a" = "unhealthy" ] && echo "$OUT" | grep -qi "FLEET STATE: unhealthy" \
+{ [ "$health60a" = "unhealthy" ] && echo "$OUT" | grep -qi "archive: WORRY - already latched unhealthy" \
   && [ "$(grep -c '^destroy' "$WORK/fz/ops.log")" = 0 ]; } \
   && ok "T60 health latch does not auto-heal: a second, individually-clean run still freezes" \
-  || bad "T60 (health_after_shock=$health60a, out: $(echo "$OUT" | grep -i fleet))"
+  || bad "T60 (health_after_shock=$health60a, out: $(echo "$OUT" | grep -i worry))"
 
 # ---- T61: --reset-health is the ONLY way to clear it; a subsequent --prune then
 #      proceeds normally again (reusing the still-latched $WORK/fz from T60). ----
@@ -342,9 +342,9 @@ health61="$(health_of "$WORK/fz/dsprops")"
 : > "$WORK/fz/ops.log"
 OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
        ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --prune --force 2>/dev/null)"
-{ ! echo "$OUT" | grep -qi "FLEET STATE"; } \
-  && ok "T61b after reset, a subsequent --prune proceeds normally (no fleet freeze)" \
-  || bad "T61b (out: $(echo "$OUT" | grep -i fleet))"
+{ ! echo "$OUT" | grep -qi "archive: WORRY"; } \
+  && ok "T61b after reset, a subsequent --prune proceeds normally (no pool freeze)" \
+  || bad "T61b (out: $(echo "$OUT" | grep -i worry))"
 
 # ---- T62: --reset-health is a safe no-op when health isn't currently unhealthy ----
 rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"; cp "$WORK/healthy" "$WORK/fz/snaps"; : > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
@@ -361,11 +361,11 @@ rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"; cp "$WORK/healthy" "$WORK/f
 printf 'archive\tzht:health\tunhealthy\n' > "$WORK/fz/dsprops"
 OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
        ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --prune --force 2>/dev/null)"
-{ echo "$OUT" | grep -qi "FLEET STATE: unhealthy" && [ "$(grep -c '^destroy' "$WORK/fz/ops.log")" = 0 ]; } \
+{ echo "$OUT" | grep -qi "archive: WORRY - already latched unhealthy" && [ "$(grep -c '^destroy' "$WORK/fz/ops.log")" = 0 ]; } \
   && ok "T63 --force does not clear the health latch; still frozen" \
-  || bad "T63 (out: $(echo "$OUT" | grep -i fleet))"
+  || bad "T63 (out: $(echo "$OUT" | grep -i worry))"
 
-# ---- T64: --dataset filtering a run to ONE dataset must not blind the fleet-wide
+# ---- T64: --dataset filtering a run to ONE dataset must not blind the pool-wide
 #      pre-pass to a shock on a DIFFERENT, non-selected dataset -- the pre-pass always
 #      scans every configured dataset regardless of --dataset. ----
 cat > "$WORK/cfg_t64.json" <<EOF
@@ -383,7 +383,7 @@ OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/cfg_t64.json" \
 { echo "$OUT" | grep "archive/home/rich:" | grep -qi "SKIP" \
   && ! echo "$OUT" | grep -q "^archive/scratch:" \
   && [ "$(grep -c '^destroy' "$WORK/fz/ops.log")" = 0 ]; } \
-  && ok "T64 --dataset filter doesn't blind the fleet pre-pass to a shock on another dataset" \
+  && ok "T64 --dataset filter doesn't blind the pool pre-pass to a shock on another dataset" \
   || bad "T64 (out: $(echo "$OUT" | tr '\n' '|'))"
 
 # ---- T65: a clean --prune with no prior health state explicitly writes health=healthy
@@ -525,11 +525,11 @@ run_tool "$WORK/lowchurn" --force
 { ! echo "$OUT" | grep -qi "churn"; } && ok "T17 normal churn: no false churn-SKIP" || bad "T17 false positive (out: $(echo "$OUT"|tail -1))"
 
 # ---- T18: cross-dataset freeze — a small (100MiB) dataset wiped 80% freezes the ENTIRE
-#      fleet, not just itself. This reverses what this test used to check ("per-dataset
+#      pool, not just itself. This reverses what this test used to check ("per-dataset
 #      isolation," the old default): docs/MODEL.md "Cross-dataset shock" argues isolation
 #      is the wrong default for a ransomware threat model -- an attacker on the source
 #      machine plausibly hit every dataset, not just the one loud enough to trip its own
-#      threshold, so any single shock must distrust the WHOLE fleet, including an
+#      threshold, so any single shock must distrust the WHOLE pool, including an
 #      otherwise-healthy large dataset. ----
 cat > "$WORK/cfg2.json" <<EOF
 { "logDir": "$WORK/logs", "zfsPath": "$WORK/bin/zfs", "minNewerHolds": 2,
@@ -548,8 +548,8 @@ OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/cfg2.json" \
 { echo "$OUT" | grep "archive/scratch:" | grep -qi "shrank" \
   && echo "$OUT" | grep "archive/home/rich:" | grep -qi "SKIP" \
   && echo "$OUT" | grep -qi "2 SKIPPED"; } \
-  && ok "T18 cross-dataset freeze: shock on one dataset freezes the entire fleet, not just itself" \
-  || bad "T18 (out: $(echo "$OUT" | grep -E 'scratch|home/rich|SKIP|FLEET' | tr '\n' '|'))"
+  && ok "T18 cross-dataset freeze: shock on one dataset freezes the entire pool, not just itself" \
+  || bad "T18 (out: $(echo "$OUT" | grep -E 'scratch|home/rich|SKIP|WORRY' | tr '\n' '|'))"
 
 # ---- T19: an expired week/month keeper (past retention) ages out, not kept forever ----
 old=$(date -u -d "$ADATE -2200 days" +%Y-%m-%d); oldsnap="$(snapname "$old")"   # ~6y old, sole rep of its week+month

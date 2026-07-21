@@ -223,7 +223,7 @@ var guardsByDataset = new Dictionary<string, Guards>();
 var policies = new Dictionary<string, Retention>();
 var policyGuards = new Dictionary<string, Guards>();
 const string DatasetPrefix = "archive/";  // allowlist: only prune archive/* datasets
-string poolDataset = DatasetPrefix.TrimEnd('/');  // where the fleet-wide health latch lives
+string poolDataset = DatasetPrefix.TrimEnd('/');  // where the pool-wide health latch lives
 
 // Considered and rejected: deriving guardMaxDeletePerRun's default per-policy as
 // minNewerHolds * 7, on the theory that a policy's first-ever hold-frontier activation
@@ -439,13 +439,13 @@ int totalKeep = 0, totalDoom = 0, destroyAttempted = 0, destroySucceeded = 0, de
 var held = new List<string>();   // datasets held by a guard
 var metadataErrors = new List<string>();  // metadata/hold failures
 
-// ---- PRE-PASS: fleet-wide health check (docs/MODEL.md "Cross-dataset shock"). Lists
+// ---- PRE-PASS: pool-wide health check (docs/MODEL.md "Cross-dataset shock"). Lists
 //      EVERY dataset once — ignoring --dataset, a filtered run must not blind the
-//      fleet-wide latch to a shock on a dataset it isn't touching this run — and checks
+//      pool-wide latch to a shock on a dataset it isn't touching this run — and checks
 //      guards 4/5 (content shock: mass deletion / mass rewrite-encryption) on each. If
 //      ransomware is on the source machine, it plausibly hit every dataset, not just the
 //      one loud enough to trip its own threshold, so ANY single shock distrusts the WHOLE
-//      fleet, not just that dataset. Cached here so the main loop below doesn't re-list.
+//      pool, not just that dataset. Cached here so the main loop below doesn't re-list.
 var dsCache = new Dictionary<string, (int code, List<Snap> snaps, List<string> warnings)>();
 string? shockReason = null;
 foreach (var (dsP, retP) in retention)
@@ -462,14 +462,14 @@ foreach (var (dsP, retP) in retention)
 // health: "" (never set, shown as "starting") | "healthy" | "unhealthy". A read FAILURE
 // fails toward frozen (globalFreeze = true) -- unlike pruned_through's read failure,
 // which fails toward the merely-cautious direction, not being able to verify whether the
-// fleet is ALREADY latched unhealthy must not be silently treated as "fine" (same
+// pool is ALREADY latched unhealthy must not be silently treated as "fine" (same
 // reasoning a `zfs holds` failure already SKIPs a dataset elsewhere in this tool).
 var (healthOk, health) = LoadHealth();
 bool globalFreeze; string healthLabel; string freezeReason;
 if (!healthOk)
 {
     globalFreeze = true; healthLabel = "unknown";
-    freezeReason = "cannot verify fleet-wide health state (zfs get failed) — failing toward frozen";
+    freezeReason = "cannot verify pool health (zfs get failed) — failing toward frozen";
 }
 else if (health == "unhealthy")
 {
@@ -489,8 +489,14 @@ else
     // "unhealthy" -> anything -- that's --reset-health's job alone (see ResetHealth).
     if (prune && health == "") { var (_, whMsg) = WriteHealth("healthy", null); Log(whMsg); }
 }
+// Reuses the tool's OWN existing WORRY grammar ({resource}: WORRY - {reason}) instead of
+// inventing a separate concept -- the pool is just another resource that can WORRY,
+// exactly like a dataset. This means the documented `grep -E 'WORRY|ERROR|FAILED|SKIP'`
+// "did anything go wrong?" workflow catches it automatically, with no separate marker to
+// know about. Silent when healthy, matching how a healthy dataset's own line never says
+// WORRY either.
 if (globalFreeze)
-    Log($"*** FLEET STATE: {healthLabel} — {freezeReason} ***");
+    Log($"{poolDataset}: WORRY - {freezeReason}");
 
 foreach (var (ds, ret) in retention)
 {
@@ -611,15 +617,15 @@ foreach (var (ds, ret) in retention)
     //      monthly keepers (even the suspect newest — a false positive costs nothing, and
     //      we don't want to skip the hold and lose the chance later) and record a worry
     //      breadcrumb on the tip — but never release a hold or delete anything. Combined
-    //      with the fleet-wide health latch (docs/MODEL.md "Cross-dataset shock"): EITHER
-    //      this dataset's own guard tripping OR the fleet latch alone is enough to
+    //      with the pool-wide health latch (docs/MODEL.md "Cross-dataset shock"): EITHER
+    //      this dataset's own guard tripping OR the pool latch alone is enough to
     //      withhold it, and a dataset that tripped its OWN guard still gets its specific
-    //      reason + worry tag rather than just the generic fleet message — only a dataset
-    //      that's frozen purely as collateral (its own guards are clean) falls back to
-    //      that. Either way, no destroy and no pruned_through advance while either is
-    //      true (see FrozenWhileUnhealthyStep in docs/model/ZfsHoldTight.tla). ----
+    //      reason rather than just the generic pool message — only a dataset that's
+    //      frozen purely as collateral (its own guards are clean) falls back to that.
+    //      Either way, no destroy and no pruned_through advance while either is true
+    //      (see FrozenWhileUnhealthyStep in docs/model/ZfsHoldTight.tla). ----
     string? ownGuard = HealthGuard(snaps, ret, gd, prunedThrough);
-    string? guard = ownGuard ?? (globalFreeze ? $"fleet health {healthLabel}: {freezeReason}" : null);
+    string? guard = ownGuard ?? (globalFreeze ? $"pool: {freezeReason}" : null);
     if (guard is not null)
     {
         Log($"{ds}: WORRY - {guard} ({keepersHeld}/{keeperNames.Count} keepers held)");
@@ -831,7 +837,7 @@ int HoldAdhoc(string snap, bool noHc)
     return 0;
 }
 
-// ---- reset the fleet-wide health latch back to healthy -- the ONLY way it clears.
+// ---- reset the pool-wide health latch back to healthy -- the ONLY way it clears.
 //      Never bundled with --force (that means something else entirely: bypass the
 //      routine volume cap) -- an operator's habitual --force reflex must never double
 //      as "yes, I reviewed a possible mass-deletion/encryption event." A separate,
@@ -929,16 +935,19 @@ int Summary(string? datasetFilter, DateTime? since)
     // markdown table.
     void LogFile(string m) { lines.Add(m); }
 
-    // Fleet-wide health banner (docs/MODEL.md "Cross-dataset shock") -- prepended so it's
+    // Pool-wide health banner (docs/MODEL.md "Cross-dataset shock") -- prepended so it's
     // unmissable at the top of exactly the artifact an operator actually reads (this
     // Console output is what nightly.sh pushes verbatim). A plain bold markdown line, not
     // part of the table, so a strict markdown-table parser downstream still sees a
-    // well-formed table starting at the next line either way.
+    // well-formed table starting at the next line either way. Uses the same
+    // "{resource}: WORRY - {reason}" grammar as a per-dataset line, with the pool itself
+    // as the resource -- silent here (no line at all) when healthy, exactly like a
+    // healthy dataset never gets a WORRY line of its own.
     var (healthOk, health) = LoadHealth();
     if (!healthOk)
-        Log("**STATE: unknown — cannot verify fleet-wide health (zfs get failed); treat as unhealthy until confirmed otherwise**\n");
+        Log($"**{poolDataset}: WORRY - cannot verify pool health (zfs get failed); treat as unhealthy until confirmed otherwise**\n");
     else if (health == "unhealthy")
-        Log("**STATE: unhealthy — frozen fleet-wide (no dataset prunes, no pruned_through advances) until `--reset-health` runs after review**\n");
+        Log($"**{poolDataset}: WORRY - frozen (no dataset prunes, no pruned_through advances) until `--reset-health` runs after review**\n");
 
     Log("| Dataset | Monthlies | Weeklies | Dailies | Start | End | Continuity |");
     Log("|---|---|---|---|---|---|---|");
@@ -1041,13 +1050,16 @@ int Doctor(string? datasetFilter)
     void Log(string m) { Console.WriteLine(m); lines.Add(m); }
     Log($"=== zfs-hold-tight {Version} {now:yyyy-MM-dd HH:mm:ss}Z  mode=doctor ===");
 
-    // Fleet-wide health latch (docs/MODEL.md "Cross-dataset shock") -- surfaced first so
-    // it's the first thing an operator running --doctor sees.
+    // Pool-wide health latch (docs/MODEL.md "Cross-dataset shock") -- surfaced first so
+    // it's the first thing an operator running --doctor sees. Same WORRY grammar as
+    // everything else in this tool, so silent here too when healthy/starting -- there's
+    // nothing to worry about, and staying silent keeps a clean --doctor run matching the
+    // documented "grep for WORRY, empty means fine" habit.
     var (healthOk, health) = LoadHealth();
     if (!healthOk)
-        Log("FLEET STATE: unknown — cannot verify (zfs get failed); treat as unhealthy until confirmed otherwise");
-    else
-        Log($"FLEET STATE: {(health == "" ? "starting" : health)}" + (health == "unhealthy" ? " — run --reset-health after review" : ""));
+        Log($"{poolDataset}: WORRY - cannot verify pool health (zfs get failed); treat as unhealthy until confirmed otherwise");
+    else if (health == "unhealthy")
+        Log($"{poolDataset}: WORRY - latched unhealthy — run --reset-health after review");
 
     int missing = 0, protected_ = 0, adhoc_ = 0, orphaned = 0, errors = 0;
     foreach (var (ds, _) in retention)
@@ -1271,7 +1283,7 @@ string? HealthGuard(List<Snap> snaps, Retention ret, Guards gd, DateTime prunedT
 }
 
 // Guards 4-5 only: content-level "shock" (mass deletion / mass rewrite-encryption),
-// extracted from HealthGuard so the cross-dataset pre-pass (see the fleet-wide
+// extracted from HealthGuard so the cross-dataset pre-pass (see the pool-wide
 // <ns>:health latch, docs/MODEL.md "Cross-dataset shock") can check it for every
 // dataset BEFORE any dataset commits to destroying anything, without duplicating the
 // threshold logic. A dataset's own per-run HealthGuard call still goes through this
@@ -1355,9 +1367,9 @@ DateTime? LoadPrunedThrough(string ds)
     return long.TryParse(v, out var secs) ? DateTimeOffset.FromUnixTimeSeconds(secs).UtcDateTime : (DateTime?)null;
 }
 
-// Reads the fleet-wide <ns>:health latch (see propHealth above). Returns (false, _) on
+// Reads the pool-wide <ns>:health latch (see propHealth above). Returns (false, _) on
 // a read FAILURE -- unlike LoadPrunedThrough, this fails toward the CAUTIOUS direction:
-// if we can't even verify whether the fleet is already latched unhealthy, we must not
+// if we can't even verify whether the pool is already latched unhealthy, we must not
 // silently assume it's fine (same reasoning `zfs holds` failures already SKIP a dataset
 // elsewhere in this tool). Returns (true, "") for never-set (reported as "starting"),
 // otherwise (true, "healthy") or (true, "unhealthy").
@@ -1369,7 +1381,7 @@ DateTime? LoadPrunedThrough(string ds)
     return (true, v == "-" ? "" : v);
 }
 
-// Writes the fleet-wide health latch. Does NOT log itself -- unlike most write helpers
+// Writes the pool-wide health latch. Does NOT log itself -- unlike most write helpers
 // in this file, this one is called both from the main top-level prune loop (whose Log()
 // it could safely close over) AND from the standalone --reset-health command (which has
 // its OWN separate `lines`/Log()); a shared top-level Log() call here would lexically

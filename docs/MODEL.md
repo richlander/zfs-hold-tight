@@ -174,7 +174,7 @@ attacker moved on to slower, quieter changes. This needs a **latch**, not a live
 recheck: a state that only a human, having actually reviewed the incident, can clear.
 
 **Design, borrowing Docker's health-check vocabulary (not its auto-recovery
-behavior):** a new, fleet-wide (not per-dataset) `<ns>:health` property, stored on the
+behavior):** a new, pool-wide (not per-dataset) `<ns>:health` property, stored on the
 pool/prefix parent dataset (e.g. `archive`), with three values:
 
 - `starting` (property never set — no verdict established yet)
@@ -187,16 +187,17 @@ again, this one **only** clears via an explicit `--reset-health` command — nev
 "I reviewed a possible mass-deletion/encryption event"), and never automatically.
 
 Mechanically: every `--prune`/dry-run first does a pre-pass across **every** configured
-dataset (ignoring `--dataset` — a filtered run must not blind the fleet-wide latch to a
+dataset (ignoring `--dataset` — a filtered run must not blind the pool-wide latch to a
 shock on a dataset it isn't touching this run), checking guards 4/5 in isolation. If any
 dataset shows shock, or the latch is already `unhealthy`, or the health property itself
 can't be read (fails toward frozen, not toward assuming it's fine), every dataset this
 run holds its keepers defensively and skips destroy + the `pruned_through` advance — the
 dataset that actually tripped its own guard still gets its specific reason and
-`<ns>:worry` tag; the others fall back to the generic fleet message.
+`<ns>:worry` tag; the others fall back to a `pool: ...` reason, logged with the same
+`{resource}: WORRY - {reason}` grammar every other WORRY line already uses.
 
 This is modeled as an extension to `docs/model/ZfsHoldTight.tla`: `health` is a variable
-shared by the whole fleet (not scoped to the one dataset the rest of the model already
+shared by the whole pool (not scoped to the one dataset the rest of the model already
 tracks in detail); `Shock` is an exogenous, nondeterministic action standing in for
 "guard 4/5 tripped on SOME dataset" (which one, and the actual shrink/churn byte-percent
 arithmetic, is a mundane numeric threshold check, not the bug-prone part — the latch's
@@ -251,7 +252,7 @@ honestly, not claimed as 100% exhaustive). Implemented as `<ns>:health` on the p
 dataset, a pre-pass in `zfs-hold-tight.cs` that checks guards 4/5 across every configured
 dataset before any dataset commits to anything, and a new `--reset-health` command that
 is the only way to clear it. `tests/run-tests.sh`: T18 (rewritten — a shock on one
-dataset now freezes the entire fleet, reversing what it used to check), T60 (the latch
+dataset now freezes the entire pool, reversing what it used to check), T60 (the latch
 does not auto-heal across a second, individually-clean run), T61 (`--reset-health`
 clears it and a subsequent prune proceeds normally), T62 (`--reset-health` is a safe
 no-op when not latched), T63 (`--force` does not clear it), T64 (`--dataset` filtering

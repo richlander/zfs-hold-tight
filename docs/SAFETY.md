@@ -229,7 +229,7 @@ and healthchecks `/fail` ping instead, not a snapshot property.
 > pre-incident keepers survive defender-side for years (independent of the source), so you
 > recover by rolling back to one as long as you notice within the retention window.
 >
-> Detection, when it does fire, now also distrusts the whole fleet, not just the dataset
+> Detection, when it does fire, now also distrusts the whole pool, not just the dataset
 > that tripped — see guard 20. A ransomware attacker on the source machine plausibly hit
 > every dataset, not just the one loud enough to cross its own threshold; the others may
 > already be compromised too, just under threshold or on a policy that relaxed the churn
@@ -280,23 +280,25 @@ and healthchecks `/fail` ping instead, not a snapshot property.
     isolation (guarantee 17): if content shock is detected on **any** configured
     dataset — checked in a pre-pass that runs before any dataset commits to anything,
     and that always scans every configured dataset regardless of `--dataset` filtering
-    — a fleet-wide `<ns>:health` property (stored on the pool/prefix parent dataset,
+    — a pool-wide `<ns>:health` property (stored on the pool/prefix parent dataset,
     e.g. `archive`, not any one managed leaf) latches to `unhealthy`. While latched,
     **every** dataset holds its keepers defensively and withholds destroy + the
     `pruned_through` advance, regardless of how clean that dataset's own feed looks that
     run — the dataset that actually tripped its own guard still gets its specific reason
-    and `<ns>:worry` tag; others fall back to the generic fleet message. Values:
-    `starting` (never set) / `healthy` / `unhealthy`. Borrows Docker's health-check
-    vocabulary, **not** its auto-recovery behavior: unlike a Docker container, this does
-    **not** clear itself the moment a later run looks clean again — a quieter run is not
-    evidence of safety, since a patient attacker may simply have moved on to slower
-    changes. The **only** way to clear it is the explicit `--reset-health` command
-    (`unhealthy` → `healthy`); never `--force` (which already means something
-    unrelated — bypass the routine volume cap, not "I reviewed a possible mass
-    deletion/encryption event"), and never automatically. A read failure on the health
-    property itself fails toward frozen, the same direction as a `zfs holds` failure
-    already SKIPs a dataset elsewhere in this tool — not being able to verify the fleet
-    isn't already latched must never be silently treated as "fine." Modeled and
+    and `<ns>:worry` tag; others fall back to a `pool: ...` reason, logged with the same
+    `{resource}: WORRY - {reason}` grammar as any per-dataset line (the pool dataset is
+    just another resource that can WORRY). Values: `starting` (never set) / `healthy` /
+    `unhealthy`. Borrows Docker's health-check vocabulary, **not** its auto-recovery
+    behavior: unlike a Docker container, this does **not** clear itself the moment a
+    later run looks clean again — a quieter run is not evidence of safety, since a
+    patient attacker may simply have moved on to slower changes. The **only** way to
+    clear it is the explicit `--reset-health` command (`unhealthy` → `healthy`); never
+    `--force` (which already means something unrelated — bypass the routine volume cap,
+    not "I reviewed a possible mass deletion/encryption event"), and never
+    automatically. A read failure on the health property itself fails toward frozen,
+    the same direction as a `zfs holds` failure already SKIPs a dataset elsewhere in
+    this tool — not being able to verify the pool isn't already latched must never be
+    silently treated as "fine." Modeled and
     model-checked in `docs/model/ZfsHoldTight.tla` (`Shock`/`ResetHealth` actions,
     `FrozenWhileUnhealthyStep`/`NoAutoRecoveryStep` properties); full design rationale in
     `docs/MODEL.md` "Cross-dataset shock"; reproduced against the real implementation in
