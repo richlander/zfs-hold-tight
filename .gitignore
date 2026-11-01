@@ -11,3 +11,6 @@ out-new/
 # TLC's on-disk state cache when run from docs/model/ (MSBDiskFPSet writes here by
 # default) -- can reach multiple GB, never something to commit.
 docs/model/states/
+
+# Python incident regression runner
+__pycache__/

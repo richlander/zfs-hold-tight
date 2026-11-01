@@ -221,3 +221,39 @@ If you are migrating from a build that used a different namespace, set
 holds/properties it already created — otherwise those old-namespace holds are treated as
 foreign (left in place, their snapshots never pruned) and the tool starts a fresh set
 under the new namespace.
+
+### Upgrading latched metadata behavior
+
+Build and validate the candidate before replacing the deployed binary. Do not
+perform a force prune merely to inspect the new tagging. The new metadata-only
+`--reconcile --no-hc` mode can update tier/expiry and add independent safety
+protection while the latch remains engaged; it never deletes or retires incident
+holds. Inspect `--doctor`, `--summary`, and the new `latch_history` properties.
+An old latch gets an identity on first observation by the new version; its
+original start time is not reconstructed from incomplete legacy tags.
+
+On recovery, confirm and acknowledge a false positive, inspect the ordinary dry run, and approve
+any cold-start/backlog cleanup separately. Incident holds persist until a healthy
+approved/established, under-cap prune reconciles them. Snapshot history remains
+for auditing afterward. Legacy binaries treat the new `:latched:<incident-id>` hold as foreign
+and therefore retain protected snapshots on rollback; do not bulk-release it.
+
+### False positives versus actual attacks
+
+Do not use retention maintenance as ransomware cleanup. Leave a suspected or
+confirmed attack latched and use separate tools for recovery, clean-point
+selection, and targeted destructive operations. Only after confirming the change
+was legitimate, run `--acknowledge-false-positive`; `--reset-health` is rejected.
+The acknowledgment verifies/repairs metadata, records an incident-specific
+receipt, and clears the warning latch without deleting or releasing safety
+holds. It does not ping normal backup success. Review the ordinary retention dry
+run and any backlog/first-prune approval separately, then validate the scheduled
+cycle. The retired bare `:latched` hold used by an undeployed preview is not
+silently adopted; incident-ID holds and matching histories are required.
+
+Before rollback to an older binary, inspect/complete pending warning activation:
+the new `latch_evidence` sentinel is authoritative even before compatibility
+health/ID mirrors or physical holds finish. Older binaries cannot interpret that
+sentinel. Foreign-hold protection on rollback applies only after those physical
+incident holds exist; do not assume a legacy `health=healthy` value alone proves
+there is no pending warning.

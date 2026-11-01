@@ -19,10 +19,13 @@ log() { echo "$*" >> "$D/ops.log"; }
 update_snap_field() {
   local snap="$1" col="$2" val="$3"
   [ -f "$D/snaps" ] || return 0
-  awk -F'\t' -v OFS='\t' -v snap="$snap" -v col="$col" -v val="$val" \
-    '$1==snap{$col=val} {print}' "$D/snaps" > "$D/snaps.tmp" && mv "$D/snaps.tmp" "$D/snaps"
+  FAKE_FIELD_VALUE="$val" awk -F'\t' -v OFS='\t' -v snap="$snap" -v col="$col" \
+    'BEGIN{val=ENVIRON["FAKE_FIELD_VALUE"]} $1==snap{while(NF<col)$(NF+1)="-";$col=val} {print}' "$D/snaps" > "$D/snaps.tmp" && mv "$D/snaps.tmp" "$D/snaps"
 }
 [ "${FAKE_ZFS_FAIL:-}" = "$sub" ] && { echo "fake: forced failure on $sub" >&2; exit 1; }
+if [ "${FAKE_ZFS_FAIL_AFTER_RECEIPT:-}" = "$sub" ] && grep -qE '^set [^ ]*:false_positive_[a-f0-9]+=' "$D/ops.log"; then
+  echo "fake: failure after receipt persistence" >&2; exit 1
+fi
 case "$sub" in
   list)
     [ -n "${FAKE_ZFS_SLEEP:-}" ] && sleep "$FAKE_ZFS_SLEEP"
@@ -36,6 +39,16 @@ case "$sub" in
     exit 0 ;;
   set)
     log "set $*"
+    if [ -n "${FAKE_ZFS_FAIL_PROPERTY:-}" ]; then
+      for arg in "$@"; do
+        [[ "$arg" == "$FAKE_ZFS_FAIL_PROPERTY="* ]] && { echo "fake: forced property failure" >&2; exit 1; }
+      done
+    fi
+    if [ -n "${FAKE_ZFS_FAIL_HEALTH_VALUE:-}" ]; then
+      for arg in "$@"; do
+        [[ "$arg" == *":health=$FAKE_ZFS_FAIL_HEALTH_VALUE" ]] && { echo "fake: targeted health transition failure" >&2; exit 1; }
+      done
+    fi
     # `set <prop=val>... <target>` — persist keep_until/tier writes on a snapshot target
     # back into $D/snaps (via update_snap_field above), so a later invocation's `list`
     # sees them (needed to test multi-run transitions, e.g. cold-start establishment
@@ -50,6 +63,7 @@ case "$sub" in
             case "${args[$i]}" in
               *:keep_until=*) update_snap_field "$target" 2 "${args[$i]#*:keep_until=}" ;;
               *:tier=*)       update_snap_field "$target" 3 "${args[$i]#*:tier=}" ;;
+              *:latch_history=*) update_snap_field "$target" 6 "${args[$i]#*:latch_history=}" ;;
             esac
           done ;;
         *)
@@ -88,6 +102,7 @@ case "$sub" in
         *) prop="$a" ;;
       esac
     done
+    [ "${FAKE_ZFS_FAIL_GET_PROPERTY:-}" = "$prop" ] && { echo "fake: targeted get failure" >&2; exit 1; }
     val="-"
     if [ -f "$D/dsprops" ]; then
       val="$(awk -F'\t' -v d="$target" -v p="$prop" '$1==d && $2==p{print $3; f=1} END{if(!f) print "-"}' "$D/dsprops")"
@@ -124,6 +139,10 @@ case "$sub" in
     exit 0 ;;
   release)
     log "release $1 $2"
+    [ "${FAKE_ZFS_FAIL_RELEASE_TARGET:-}" = "$2" ] && { echo "fake: targeted release failure" >&2; exit 1; }
+    if ! [ -f "$D/holds" ] || ! awk -F'\t' -v n="$2" -v t="$1" '$1==n && $2==t{found=1} END{exit !found}' "$D/holds"; then
+      echo "cannot release hold: no such tag on this dataset" >&2; exit 1
+    fi
     if [ -f "$D/holds" ]; then
       grep -vP "^$(printf '%s' "$2" | sed 's/[.[\*^$]/\\&/g')\t$(printf '%s' "$1" | sed 's/[.[\*^$]/\\&/g')\t" "$D/holds" > "$D/holds.tmp" || true
       mv "$D/holds.tmp" "$D/holds"

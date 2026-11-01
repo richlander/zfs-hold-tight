@@ -23,6 +23,7 @@ static partial class Commands
         Log("|---|---|---|---|---|---|---|");
 
         int errors = 0;
+        var incidents = new List<string>();
         foreach (var (ds, ret) in c.Retention)
         {
             if (datasetFilter is not null && ds != datasetFilter) continue;
@@ -34,6 +35,29 @@ static partial class Commands
             foreach (var w in warnings) LogFile(w);
             if (code != 0) { Log($"| {ds} | — | — | — | — | — | ERROR: zfs list failed (see log) |"); errors++; continue; }
             if (snaps.Count == 0) { Log($"| {ds} | 0 | 0 | 0 | — | — | no snapshots |"); continue; }
+
+            // Holds must be inspected even when every history write failed.
+            // No history is not evidence that no incident protection exists.
+            var incidentHolds = Zfs.LoadHolds(c, snaps.Select(s => s.Name).ToList());
+            if (incidentHolds is null)
+            { errors++; incidents.Add($"{ds}: incident protection unverified (cannot read holds)"); }
+            else
+            {
+                int histories = snaps.Count(Latched.HasHistory);
+                int invalid = snaps.Count(s => !Latched.ReadHistory(s.LatchHistory, out _));
+                int active = 0, unverified = 0;
+                foreach (var s in snaps)
+                {
+                    if (!incidentHolds.TryGetValue(s.Name, out var tags)) continue;
+                    var safetyTags = tags.Where(t => Latched.IsSafetyTag(c, t)).ToList();
+                    if (safetyTags.Count > 0) active++;
+                    if (safetyTags.Any(t => !Latched.VerifiedHold(c, s, t))) unverified++;
+                }
+                if (invalid > 0 || unverified > 0)
+                { errors++; incidents.Add($"{ds}: incident protection UNVERIFIED ({unverified} snapshots with unverified holds; {invalid} invalid histories)"); }
+                if (active > 0 || histories > 0)
+                    incidents.Add($"{ds}: {active} safety-held snapshots; {histories} snapshots with retained incident history");
+            }
 
             var oldest = snaps.Min(s => s.Date).Date;
             var newest = snaps.Max(s => s.Date).Date;
@@ -52,7 +76,8 @@ static partial class Commands
             // Same bootstrap default as Commands.Prune (see its comment): an established
             // dataset predating this property shouldn't have its whole pre-existing daily
             // tail reported as a Continuity break just because the watermark is new.
-            bool everEstablished = snaps.Any(s => s.Tier is not null);
+            var (establishmentOk, everEstablished, _) = Latched.Established(c, ds, snaps);
+            if (!establishmentOk) { errors++; LogFile($"{ds}: ERROR - cannot verify establishment state"); }
             var prunedThrough = Zfs.LoadPrunedThrough(c, ds) ?? (everEstablished ? c.Now.Date : DateTime.MinValue);
 
             var windowed = snaps.Where(s => s.Date.Date >= effectiveSince).ToList();
@@ -108,10 +133,16 @@ static partial class Commands
         {
             var (reasonOk, reason) = Zfs.LoadHealthReason(c);
             var reasonText = reasonOk && reason != "" ? reason : "no recorded reason";
-            Log($"{c.PoolDataset}: WORRY - {reasonText} (run `--reset-health` after review)");
+            Log($"{c.PoolDataset}: WORRY - {reasonText} (run `--acknowledge-false-positive` only for a confirmed false positive; attacks require external recovery)");
         }
         else
             Log($"{c.PoolDataset}: {(health == "" ? "starting" : "healthy")}");
+
+        if (incidents.Count > 0)
+        {
+            Log("\n## Incident protection\n");
+            foreach (var incident in incidents) Log(incident);
+        }
 
         Zfs.FlushLog(c, lines);
         return errors > 0 ? 1 : 0;

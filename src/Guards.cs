@@ -32,7 +32,7 @@ static class GuardChecks
             return $"gap in last {gd.RecentWindowDays}d: missing {string.Join(",", missing)} (pruned_through={pt})";
         }
 
-        string? shock = ContentShockGuard(snaps, gd);
+        string? shock = ContentShockGuard(c, snaps[0].Name.Split('@')[0], snaps, gd);
         if (shock is not null) return shock;
 
         // population note (informational): under the two-holds invariant nothing is droppable
@@ -50,12 +50,21 @@ static class GuardChecks
     // dataset BEFORE any dataset commits to destroying anything, without duplicating the
     // threshold logic. A dataset's own per-run HealthGuard call still goes through this
     // same function, so the two can never drift apart.
-    public static string? ContentShockGuard(List<Snap> snaps, Guards gd)
+    public static string? ContentShockGuard(Ctx c, string ds, List<Snap> snaps, Guards gd)
     {
         var newest = snaps.Max(s => s.Date);
         var newestSnap = snaps.MaxBy(s => s.Date)!;
+        var (acceptedOk, acceptedFrom, acceptedTip) = Latched.ContentBaseline(c, ds);
+        if (!acceptedOk) return "cannot verify false-positive content baseline";
+        if (acceptedFrom is not null && newest < acceptedFrom.Value)
+            return "newest snapshot predates acknowledged false-positive baseline";
+        // An operator accepted the exact tip, not arbitrary future content. New
+        // snapshots use the post-acknowledgment reference-size population and
+        // are still checked for fresh shrinkage/churn.
+        if (newestSnap.Name == acceptedTip) return null;
         // baseline = recent dailies of THIS dataset (so a small dataset is judged on its own scale)
-        var baseline = snaps.Where(s => s.Name != newestSnap.Name && s.Date >= newest.AddDays(-gd.RecentWindowDays))
+        var baseline = snaps.Where(s => s.Name != newestSnap.Name && s.Date >= newest.AddDays(-gd.RecentWindowDays)
+                                && (acceptedFrom is null || s.Date >= acceptedFrom.Value))
                             .ToList();
 
         // guard: data shrinkage. Newest daily referencing far less than this dataset's recent

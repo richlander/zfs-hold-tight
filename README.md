@@ -108,18 +108,19 @@ run as a user able to `zfs destroy`/`hold` the target datasets (usually root).
 | Command | What it does |
 |---|---|
 | *(none)* | Dry-run: report what would be pruned. **Deletes nothing.** |
+| `--reconcile` | Update keeper metadata and holds without deleting snapshots, clearing incident holds, establishing first-prune approval, or sending backup healthcheck pings. Separate mode; cannot combine with `--prune` or `--force`. |
 | `--prune` | Prune + tag keepers + create monthly/weekly keeper holds + ping healthchecks. |
 | `--prune --force` | Bypass the per-run delete cap (for a reviewed bulk cleanup). |
 | `-v`, `--verbose` | Log each snapshot decision. |
-| `--doctor` | Report keeper hold status: protected ✓ / missing ✗ / unexpected. |
-| `--summary [--since YYYY-MM-DD]` | Two-section markdown report ([sample output](docs/SUMMARY.example.md)) — for pasting into a gist/PR/chat, not a replacement for `--doctor`'s per-keeper detail. **Snapshots**: one-line-per-dataset table (monthlies/weeklies/dailies retained, date range, feed continuity); `--since` narrows the window, omitted defaults to the oldest snapshot actually retained. **Health**: the pool-wide state (`starting`/`healthy`/`unhealthy`), always shown explicitly (unlike the console log's silent-when-healthy convention — this file is read directly by a human, not grepped), plus the persisted reason when unhealthy. |
+| `--doctor` | Report calculated keepers, recorded tier/expiry mismatches, actual holds, stale managed holds, and separate incident protection/history. |
+| `--summary [--since YYYY-MM-DD]` | Markdown report with Snapshots/Health sections and an incident section when applicable ([sample output](docs/SUMMARY.example.md)) — for pasting into a gist/PR/chat, not a replacement for `--doctor`'s per-keeper detail. **Snapshots**: one-line-per-dataset table (monthlies/weeklies/dailies retained, date range, feed continuity); `--since` narrows the window, omitted defaults to the oldest snapshot actually retained. **Health**: the pool-wide state (`starting`/`healthy`/`unhealthy`), always shown explicitly (unlike the console log's silent-when-healthy convention — this file is read directly by a human, not grepped), plus the persisted reason when unhealthy. |
 | `--check-holds` | Flag holds on snapshots older than their dataset's own retention. |
 | `--fix` | Create missing managed holds on monthly and weekly keepers. |
 | `--hold-adhoc <snap>` | Defensive manual `<ns>:adhoc` hold on one snapshot. |
 | `--hold-latest-tier <daily\|weekly\|monthly>` | Hold the newest snapshot of a tier. |
 | `--hold-latest` | Shorthand for `--hold-latest-tier daily`. |
-| `--reset-health` | Clear the pool-wide `<ns>:health` shock latch (`unhealthy` → `healthy`). The **only** way it clears — never `--force`, never automatically. No-op (exit 0) if not currently `unhealthy`. |
-| `--dataset <name>` | Limit `--doctor`/`--summary`/`--fix`/`--prune` to one dataset. Does **not** limit the pool-wide shock pre-pass (see [Safety guards](#safety-guards)) — a shock on a dataset outside the filter still freezes the one(s) you asked for. |
+| `--acknowledge-false-positive` | Assert the warning was a legitimate change, repair/verify incident metadata, persist the acknowledgment, and clear the latch. No snapshot deletion, safety-hold release, or backup-success ping. Separate pool-wide mode. Confirmed attacks require external tools. |
+| `--dataset <name>` | Limit `--doctor`/`--summary`/`--fix`/`--prune`/`--reconcile` to one dataset. Does **not** limit the pool-wide shock pre-pass (see [Safety guards](#safety-guards)) — a shock on a dataset outside the filter still freezes the one(s) you asked for. |
 | `--no-hc` | Skip healthchecks pings for this run. |
 | `--version` | Print the tool version and exit. |
 
@@ -211,13 +212,13 @@ the pool dataset is just another resource that can WORRY (see
 
 This latch does **not** self-heal: a later run whose numbers look clean again is not
 evidence of safety (a patient attacker may just be moving slower), so only the explicit
-`--reset-health` command clears it — never `--force`, never automatically. The
+`--acknowledge-false-positive` command clears it — never `--force`, never automatically. The
 pool-wide pre-pass that checks this runs regardless of `--dataset` filtering, so a
 shock elsewhere still freezes whatever you asked to prune.
 
 The free-text reason (which dataset, which guard) is also persisted, in `<ns>:health_reason`
 alongside the `<ns>:health` enum, so an operator can see WHAT tripped it via `--summary` or
-`--doctor` without needing to log in and grep the day's log. `--reset-health` prints it one
+`--doctor` without needing to log in and grep the day's log. `--acknowledge-false-positive` prints it one
 last time before clearing it, since reviewing that reason is the whole point of the command.
 See
 [docs/DESIGN.md](docs/DESIGN.md) "Cross-dataset shock" for the full design and
@@ -340,3 +341,150 @@ fixtures above: [`docs/model/ZfsHoldTight.tla`](docs/model/ZfsHoldTight.tla) —
 ## License
 
 [MIT](LICENSE).
+
+## Retention metadata while the safety latch is engaged
+
+A latched run keeps moving the weekly/monthly classification normally. It does
+not call every protected snapshot a monthly keeper. Before updating metadata or
+releasing a superseded tier hold, the tool protects **every affected daily** with
+`<ns>:latched:<incident-id>` and appends its incident to `<ns>:latch_history`. The actual keeper
+continues to carry `<ns>:weekly` or `<ns>:monthly`; ordinary dailies have no tier
+or keep-until properties. A plain daily can therefore be incident-protected
+without looking like a five-year monthly retention commitment.
+
+The pool-level `<ns>:latch_id` is a compatibility mirror of the incident ID;
+`<ns>:latch_evidence` holds the authoritative identity during interrupted activation. Snapshot history is a JSON
+array of `{ "id": "...", "reason": "...", "observed_utc": "..." }` records. Repeated
+runs do not duplicate a record. `observed_utc` records this version's first
+observation, not an invented start date for a pre-upgrade incident. A later
+incident appends a new identity, including when its reason repeats.
+
+`--acknowledge-false-positive` records the false-positive receipt and clears the pool latch, but
+never removes snapshot history or incident holds. A subsequent healthy,
+approved/established, under-cap prune first reconciles keeper protection, then
+releases verified incident holds and prunes eligible snapshots. A blocked prune
+keeps the incident holds. `--reconcile` never releases them or deletes anything;
+it is useful for examining metadata independently of backlog cleanup. Dry runs
+remain entirely read-only.
+
+The dataset-level `<ns>:established=yes|no` distinguishes completion of a healthy
+prune from metadata-only work. Otherwise tagging during a latch could silently
+clear the first-prune approval requirement. On upgrade, existing tier metadata
+provides the legacy baseline; this is recorded before new metadata is written.
+A first successful healthy prune marks the dataset established; failed,
+metadata-only, latched, cold-start-blocked, and capped runs do not.
+
+Malformed incident history, unverifiable establishment, and failed protection
+writes stop reconciliation/deletion rather than guessing. History that would
+exceed ZFS's property size limit likewise requires review while holds remain.
+Legacy monthly holds without incident history remain explicitly described as
+legacy/unknown provenance by `--doctor`; the tool does not fabricate an old
+incident record from a hold name. A real latched run can mark its own newly
+observed incident and reconcile these old tier holds after protecting all data.
+
+`--doctor` distinguishes active safety holds from retained incident history and
+returns nonzero for stale tier/expiry metadata or stale managed tier holds.
+`--summary` adds an **Incident protection** section when history exists. See
+[the safety contract](docs/SAFETY.md) and [design rationale](docs/DESIGN.md).
+
+Regression tests for the real 2026 incident run without a ZFS pool:
+
+```bash
+bash tests/run-tests.sh
+python3 tests/latched-tests.py
+# Run the same incident/failure cases against an actual published binary:
+ZFS_HOLD_TIGHT_TEST_BINARY="$PWD/out/zfs-hold-tight" python3 tests/latched-tests.py
+```
+
+## Supported incident workflow: warn/latch, then acknowledge a false positive
+
+The content heuristics are warning signals, not proof of ransomware and not a
+recovery-point selector. This tool supports two incident actions:
+
+1. **Warn and latch.** Stop pruning, preserve recovery options, record the
+   incident, and continue understandable retention metadata marking.
+2. **Recover from a confirmed false positive.** The operator explicitly asserts
+   the detected change was legitimate using `--acknowledge-false-positive`.
+
+A suspected/confirmed attack stays latched. Choosing a clean recovery point,
+restoring/rebuilding systems, abandoning a compromised continuation, and targeted
+snapshot destruction require different tools and deliberate operations. There is
+no attack-cleanup, compromised-snapshot selection, or `prune-latched` mode.
+The old generic `--reset-health` is rejected rather than retained as an ambiguous
+alias. Unknown command-line arguments are errors, including when combined with
+`--prune`, so unsupported recovery flags cannot silently run ordinary pruning.
+
+Acknowledgment is a non-deleting, retryable maintenance action. While still
+frozen it completes incident history/protection and keeper reconciliation, then
+verifies every configured dataset. Each physical safety hold embeds its incident
+ID, and only the matching history can verify it. Missing/corrupt history blocks
+clearance unless it can be repaired from that active incident's recorded identity
+and reason. Unbound legacy `:latched` holds remain unverified; the tool does not
+invent an incident identity for them. A persistent pool receipt
+`<ns>:false_positive_<id>=<acknowledgment-epoch>` is written before health clears.
+New warnings persist exact evidence and a fresh ID before compatibility health/ID
+mirrors. Unacknowledged evidence itself is a durable latch, so interrupted
+activation cannot reuse an old approval. Acknowledgment retries retain the same
+incident and receipt; they do not create another incident.
+
+Acknowledgment records `<ns>:accepted_content=<id>|<snapshot-name>` only for
+the exact recorded triggering snapshot on its dataset. It becomes effective only after that incident's false-positive
+receipt exists. The exact accepted warning snapshot is not immediately flagged again for the
+same shrink/churn. Collateral datasets and newly arrived warning tips receive no
+implicit exemption. Later snapshots still undergo churn checks and compare size
+against the post-acceptance population, so new changes can trigger a new latch.
+Clock, freshness, continuity, retention, and first-prune/cap guards remain active.
+This is an operator acceptance of a legitimate change, not a claim the heuristics
+have established clean data. Ordinary retention resumes separately, with safety
+holds retired only when all their IDs have explicit false-positive receipts.
+
+Read-only reports always inspect actual incident holds, even if all history
+writes failed. Malformed history blocks reconciliation/pruning even without a
+physical hold, preserving the evidence for manual review.
+
+### Exact warning evidence and additional warnings
+
+`<ns>:latch_evidence` stores the incident ID, dataset, exact triggering snapshot,
+reason, and observed reference/written metrics. This single durable record is
+written before the compatibility health/ID mirrors. Unacknowledged evidence
+itself means latched, even if writing those mirrors fails. Acknowledgment requires
+the recorded snapshot and metrics to remain available; it never silently accepts
+a different tip. Older latches without exact evidence receive no content-check
+exception and may surface a separately observed warning for another review.
+
+After recording acceptance of the original warning, acknowledgment rechecks every
+current dataset **before clearing health**. If an additional warning exists—on
+another dataset or a new tip—it persists that new exact incident, keeps the pool
+latched, reports it, and exits nonzero. The original false-positive receipt is
+retained. The operator must review the new warning separately. Neither step
+deletes snapshots or releases safety holds.
+
+A failed health-clear write leaves the original incident active under the same
+identity; retrying completes that acknowledgment without inventing a second
+incident. A genuinely new warning is distinguishable because its exact evidence
+and identity are persisted before its health mirror. On rollback to an older
+binary, first complete or deliberately inspect any pending activation: older
+versions do not understand the new authoritative evidence sentinel, although
+existing incident-specific physical holds remain foreign/protective to them.
+
+### Verification warnings and durable acknowledgment fallback
+
+Warning evidence is typed as `shrink`, `churn`, or `verification`. Only an actual
+recorded shrink/churn warning can authorize the exact snapshot's content
+exception. An infrastructure/baseline-verification failure is not evidence that
+any data content was reviewed. Its fault must be resolved, and content checks
+must run without an exemption; a newly visible content warning remains latched
+for separate review.
+
+Before publishing a false-positive receipt, acknowledgment must successfully
+persist the compatibility health state as **unhealthy**. This durable fallback
+keeps the pool frozen if receipt persistence succeeds but the final warning scan
+or health-clear subsequently fails—even if initial unhealthy mirror writes had
+never succeeded. A receipt is the operator's decision, not evidence that latch
+clearance completed. Retries retain the same incident and do not delete data.
+
+Resolved historical evidence may outlive a dataset's configuration entry; parsing
+that history does not require the dataset still to be configured. An unresolved
+incident whose dataset is no longer in scope cannot be acknowledged because its
+data cannot be verified. Restore verification scope or use deliberate external
+recovery tools rather than silently clearing that warning.

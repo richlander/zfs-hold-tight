@@ -1,12 +1,12 @@
 // ---- prune: the tool's one destructive mode (dry-run when `prune` is false) ----
 static partial class Commands
 {
-    public static int Prune(Ctx c, bool prune, bool force, bool verbose, string? only, bool noHc)
+    public static int Prune(Ctx c, bool prune, bool force, bool verbose, string? only, bool noHc, bool reconcileOnly = false)
     {
         var lines = new List<string>();
         void Log(string m) { Console.WriteLine(m); lines.Add(m); }
 
-        Log($"=== zfs-hold-tight {c.Version} {c.Now:yyyy-MM-dd HH:mm:ss}Z  mode={(prune ? "PRUNE" : "dry-run")}{(force ? " --force" : "")} ===");
+        Log($"=== zfs-hold-tight {c.Version} {c.Now:yyyy-MM-dd HH:mm:ss}Z  mode={(reconcileOnly ? "RECONCILE" : prune ? "PRUNE" : "dry-run")}{(force ? " --force" : "")} ===");
         if (prune && !noHc) Zfs.HcPing(c, c.HcUrl + "/start", null);
 
         int totalKeep = 0, totalDoom = 0, destroyAttempted = 0, destroySucceeded = 0, destroyFails = 0;
@@ -21,16 +21,18 @@ static partial class Commands
         //      one loud enough to trip its own threshold, so ANY single shock distrusts the WHOLE
         //      pool, not just that dataset. Cached here so the main loop below doesn't re-list.
         var dsCache = new Dictionary<string, (int code, List<Snap> snaps, List<string> warnings)>();
-        string? shockReason = null;
+        string? shockReason = null, shockDataset = null;
+        Snap? shockTip = null;
         foreach (var (dsP, retP) in c.Retention)
         {
             var (codeP, snapsP, warningsP) = Zfs.ListDailies(c, dsP);
             dsCache[dsP] = (codeP, snapsP, warningsP);
             if (shockReason is not null) continue;   // already found one; still cache the rest
-            if (codeP != 0) { shockReason = $"{dsP}: zfs list failed, cannot verify"; continue; }
+            if (codeP != 0) { shockReason = $"{dsP}: zfs list failed, cannot verify"; shockDataset = dsP; continue; }
             if (snapsP.Count == 0) continue;
-            var contentShock = GuardChecks.ContentShockGuard(snapsP, c.GuardsByDataset[dsP]);
-            if (contentShock is not null) shockReason = $"{dsP}: {contentShock}";
+            var contentShock = GuardChecks.ContentShockGuard(c, dsP, snapsP, c.GuardsByDataset[dsP]);
+            if (contentShock is not null)
+            { shockReason = $"{dsP}: {contentShock}"; shockDataset = dsP; shockTip = snapsP.MaxBy(s => s.Date); }
         }
 
         // health: "" (never set, shown as "starting") | "healthy" | "unhealthy". A read FAILURE
@@ -40,6 +42,7 @@ static partial class Commands
         // reasoning a `zfs holds` failure already SKIPs a dataset elsewhere in this tool).
         var (healthOk, health) = Zfs.LoadHealth(c);
         bool globalFreeze; string freezeReason;
+        bool warningEvidenceFailed = false;
         if (!healthOk)
         {
             globalFreeze = true;
@@ -48,19 +51,19 @@ static partial class Commands
         else if (health == "unhealthy")
         {
             globalFreeze = true;
-            freezeReason = "already latched unhealthy — run --reset-health after review";
+            freezeReason = "already latched unhealthy — run --acknowledge-false-positive only for a confirmed false positive; attacks require external recovery";
         }
         else if (shockReason is not null)
         {
             globalFreeze = true;
             freezeReason = $"content shock detected — {shockReason}";
-            if (prune) { var (_, whMsg) = Zfs.WriteHealth(c, "unhealthy", shockReason); Log(whMsg); }
+            if (prune) warningEvidenceFailed = Latched.BeginWarning(c, Log, shockDataset!, shockTip, shockReason) is null;
         }
         else
         {
             globalFreeze = false; freezeReason = "";
             // First-ever clean pass: "starting" -> "healthy". Never the reverse direction of
-            // "unhealthy" -> anything -- that's --reset-health's job alone (see ResetHealth).
+            // "unhealthy" -> anything -- that's --acknowledge-false-positive's job alone (see AcknowledgeFalsePositive).
             if (prune && health == "") { var (_, whMsg) = Zfs.WriteHealth(c, "healthy", null); Log(whMsg); }
         }
         // Reuses the tool's OWN existing WORRY grammar ({resource}: WORRY - {reason}) instead of
@@ -71,6 +74,21 @@ static partial class Commands
         // WORRY either.
         if (globalFreeze)
             Log($"{c.PoolDataset}: WORRY - {freezeReason}");
+
+        string? incidentId = null;
+        string incidentReason = freezeReason;
+        if (prune && globalFreeze && !warningEvidenceFailed)
+        {
+            // Do not create an apparently reviewed incident when the health
+            // state could not be read/persisted. Existing guard protection stays.
+            var (latchedOk, latchedState) = Zfs.LoadHealth(c);
+            if (latchedOk && latchedState == "unhealthy")
+            {
+                incidentId = Latched.Identity(c, Log);
+                var (reasonOk, reason) = Zfs.LoadHealthReason(c);
+                incidentReason = reasonOk && reason != "" ? reason : "original latch reason not recorded";
+            }
+        }
 
         foreach (var (ds, ret) in c.Retention)
         {
@@ -121,7 +139,8 @@ static partial class Commands
                 continue;
             }
             bool IsForeignHeld(string name) =>
-                holdMap.TryGetValue(name, out var tags) && tags.Any(t => t != c.TagMonthly && t != c.TagWeekly);
+                holdMap.TryGetValue(name, out var tags) && tags.Any(t => t != c.TagMonthly && t != c.TagWeekly
+                    && !snaps.Any(s => s.Name == name && Latched.VerifiedHold(c, s, t)));
 
             // Persisted watermark for guard 1 (see Ctx.PropPrunedThrough / Zfs.LoadPrunedThrough).
             // Unreadable always defaults to MinValue (the safe/conservative direction -- can't
@@ -137,7 +156,9 @@ static partial class Commands
             // extends trust to a dataset this tool was already successfully managing, never to a
             // genuinely fresh one. Applied identically in dry-run and --prune so a dry-run's
             // guard-1 preview isn't needlessly alarming either; only --prune actually persists it.
-            bool everEstablished = snaps.Any(s => s.Tier is not null);
+            var (establishmentOk, everEstablished, establishmentRecorded) = Latched.Established(c, ds, snaps);
+            if (prune && establishmentOk && !establishmentRecorded)
+                establishmentOk = Latched.RecordEstablished(c, Log, ds, everEstablished);
             var prunedThrough = Zfs.LoadPrunedThrough(c, ds) ?? (everEstablished ? c.Now.Date : DateTime.MinValue);
 
             // Keeper/hold summary — hoisted above the worry paths so the WORRY lines and the normal
@@ -188,9 +209,9 @@ static partial class Commands
             }
 
             // ---- run-level guards. On a worry, protection only ever INCREASES: still hold the
-            //      monthly keepers (even the suspect newest — a false positive costs nothing, and
-            //      we don't want to skip the hold and lose the chance later) and record a worry
-            //      breadcrumb on the tip — but never release a hold or delete anything. Combined
+            //      current keepers (even the suspect newest). A verified pool latch now protects
+            //      every daily with an independent incident hold before reconciling classification;
+            //      other guard failures retain the add-only keeper path. Never delete on either. Combined
             //      with the pool-wide health latch (docs/DESIGN.md "Cross-dataset shock"): EITHER
             //      this dataset's own guard tripping OR the pool latch alone is enough to
             //      withhold it, and a dataset that tripped its OWN guard still gets its specific
@@ -198,14 +219,26 @@ static partial class Commands
             //      frozen purely as collateral (its own guards are clean) falls back to that.
             //      Either way, no destroy and no pruned_through advance while either is true
             //      (see FrozenWhileUnhealthyStep in docs/model/ZfsHoldTight.tla). ----
-            string? ownGuard = GuardChecks.HealthGuard(c, Log, snaps, ret, gd, prunedThrough);
+            bool incidentHistoryOk = Latched.ValidateHistory(c, Log, snaps, holdMap);
+            bool acknowledgmentOk = globalFreeze || Latched.ValidateAcknowledgments(c, Log, holdMap);
+            string? ownGuard = !establishmentOk ? "cannot verify/persist establishment state"
+                : !incidentHistoryOk ? "unverified incident protection/history"
+                : !acknowledgmentOk ? "incident not acknowledged as a false positive"
+                : GuardChecks.HealthGuard(c, Log, snaps, ret, gd, prunedThrough);
             string? guard = ownGuard ?? (globalFreeze ? $"pool: {freezeReason}" : null);
             if (guard is not null)
             {
                 Log($"{ds}: WORRY - {guard} ({keepersHeld}/{keeperNames.Count} keepers held)");
                 if (prune)
                 {
-                    HoldCandidateKeepersDefensively("worry");
+                    if (globalFreeze && establishmentOk && incidentId is not null)
+                    {
+                        if (!Latched.Protect(c, Log, snaps, holdMap, incidentId, incidentReason)
+                            || !Latched.Reconcile(c, Log, snaps, monthKeeper, weekKeeper, Desired, holdMap))
+                            metadataErrors.Add($"  {ds}: latched protection/metadata reconciliation failed");
+                    }
+                    else
+                        HoldCandidateKeepersDefensively("worry");
                     if (ownGuard is not null)
                     {
                         var (wc, _, we) = Zfs.Exec(c, "zfs", "set", $"{c.Ns}:worry={c.Now:yyyy-MM-dd} {ownGuard}", newest);
@@ -223,7 +256,7 @@ static partial class Commands
             // the feed healthy," not "did we destroy anything" (see docs/DESIGN.md). Only in --prune
             // mode; a dry-run must never mutate state. A write failure here is logged but doesn't
             // SKIP the dataset -- worst case, guard 1 stays exactly as cautious as it is today.
-            if (prune)
+            if (prune && !reconcileOnly)
             {
                 var (pwc, _, pwe) = Zfs.Exec(c, "zfs", "set", $"{c.PropPrunedThrough}={((DateTimeOffset)c.Now).ToUnixTimeSeconds()}", ds);
                 if (pwc != 0) Log($"    META:UPDATE {ds} {c.PropPrunedThrough} FAILED: {pwe.Trim()}");
@@ -269,18 +302,18 @@ static partial class Commands
             //      to destroy anything at all here for the first time." So this floor is not a
             //      smaller cap, it is a flat requirement: ANY doomed snapshot on a
             //      never-established dataset needs --force, regardless of count (see
-            //      docs/SAFETY.md guard 6 "Accepted tradeoff" and guard 7). "Established" = at
-            //      least one snapshot already carries a real <ns>:tier value. This check runs, and
-            //      `continue`s, BEFORE Promote (unlike the routine volume-capped case below, where
-            //      Promote deliberately keeps running while capped) specifically so a blocked
-            //      cold-start pass can never tag a keeper and thereby self-clear the floor without
-            //      --force ever being used. A dataset with zero doomed snapshots (nothing
+            //      docs/SAFETY.md guard 6 "Accepted tradeoff" and guard 7). Explicit establishment
+            //      is recorded before new metadata, so continued latched/metadata-only tagging
+            //      cannot silently clear this floor. Legacy tier metadata supplies the one-time
+            //      upgrade baseline. Ordinary blocked cold starts still protect keepers only;
+            //      --reconcile can maintain classification without approving a first prune.
+            //      A dataset with zero doomed snapshots (nothing
             //      destructive to decide on yet) establishes on its first plain --prune — Promote
             //      only ever tags/holds keepers, never destroys, so there is nothing to review.
             //      (everEstablished computed above, alongside prunedThrough's own bootstrap.)
-            if (!everEstablished && doomed.Count > 0 && !force)
+            if (!everEstablished && doomed.Count > 0 && !force && !reconcileOnly)
             {
-                Log($"{ds}: WORRY - cold start: would delete {doomed.Count} (dataset not yet established — no snapshot carries a real {c.PropTier} value; if --force was already used and this persists, Promote's metadata/hold writes may be failing rather than never having run); {keeperTailSuffix}");
+                Log($"{ds}: WORRY - cold start: would delete {doomed.Count} (dataset not yet established — no completed healthy prune; if --force was already used and this persists, Promote's metadata/hold writes may be failing rather than never having run); {keeperTailSuffix}");
                 if (prune) HoldCandidateKeepersDefensively("cold start");
                 Log($"{ds}: SKIP - cold-start floor (no deletions)");
                 held.Add($"{ds}: cold start, needs --force");
@@ -292,34 +325,17 @@ static partial class Commands
             //      ever increases" (same principle as the HealthGuard branch above). Gating Promote
             //      behind this guard would leave newly-due weekly/monthly keepers unheld for as long
             //      as the dataset stays capped: a protection regression masquerading as a safety win.
-            bool volumeCapped = doomed.Count > gd.MaxDeletePerRun && !force;
+            bool volumeCapped = doomed.Count > gd.MaxDeletePerRun && !force && !reconcileOnly;
             if (volumeCapped)
                 Log($"{ds}: WORRY - would delete {doomed.Count} > cap {gd.MaxDeletePerRun}; {keeperTailSuffix}");
 
-            // ---- tag keepers / clean up demotions (prune only) ----
+            // ---- tag keepers / clean up demotions (mutating modes only) ----
             if (prune)
             {
-                var promoteErrors = new List<string>();  // snapshots whose metadata/hold write failed
-                foreach (var s in snaps.OrderBy(s => s.Date))
+                if (!Latched.Reconcile(c, Log, snaps, monthKeeper, weekKeeper, Desired, holdMap))
                 {
-                    string tier = monthKeeper.Contains(s.Name) ? "monthly" : weekKeeper.Contains(s.Name) ? "weekly" : "daily";
-                    // Our keeper holds currently on this snapshot (from the load-time holds list), so
-                    // Promote can add-then-release across a tier change without a transient unheld gap.
-                    var heldKeeperTags = new HashSet<string>();
-                    if (holdMap.TryGetValue(s.Name, out var sht))
-                    {
-                        if (sht.Contains(c.TagMonthly)) heldKeeperTags.Add(c.TagMonthly);
-                        if (sht.Contains(c.TagWeekly))  heldKeeperTags.Add(c.TagWeekly);
-                    }
-                    if (!Zfs.Promote(c, Log, s, Desired(s), tier, heldKeeperTags)) promoteErrors.Add(Utils.Short(s.Name));
-                }
-                // Metadata/hold write failures SKIP the dataset (delete nothing) and alert.
-                if (promoteErrors.Count > 0)
-                {
-                    // The per-op `… FAILED` lines above are the reason; emit the verdict.
                     Log($"{ds}: SKIP - metadata/hold write failed (no deletions)");
-                    held.Add($"{ds}: metadata/hold failures");
-                    metadataErrors.AddRange(promoteErrors.Select(n => $"  {ds}@{n}"));
+                    held.Add($"{ds}: metadata/hold failures"); metadataErrors.Add(ds);
                     continue;
                 }
             }
@@ -330,16 +346,24 @@ static partial class Commands
                 held.Add($"{ds}: volume {doomed.Count}>cap"); continue;
             }
 
+            // Only a healthy, established/approved, under-cap run can retire
+            // incident holds. History remains even when all protection is released.
+            if (prune && !reconcileOnly && !Latched.ReleaseAcknowledged(c, Log, snaps, holdMap))
+            {
+                Log($"{ds}: SKIP - latch hold release failed (no deletions)");
+                held.Add($"{ds}: latch reconciliation failed"); metadataErrors.Add(ds); continue;
+            }
+            int priorDestroyFails = destroyFails;
             int kept = snaps.Count - doomed.Count;
             totalKeep += kept; totalDoom += doomed.Count;
-            string verb = prune ? "destroy" : "would destroy";
+            string verb = prune && !reconcileOnly ? "destroy" : "would destroy";
             string rng = doomed.Count > 0 ? $" [{Utils.Short(doomed[0])} .. {Utils.Short(doomed[^1])}]" : "";
             // keeper tag breakdown (mCount/wCount/tail hoisted above the worry paths) and the daily-tail
             // frontier: dailies newer than it survive (< destroyDepth held keepers ahead).
             Log($"{ds}: {snaps.Count} snaps -> keep {kept} ({mCount} monthly + {wCount} weekly held; daily tail: >={destroyDepth} newer holds, to {tail}), {verb} {doomed.Count}{rng}");
             foreach (var name in doomed)
             {
-                if (!prune) { if (verbose) Log($"  WOULD-DESTROY {name}"); continue; }
+                if (!prune || reconcileOnly) { if (verbose) Log($"  WOULD-DESTROY {name}"); continue; }
 
                 // Release ANY of our managed holds (<ns>:monthly and/or <ns>:weekly) before destroy,
                 // but ONLY for snapshots that actually carry one (an expired keeper — the tag Promote
@@ -356,7 +380,7 @@ static partial class Commands
                 foreach (var tag in toRelease)
                 {
                     var (rc, _, re) = Zfs.Exec(c, "zfs", "release", tag, name);
-                    if (rc != 0 && !re.Contains("no such hold") && !re.Contains("not found"))
+                    if (rc != 0 && !Zfs.IsMissingHold(re))
                         Log($"    HOLD:REMOVE {Utils.Short(name)} FAILED: {re.Trim()}");
                     else Log($"  HOLD:REMOVE {name} (expired keeper, before destroy)");
                 }
@@ -366,10 +390,13 @@ static partial class Commands
                 if (code != 0) { destroyFails++; Log($"    SNAP:DESTROY {Utils.Short(name)} FAILED: {err.Trim()}"); }
                 else { destroySucceeded++; Log($"  SNAP:DESTROY {name}"); }
             }
+            if (prune && !reconcileOnly && !everEstablished && priorDestroyFails == destroyFails
+                && !Latched.RecordEstablished(c, Log, ds, true))
+                metadataErrors.Add($"{ds}: establishment completion write failed");
         }
 
         bool trouble = held.Count > 0 || metadataErrors.Count > 0 || (prune && destroyFails > 0);
-        Log($"\n{(prune ? "PRUNED" : "DRY RUN")}: kept {totalKeep}, {(prune ? $"destroyed {destroySucceeded}/{destroyAttempted}" : $"would destroy {totalDoom}")}"
+        Log($"\n{(reconcileOnly ? "RECONCILED (no deletions)" : prune ? "PRUNED" : "DRY RUN")}: kept {totalKeep}, {(prune && !reconcileOnly ? $"destroyed {destroySucceeded}/{destroyAttempted}" : $"would destroy {totalDoom}")}"
             + (held.Count > 0 ? $", {held.Count} SKIPPED" : "")
             + (metadataErrors.Count > 0 ? $", {metadataErrors.Count} metadata errors" : "")
             + (prune && destroyFails > 0 ? $", {destroyFails} destroy-failures" : ""));

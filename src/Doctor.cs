@@ -21,11 +21,12 @@ static partial class Commands
         {
             var (reasonOk, reason) = Zfs.LoadHealthReason(c);
             var reasonText = reasonOk && reason != "" ? reason : "no recorded reason";
-            Log($"{c.PoolDataset}: WORRY - {reasonText} (run --reset-health after review)");
+            Log($"{c.PoolDataset}: WORRY - {reasonText} (run --acknowledge-false-positive only for a confirmed false positive; attacks require external recovery)");
         }
 
         int missing = 0, protected_ = 0, adhoc_ = 0, orphaned = 0, errors = 0;
-        foreach (var (ds, _) in c.Retention)
+        int incidentHeld = 0, incidentHistory = 0, staleManaged = 0, staleMetadata = 0;
+        foreach (var (ds, ret) in c.Retention)
         {
             if (datasetFilter is not null && ds != datasetFilter) continue;
             var (code, snaps, listWarnings) = Zfs.ListDailies(c, ds);
@@ -39,6 +40,7 @@ static partial class Commands
             var weekKeeper = snaps.GroupBy(s => (ISOWeek.GetYear(s.Date), ISOWeek.GetWeekOfYear(s.Date)))
                                   .Select(g => g.MaxBy(s => s.Date)!.Name).ToHashSet();
             var weekOnly = weekKeeper.Where(w => !monthKeeper.Contains(w)).ToHashSet();
+            var (_, _, _, _, desiredExpiry) = Utils.ComputeKeepersAndFrontier(snaps, ret, c.Now);
 
             // Check which snapshots have holds
             var holdMap = Zfs.LoadHolds(c, snaps.Select(s => s.Name).ToList());
@@ -73,6 +75,39 @@ static partial class Commands
                 }
             }
 
+            // Report actual protection separately from calculated classification.
+            // Legacy managed holds are ambiguous, never silently relabelled as
+            // incident history that the old version did not actually record.
+            foreach (var s in snaps)
+            {
+                holdMap.TryGetValue(s.Name, out var actualTags);
+                actualTags ??= new();
+                bool hasHistory = Latched.HasHistory(s);
+                if (s.LatchHistory is not null && !hasHistory)
+                { Log($"  ? {Utils.Short(s.Name)} INVALID INCIDENT HISTORY"); errors++; }
+                if (hasHistory) incidentHistory++;
+                var safetyTags = actualTags.Where(t => Latched.IsSafetyTag(c, t)).ToList();
+                if (safetyTags.Count > 0) incidentHeld++;
+                foreach (var tag in safetyTags)
+                {
+                    bool verified = Latched.VerifiedHold(c, s, tag);
+                    Log($"  ℹ {Utils.Short(s.Name)} ({tag}; {(verified ? "matching incident history recorded" : "UNVERIFIED incident protection")})");
+                    if (!verified) errors++;
+                }
+                string? expected = monthKeeper.Contains(s.Name) ? "monthly" : weekOnly.Contains(s.Name) ? "weekly" : null;
+                long? expectedKeep = expected is null ? null : ((DateTimeOffset)desiredExpiry(s)).ToUnixTimeSeconds();
+                if (s.Tier != expected || s.KeepUntil != expectedKeep)
+                {
+                    staleMetadata++;
+                    Log($"  ? {Utils.Short(s.Name)} STALE METADATA: recorded {s.Tier ?? "daily"}/{s.KeepUntil?.ToString() ?? "-"}, calculated {expected ?? "daily"}/{expectedKeep?.ToString() ?? "-"}");
+                }
+                if (expected is null && actualTags.Any(t => t == c.TagMonthly || t == c.TagWeekly))
+                {
+                    staleManaged++;
+                    Log($"  ? {Utils.Short(s.Name)} STALE MANAGED HOLD: calculated daily; {(hasHistory ? "incident history recorded" : "legacy provenance unknown")}");
+                }
+            }
+
             // Report other holds — a keeper carrying its own <ns>:weekly/<ns>:monthly hold is
             // expected, so exclude both keeper sets here; only genuinely unexpected holds remain.
             foreach (var (snap, tags) in holdMap)
@@ -95,12 +130,13 @@ static partial class Commands
 
         Log($"\nSummary: {protected_} keepers protected, {missing} missing, {adhoc_} adhoc, {orphaned} unexpected"
             + (errors > 0 ? $", {errors} datasets unverified (zfs errors)" : ""));
-        if (missing == 0 && orphaned == 0 && errors == 0)
+        Log($"Incident protection: {incidentHeld} latch-held, {incidentHistory} with history; {staleManaged} stale managed holds, {staleMetadata} stale tier records");
+        if (missing == 0 && orphaned == 0 && errors == 0 && staleManaged == 0 && staleMetadata == 0)
             Log("✓ Hold strategy validated");
         else
             Log($"⚠ Issues: {missing} missing holds, {orphaned} unexpected, {errors} unverified");
 
         Zfs.FlushLog(c, lines);
-        return (missing > 0 || errors > 0) ? 1 : 0;
+        return (missing > 0 || errors > 0 || staleManaged > 0 || staleMetadata > 0) ? 1 : 0;
     }
 }

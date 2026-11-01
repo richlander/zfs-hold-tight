@@ -11,6 +11,7 @@
 #:include ./Summary.cs
 #:include ./Fix.cs
 #:include ./Holds.cs
+#:include ./Latched.cs
 
 // zfs-hold-tight - defender-side GFS retention for TrueNAS archive/* datasets.
 //
@@ -209,11 +210,11 @@ string propPrunedThrough = $"{ns}:pruned_through";
 // there's one of these for the whole tool, not one per dataset. Set to "unhealthy" the
 // moment ANY dataset shows a content shock (guard 4/5); once set, EVERY dataset freezes
 // (no destroy, no pruned_through advance) on every subsequent run regardless of that
-// run's own guard results, until an operator runs --reset-health. See docs/DESIGN.md
+// run's own guard results, until an operator acknowledges a confirmed false positive. See docs/DESIGN.md
 // "Cross-dataset shock".
 string propHealth = $"{ns}:health";
 // Free-text companion to propHealth: WHY the pool is unhealthy, e.g. "archive/scratch:
-// referenced dropped 41% (...)". Persisted so --doctor/--summary/--reset-health can show
+// referenced dropped 41% (...)". Persisted so --doctor/--summary/--acknowledge-false-positive can show
 // an operator what tripped it without needing to SSH in and grep the day's log -- the
 // pool-wide latch itself doesn't carry that detail. Only ever written alongside a
 // transition TO unhealthy (see Zfs.WriteHealth); cleared the moment health goes healthy
@@ -344,11 +345,28 @@ if (sinceIdx >= 0)
     since = sinceVal;
 }
 
+// A generic reset would imply attack recovery that this tool does not provide.
+if (args.Contains("--reset-health"))
+{ Console.Error.WriteLine("--reset-health is unsupported; use --acknowledge-false-positive only after confirming a legitimate change. Confirmed attacks require separate recovery tools."); return 2; }
+var simpleFlags = new HashSet<string> { "--prune", "--force", "--verbose", "-v", "--no-hc", "--doctor", "--summary", "--check-holds", "--fix", "--hold-latest", "--reconcile", "--acknowledge-false-positive" };
+var valueFlags = new HashSet<string> { "--dataset", "--since", "--hold-adhoc", "--hold-latest-tier" };
+for (int i = 0; i < args.Length; i++)
+{
+    if (valueFlags.Contains(args[i])) { i++; continue; }
+    if (!simpleFlags.Contains(args[i])) { Console.Error.WriteLine($"Unknown argument: {args[i]}"); return 2; }
+}
+if (args.Contains("--acknowledge-false-positive") && args.Any(a => a is not ("--acknowledge-false-positive" or "--no-hc" or "--verbose" or "-v")))
+{ Console.Error.WriteLine("--acknowledge-false-positive is a separate pool-wide, non-deleting maintenance action; cannot combine with other modes, --dataset or --force"); return 2; }
+
 // Run-lock: serialize any run that mutates ZFS state (prune/fix/hold-*), so two
 // overlapping cron invocations can't double-process. Read-only modes skip the lock.
-bool willMutate = args.Contains("--prune") || args.Contains("--fix")
+if (args.Contains("--reconcile") && (args.Contains("--prune") || args.Contains("--force")
+    || args.Any(a => a is "--doctor" or "--fix" or "--summary" or "--acknowledge-false-positive" or "--hold-latest" or "--hold-latest-tier" or "--hold-adhoc" or "--check-holds")))
+{ Console.Error.WriteLine("--reconcile is a separate metadata-only mode; cannot combine with other modes or --force"); return 2; }
+
+bool willMutate = args.Contains("--reconcile") || args.Contains("--prune") || args.Contains("--fix")
     || args.Contains("--hold-adhoc") || args.Contains("--hold-latest-tier") || args.Contains("--hold-latest")
-    || args.Contains("--reset-health");
+    || args.Contains("--acknowledge-false-positive");
 FileStream? runLock = null;
 if (willMutate)
 {
@@ -394,6 +412,12 @@ var ctx = new Ctx
 };
 
 // Check for special commands
+if (args.Contains("--reconcile"))
+{
+    var result = Commands.Prune(ctx, true, false, args.Contains("--verbose") || args.Contains("-v"), datasetFilter, noHc: true, reconcileOnly: true);
+    configDoc?.Dispose(); return result;
+}
+
 if (args.Contains("--doctor"))
 {
     var result = Commands.Doctor(ctx, datasetFilter);
@@ -451,9 +475,9 @@ if (args.Contains("--hold-latest"))
     return result;
 }
 
-if (args.Contains("--reset-health"))
+if (args.Contains("--acknowledge-false-positive"))
 {
-    var result = Commands.ResetHealth(ctx, noHc);
+    var result = Commands.AcknowledgeFalsePositive(ctx, noHc);
     configDoc?.Dispose();
     return result;
 }

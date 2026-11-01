@@ -87,8 +87,8 @@ content guards while a churny scratch policy relaxes them).
      `pruned_through` existed has no watermark on its first run under a binary that
      tracks one. Defaulting to `MinValue` there would flag its whole pre-existing daily
      tail as a gap — also a real, not hypothetical, case: any such dataset hits it once.
-     Instead, an already-established dataset (real `<ns>:tier` history — the same signal
-     guard 7's cold-start floor uses) with no recorded watermark defaults to `now`, once
+     Instead, an already-established dataset (`<ns>:established=yes`, with legacy
+     tier history used only as the initial upgrade baseline) with no recorded watermark defaults to `now`, once
      — self-limiting, since a real run persists a value immediately after. Side effect
      worth naming: on that one run this makes guard 1 a no-op entirely (every day is
      `<= now`), not just for the historical gap — guards 2/4/5 don't depend on
@@ -171,22 +171,18 @@ content guards while a churny scratch policy relaxes them).
    a safe cutoff, see docs/TRUENAS.md — would otherwise clear silently on the very first
    plain `--prune` with no review).
 
-   - **"Established"** = at least one snapshot already carries a real `<ns>:tier` value.
-     Normally this is *only* ever written by Promote, but the check (`zfs list`) reads
-     whatever value is currently visible, including one that arrived by ZFS property
-     **inheritance** (someone runs `zfs set <ns>:tier=weekly` on a *parent* dataset) or a
-     **received** property (carried over by replication, if the source ever had the same
-     namespace value set on it) rather than this tool's own Promote call. Both require a
-     human to have set the property somewhere in the hierarchy — not a
-     replication-driven attack path — but the floor doesn't currently distinguish
-     "Promote wrote this" from "this is merely visible here," so a stray `zfs set` on a
-     parent dataset could unintentionally waive the floor. Not fixed: doing so requires
-     checking property *source* (`zfs get -s local`), a second, non-batched `zfs` call
-     per dataset, judged not worth the cost for a self-inflicted misconfiguration, not a
-     scenario this tool's threat model is defending against (see `truenas/README.md`'s
-     residual risks in the orientation repo).
-   - **Ordering.** Checked and enforced *before* Promote runs, so a blocked cold-start
-     pass can never tag a keeper and thereby clear itself without `--force`.
+   - **"Established"** = the explicit dataset property `<ns>:established=yes`.
+     `no` remains authoritative even when latched or metadata-only runs create tier
+     records. On upgrade, an absent property falls back to visible legacy tier
+     history once; record that baseline before any new metadata is written.
+     Unreadable/invalid state blocks deletion rather than assuming establishment.
+     As with the legacy check, an operator can misconfigure visible properties by
+     inheritance or replication; do not set this approval property on parents or
+     source datasets. Property-source validation is outside this change.
+   - **Ordering.** Ordinary blocked cold starts still stop before reconciliation.
+     Latched runs and `--reconcile` can keep metadata current without establishing
+     first-prune approval. The explicit baseline prevents these paths from
+     silently clearing the floor.
    - **First completion.** A dataset establishes the first time `--prune` completes for
      it: immediately, with no `--force` needed, if it has nothing doomed yet (Promote
      only tags/holds — nothing to review); via `--force` the first time it does have
@@ -203,8 +199,13 @@ health by proxy.
 - When any guard above withholds (`SKIP`s) a dataset, the tool still proactively
   `zfs hold`s every keeper (`<ns>:monthly` / `<ns>:weekly`, including the suspect newest
   where applicable).
-- It **never** releases a hold or deletes anything on a worried run — a release/delete
-  only ever happens on a fully-healthy, under-cap run.
+- It never deletes anything on a worried run. While the pool is latched, every
+  affected daily first receives a separate `<ns>:latched:<incident-id>` hold and incident history.
+  Only after that complete protection phase succeeds can normal keeper metadata
+  and tier holds move. Superseded monthly/weekly holds may then be released without
+  weakening incident protection. Other own-guard failures retain the conservative
+  add-only keeper behavior. Verified incident holds are released only after a
+  explicit false-positive acknowledgment on a healthy, approved/established, under-cap prune.
 - Guards 1–5 additionally write a `<ns>:worry=<date> <reason>` breadcrumb on the tip;
   guards 6 and 7 (the volume circuit-breaker and cold-start floor) do not — they're
   visible via their `WORRY` log line and healthchecks `/fail` ping instead, not a
@@ -274,14 +275,15 @@ health by proxy.
         starting --> healthy: first clean, non-WORRY --prune
         healthy --> unhealthy: any dataset shows content shock (guard 4/5)
         unhealthy --> unhealthy: later run, even if that run itself looks clean
-        unhealthy --> healthy: --reset-health (the only path back)
+        unhealthy --> healthy: --acknowledge-false-positive (the only path back)
     ```
 
     - **Mechanism.** A pre-pass runs before any dataset commits to anything, and always
       scans every configured dataset regardless of `--dataset` filtering. If any dataset
       shows shock, a pool-wide `<ns>:health` property (stored on the pool/prefix parent
       dataset, e.g. `archive`, not any one managed leaf) latches to `unhealthy`. While
-      latched, **every** dataset holds its keepers defensively and withholds destroy +
+      latched, **every** processed daily gets independent incident protection and normal
+      tier metadata continues advancing; every dataset withholds destroy +
       the `pruned_through` advance, regardless of how clean that dataset's own feed looks
       that run — the dataset that actually tripped its own guard still gets its specific
       reason and `<ns>:worry` tag; others fall back to a `pool: ...` reason, logged with
@@ -292,7 +294,7 @@ health by proxy.
     - **No self-heal.** Unlike a Docker container, this does **not** clear itself the
       moment a later run looks clean again — a quieter run is not evidence of safety,
       since a patient attacker may simply have moved on to slower changes. The **only**
-      way to clear it is the explicit `--reset-health` command (`unhealthy` →
+      way to clear it is the explicit `--acknowledge-false-positive` command (`unhealthy` →
       `healthy`); never `--force` (which already means something unrelated — bypass the
       routine volume cap, not "I reviewed a possible mass deletion/encryption event"),
       and never automatically.
@@ -303,7 +305,7 @@ health by proxy.
     - **`<ns>:health_reason`** is a free-text companion property that persists WHAT
       tripped it (dataset + guard detail) alongside the enum — surfaced by `--summary`
       and `--doctor` (both otherwise read-only), and printed one last time by
-      `--reset-health` before it clears both, since reviewing that reason is the entire
+      `--acknowledge-false-positive` before it clears both, since reviewing that reason is the entire
       point of the command. It never lingers past a resolved incident: cleared (`zfs
       inherit`) the moment health goes back to `healthy`, whichever path got it there.
     - **Verified.** Modeled and model-checked in `docs/model/ZfsHoldTight.tla`
@@ -321,3 +323,115 @@ could begin deleting older dailies — destroying real coverage that nothing is 
 Guard 1 (6-day gap) and guard 2 (stale newest) both fail, so `zfs-hold-tight` deletes
 nothing and pings `/fail`. The operator sees a stalled feed instead of slow, silent data
 loss.
+
+## Latched classification and protection are separate
+
+The November 2026 recovery exposed stale `monthly` properties and many monthly
+holds on snapshots that were no longer selected keepers. The old freeze path
+added keeper holds but skipped normal metadata marking. Metadata now keeps
+advancing while independent incident protection prevents any data loss:
+
+1. Record the preexisting dataset establishment baseline explicitly. Merely
+   tagging during a latch must not satisfy first-prune approval.
+2. Obtain a persistent pool incident identity; preserve the recorded reason.
+3. Add `<ns>:latched:<incident-id>` to **all** affected dailies and append incident history.
+   If any protection/history operation fails, do not begin demotion.
+4. Hold every replacement keeper before any old keeper is demoted. Then update
+   tier/expiry normally, keeping all incident holds intact.
+5. Never destroy or advance `pruned_through` while latched. `--force` cannot
+   override this. Snapshot history survives false-positive acknowledgment and later hold reconciliation.
+
+After explicit false-positive acknowledgment, ordinary guards, cold-start approval, and the delete
+cap still apply. Only a healthy, approved/established, under-cap prune can retire
+verified tool-owned incident holds. Unmarked/malformed safety holds require
+review; all histories are validated before any incident hold release begins.
+Failure in a release phase skips dataset deletion. Foreign holds remain foreign.
+Metadata-only `--reconcile` does not retire incident holds, certify history,
+establish first-prune approval, or destroy snapshots.
+
+The existing TLA+ snapshot/watermark freeze properties still describe the
+no-deletion/no-certification invariant. Hold identities, incident JSON history,
+and metadata writes are outside that model's abstraction; their transition and
+failure guarantees are covered by the multi-run fake-ZFS integration tests in
+`tests/latched-tests.py`, not claimed to be newly model-checked.
+
+## False-positive acknowledgment is the only in-tool incident recovery
+
+The tool does not remediate ransomware. It warns/latches on heuristic evidence
+and supports an explicit declaration that the warning was a false positive.
+A confirmed attack must be handled with separate recovery tools; neither
+`--force` nor metadata reconciliation permits deleting history while an incident is unresolved.
+
+Safety holds have incident-specific names `<ns>:latched:<id>`. Before releasing
+any such hold, the tool requires its exact ID in that snapshot's valid history
+and a durable pool-level `false_positive_<id>` acknowledgment. Old valid history
+cannot approve a newer incident's partially written hold. Validate **all**
+non-null history before reconciliation, watermark certification, or deletion,
+including history on unheld snapshots. Inspect actual safety holds in reports
+regardless of whether history exists at all.
+
+Acknowledgment repairs and re-reads every configured dataset while frozen. It
+neither destroys snapshots nor releases safety holds, establishes a first prune,
+or advances `pruned_through`. Unknown/malformed histories, unmatched hold IDs,
+unacknowledged older incidents, and write failures block clearance. The operator
+may retry after correcting/retrying a partial write. Only after verification
+are the false-positive receipt and legitimate-content baseline made effective,
+then health is cleared. Partial failures preserve physical protection.
+
+An accepted tip bypasses only repeat content-shock detection of that exact
+snapshot. Future shrink comparisons use post-acceptance references; future churn,
+clock/freshness/gap checks remain active. A failure to read/validate acceptance
+metadata fails toward warning/freeze. A pending baseline without a durable
+false-positive receipt cannot suppress a warning. This avoids immediately
+re-latching an explicitly accepted legitimate shrink/churn while keeping new
+changes detectable. It is not a ransomware-remediation or clean-snapshot policy.
+
+The legacy abstract model action named `ResetHealth` now represents operator
+false-positive acknowledgment only. The model does not encode the incident-ID,
+partial-write, acknowledgment-receipt, or baseline protocols; those are covered
+by integration tests and are not claimed to be model-checked here.
+
+### Warning activation and acknowledgment interruption ordering
+
+The authoritative pending-warning sentinel is `<ns>:latch_evidence`: a single
+record binding ID, dataset, exact snapshot, reason, and reference/written metrics.
+Persist it before legacy health/ID mirrors. An unacknowledged sentinel freezes
+pruning even when a mirror write is interrupted. Acknowledgment receipts do not
+rotate identity. If clearing health fails after receipt persistence, retries stay
+on the same incident; a genuinely new warning has a separately persisted new
+sentinel before its health transition.
+
+Only the exact recorded trigger may receive a content-baseline exception. Require
+its name and metrics still to match. Never write acceptance baselines for every
+collateral dataset's current tip. Once the original false-positive receipt is
+durable, recheck all current warnings before clearing health. Any new warning
+becomes a new pending sentinel, remains latched, and requires a separate explicit
+review. A legacy warning without exact evidence gets no implicit exemption.
+
+The model abstracts the latch transition as atomic; this implementation ordering
+and the multi-dataset acceptance scope are checked by fault-injection integration
+tests, not newly claimed to be model-checked. Older binaries do not understand a
+pending sentinel before physical holds exist; complete/inspect activation before
+any rollback rather than assuming the legacy health mirror alone is sufficient.
+
+### Verification warnings and durable acknowledgment fallback
+
+Warning evidence is typed as `shrink`, `churn`, or `verification`. Only an actual
+recorded shrink/churn warning can authorize the exact snapshot's content
+exception. An infrastructure/baseline-verification failure is not evidence that
+any data content was reviewed. Its fault must be resolved, and content checks
+must run without an exemption; a newly visible content warning remains latched
+for separate review.
+
+Before publishing a false-positive receipt, acknowledgment must successfully
+persist the compatibility health state as **unhealthy**. This durable fallback
+keeps the pool frozen if receipt persistence succeeds but the final warning scan
+or health-clear subsequently fails—even if initial unhealthy mirror writes had
+never succeeded. A receipt is the operator's decision, not evidence that latch
+clearance completed. Retries retain the same incident and do not delete data.
+
+Resolved historical evidence may outlive a dataset's configuration entry; parsing
+that history does not require the dataset still to be configured. An unresolved
+incident whose dataset is no longer in scope cannot be acknowledged because its
+data cannot be verified. Restore verification scope or use deliberate external
+recovery tools rather than silently clearing that warning.

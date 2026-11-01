@@ -38,7 +38,7 @@ static class Zfs
     {
         var warnings = new List<string>();
         // -p: exact bytes for referenced/written (the shrinkage + churn guards need raw numbers).
-        var (code, outp, err) = Exec(c, "zfs", "list", "-Hp", "-t", "snapshot", "-o", $"name,{c.PropKeep},{c.PropTier},referenced,written", "-d", "1", ds);
+        var (code, outp, err) = Exec(c, "zfs", "list", "-Hp", "-t", "snapshot", "-o", $"name,{c.PropKeep},{c.PropTier},referenced,written,{c.PropLatchHistory}", "-d", "1", ds);
         var list = new List<Snap>();
         if (code != 0) { warnings.Add($"ERROR: zfs list {ds} failed: {err.Trim()}"); return (code, list, warnings); }
         foreach (var line in outp.Split('\n', StringSplitOptions.RemoveEmptyEntries))
@@ -55,7 +55,7 @@ static class Zfs
             string? tier = cols.Length > 2 && cols[2] != "-" ? cols[2] : null;
             long? refb = cols.Length > 3 && long.TryParse(cols[3], out var rb) ? rb : null;
             long? wrb = cols.Length > 4 && long.TryParse(cols[4], out var wb) ? wb : null;
-            list.Add(new Snap(cols[0], date, ku, tier, refb, wrb));
+            list.Add(new Snap(cols[0], date, ku, tier, refb, wrb, cols.Length > 5 && cols[5] != "-" ? cols[5] : null));
         }
         return (0, list, warnings);
     }
@@ -81,10 +81,18 @@ static class Zfs
     // otherwise (true, "healthy") or (true, "unhealthy").
     public static (bool ok, string value) LoadHealth(Ctx c)
     {
+        var (evidenceOk, evidence) = Latched.ReadEvidence(c);
+        if (!evidenceOk) return (false, "");
+        if (evidence is not null)
+        {
+            var (ackOk, acknowledged) = Latched.FalsePositiveState(c, evidence.Id);
+            if (!ackOk) return (false, "");
+            if (!acknowledged) return (true, "unhealthy");
+        }
         var (code, outp, _) = Exec(c, "zfs", "get", "-H", "-o", "value", c.PropHealth, c.PoolDataset);
         if (code != 0) return (false, "");
         var v = outp.Trim();
-        return (true, v == "-" ? "" : v);
+        return v is "-" or "healthy" or "unhealthy" ? (true, v == "-" ? "" : v) : (false, "");
     }
 
     // Reads the persisted WHY behind the current/most-recent unhealthy latch (see
@@ -94,6 +102,9 @@ static class Zfs
     // does.
     public static (bool ok, string reason) LoadHealthReason(Ctx c)
     {
+        var (evidenceOk, evidence) = Latched.ReadEvidence(c);
+        if (!evidenceOk) return (false, "");
+        if (evidence is not null) return (true, evidence.Reason);
         var (code, outp, _) = Exec(c, "zfs", "get", "-H", "-o", "value", c.PropHealthReason, c.PoolDataset);
         if (code != 0) return (false, "");
         var v = outp.Trim();
@@ -102,7 +113,7 @@ static class Zfs
 
     // Writes the pool-wide health latch. Does NOT log itself -- unlike most write helpers
     // in this file, this one is called both from Commands.Prune (whose Log() it could
-    // safely close over) AND from the standalone --reset-health command (which has its
+    // safely close over) AND from the standalone --acknowledge-false-positive command (which has its
     // OWN separate `lines`/Log()); a shared Log() call here would only ever reach ONE of
     // those callers' log files (the exact bug class ListDailies's own comment already
     // documents once). Caller logs the returned message with its own Log().
@@ -114,7 +125,12 @@ static class Zfs
     // resolved incident's explanation never lingers as if it still applied.
     public static (bool ok, string message) WriteHealth(Ctx c, string value, string? reason)
     {
-        var (code, _, e) = Exec(c, "zfs", "set", $"{c.PropHealth}={value}", c.PoolDataset);
+        // Identity is assigned on entry to a new unacknowledged incident,
+        // independently of this health write. Acknowledgment persists before
+        // clearing health, so retries/partial health writes never invent approval.
+        var args = new List<string> { "set", $"{c.PropHealth}={value}" };
+        args.Add(c.PoolDataset);
+        var (code, _, e) = Exec(c, "zfs", args.ToArray());
         if (code != 0) return (false, $"    META:UPDATE {c.PoolDataset} {c.PropHealth} FAILED: {e.Trim()}");
         if (value == "unhealthy" && reason is not null)
             Exec(c, "zfs", "set", $"{c.PropHealthReason}={reason}", c.PoolDataset);
@@ -122,6 +138,9 @@ static class Zfs
             Exec(c, "zfs", "inherit", c.PropHealthReason, c.PoolDataset);
         return (true, $"  META:UPDATE {c.PoolDataset} {c.PropHealth}={value}" + (reason is null ? "" : $" ({reason})"));
     }
+
+    public static bool IsMissingHold(string error) =>
+        error.Contains("no such hold") || error.Contains("no such tag") || error.Contains("not found");
 
     // Annotate one snapshot for its current tier. Returns false if any write failed.
     // Only keepers (weekly/monthly) carry <ns>:tier + <ns>:keep_until tags; a plain
@@ -153,7 +172,7 @@ static class Zfs
                 foreach (var tag in heldKeeperTags)
                 {
                     var (rc, _, re) = Exec(c, "zfs", "release", tag, s.Name);
-                    if (rc != 0 && !re.Contains("no such hold") && !re.Contains("not found"))
+                    if (rc != 0 && !IsMissingHold(re))
                     { log($"    HOLD:REMOVE {Utils.Short(s.Name)} FAILED: {re.Trim()}"); success = false; }
                     else log($"  HOLD:REMOVE {s.Name} (demoted to daily)");
                 }
@@ -196,7 +215,7 @@ static class Zfs
         if (wantHeld && heldKeeperTags.Contains(otherTag))   // wrong-tier hold left over → release it
         {
             var (rc, _, re) = Exec(c, "zfs", "release", otherTag, s.Name);
-            if (rc != 0 && !re.Contains("no such hold") && !re.Contains("not found"))
+            if (rc != 0 && !IsMissingHold(re))
                 { log($"    HOLD:REMOVE {Utils.Short(s.Name)} FAILED: {re.Trim()}"); success = false; }
             else
                 log($"  HOLD:REMOVE {s.Name} ({(tier == "monthly" ? "weekly→monthly" : "monthly→weekly")})");

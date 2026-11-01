@@ -324,7 +324,14 @@ FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
   ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --prune --force >/dev/null 2>&1
 health60a="$(health_of "$WORK/fz/dsprops")"
 
-: > "$WORK/fz/ops.log"; cp "$WORK/healthy" "$WORK/fz/snaps"   # now a clean, dense feed -- same dataset
+# Immutable original shock snapshot remains. A genuinely new healthy tip makes
+# the live heuristic clean; replacing metrics on the old snapshot would be an
+# impossible mutation and invalidate exact trigger-evidence verification.
+: > "$WORK/fz/ops.log"
+old_tip60=$(tail -1 "$WORK/t60shock" | cut -f1)
+awk -F'\t' -v old="$old_tip60" '$1!=old' "$WORK/healthy" > "$WORK/fz/snaps"
+tail -1 "$WORK/t60shock" >> "$WORK/fz/snaps"
+printf 'archive/home/rich@autosnap_%s_daily\t-\t-\t1073741824\t0\n' "$(date -u -d "@$((ANCHOR+60))" +%Y-%m-%d_%H:%M:%S)" >> "$WORK/fz/snaps"
 OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
        ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --prune --force 2>/dev/null)"
 { [ "$health60a" = "unhealthy" ] && echo "$OUT" | grep -qi "archive: WORRY - already latched unhealthy" \
@@ -332,13 +339,13 @@ OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
   && ok "T60 health latch does not auto-heal: a second, individually-clean run still freezes" \
   || bad "T60 (health_after_shock=$health60a, out: $(echo "$OUT" | grep -i worry))"
 
-# ---- T61: --reset-health is the ONLY way to clear it; a subsequent --prune then
+# ---- T61: --acknowledge-false-positive is the ONLY way to clear it; a subsequent --prune then
 #      proceeds normally again (reusing the still-latched $WORK/fz from T60). ----
 OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
-       ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --reset-health 2>/dev/null)"
+       ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --acknowledge-false-positive 2>/dev/null)"
 health61="$(health_of "$WORK/fz/dsprops")"
 { echo "$OUT" | grep -qi "health" && [ "$health61" = "healthy" ]; } \
-  && ok "T61a --reset-health clears the latch (unhealthy -> healthy)" \
+  && ok "T61a --acknowledge-false-positive clears the latch (unhealthy -> healthy)" \
   || bad "T61a (health=$health61, out: $(echo "$OUT" | tail -3 | tr '\n' '|'))"
 
 : > "$WORK/fz/ops.log"
@@ -348,15 +355,15 @@ OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
   && ok "T61b after reset, a subsequent --prune proceeds normally (no pool freeze)" \
   || bad "T61b (out: $(echo "$OUT" | grep -i worry))"
 
-# ---- T62: --reset-health is a safe no-op when health isn't currently unhealthy ----
+# ---- T62: --acknowledge-false-positive is a safe no-op when health isn't currently unhealthy ----
 rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"; cp "$WORK/healthy" "$WORK/fz/snaps"; : > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
 OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
-       ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --reset-health 2>/dev/null)"; RC=$?
-{ [ "$RC" = 0 ] && echo "$OUT" | grep -qi "nothing to reset"; } \
-  && ok "T62 --reset-health is a safe no-op when not currently unhealthy" \
+       ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --acknowledge-false-positive 2>/dev/null)"; RC=$?
+{ [ "$RC" = 0 ] && echo "$OUT" | grep -qi "No active latch"; } \
+  && ok "T62 --acknowledge-false-positive is a safe no-op when not currently unhealthy" \
   || bad "T62 (rc=$RC, out: $(echo "$OUT" | tail -2 | tr '\n' '|'))"
 
-# ---- T63: --force does NOT clear the health latch -- only --reset-health may. Proves
+# ---- T63: --force does NOT clear the health latch -- only --acknowledge-false-positive may. Proves
 #      the two are genuinely separate mechanisms; an operator's habitual --force reflex
 #      must never double as reviewing a possible mass-deletion/encryption event. ----
 rm -rf "$WORK/fz"; mkdir -p "$WORK/fz" "$WORK/logs"; cp "$WORK/healthy" "$WORK/fz/snaps"; : > "$WORK/fz/holds"; : > "$WORK/fz/ops.log"
@@ -419,14 +426,14 @@ OUT2="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
   && ok "T70 content shock persists a reason, surfaced by --summary and --doctor without reading the log" \
   || bad "T70 (reason=$reason70, summary: $(echo "$OUT"|tail -3|tr '\n' '|'), doctor: $(echo "$OUT2"|head -3|tr '\n' '|'))"
 
-# ---- T71: --reset-health prints the persisted reason before clearing it, and the
+# ---- T71: --acknowledge-false-positive prints the persisted reason before clearing it, and the
 #      reason property is actually gone afterward (not left as a stale explanation for a
 #      now-resolved incident). ----
 OUT="$(FAKE_ZFS_DIR="$WORK/fz" ZFS_HOLD_TIGHT_CONFIG="$WORK/config.json" \
-       ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --reset-health 2>/dev/null)"
+       ZFS_HOLD_TIGHT_LOG_DIR="$WORK/logs" dotnet run "$TARGET" -- --no-hc --acknowledge-false-positive 2>/dev/null)"
 reason71="$(health_reason_of "$WORK/fz/dsprops")"
-{ echo "$OUT" | grep -qi "Reason for the latch:.*shrank" && [ -z "$reason71" ]; } \
-  && ok "T71 --reset-health shows the reason before clearing it" \
+{ echo "$OUT" | grep -qi "Operator asserts FALSE POSITIVE:.*shrank" && [ -z "$reason71" ]; } \
+  && ok "T71 --acknowledge-false-positive shows the reason before clearing it" \
   || bad "T71 (out: $(echo "$OUT"|head -2|tr '\n' '|'), reason_after=$reason71)"
 
 # ---- T72: --summary's two sections -- "## Snapshots" / "## Health" headers always
